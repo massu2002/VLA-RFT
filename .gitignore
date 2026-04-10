@@ -1,0 +1,13 @@
+.DS_Store
+/.idea
+.venv
+.venv5090_eval
+logs
+checkpoints
+outputs
+rollouts
+amused
+worldmodel/visualizations
+
+**/core.*
+**/test
