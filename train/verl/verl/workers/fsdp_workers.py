@@ -17,6 +17,9 @@ The main entry point to run the PPO algorithm
 
 import logging
 import os
+import json
+import copy
+import shutil
 import warnings
 import psutil
 from collections import deque
@@ -46,11 +49,188 @@ from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager 
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
 
 from torch.optim.lr_scheduler import LambdaLR
+from safetensors.torch import load_file as load_safetensors
 
 from codetiming import Timer
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv('VERL_PPO_LOGGING_LEVEL', 'WARN'))
+
+
+def _read_json(path: Path):
+    with open(path, "r") as f:
+        return json.load(f)
+
+def _has_tokenizer_assets(path: str) -> bool:
+    p = Path(path)
+    return any([
+        (p / "tokenizer.json").exists(),
+        (p / "tokenizer.model").exists(),
+        (p / "spiece.model").exists(),
+        (p / "vocab.json").exists(),
+    ])
+
+def _has_processor_assets(path: str) -> bool:
+    p = Path(path)
+    return any([
+        (p / "processor_config.json").exists(),
+        (p / "preprocessor_config.json").exists(),
+        (p / "feature_extractor_config.json").exists(),
+    ])
+
+def _is_hf_model_dir(path: str) -> bool:
+    cfg_path = Path(path) / "config.json"
+    if not cfg_path.exists():
+        return False
+    try:
+        cfg = _read_json(cfg_path)
+    except Exception:
+        return False
+    return "model_type" in cfg
+
+def _normalize_state_dict_key(key: str) -> str:
+    prefixes = [
+        "module.",
+        "_orig_mod.",
+        "model.",
+        "lm.",
+    ]
+    changed = True
+    while changed:
+        changed = False
+        for p in prefixes:
+            if key.startswith(p):
+                key = key[len(p):]
+                changed = True
+    return key
+
+def _extract_lm_state_dict(state_dict):
+    return {_normalize_state_dict_key(k): v for k, v in state_dict.items()}
+
+def _load_world_model_weights(world_module, trained_model_dir: str, logger=None):
+    weight_path = Path(trained_model_dir) / "model.safetensors"
+    if not weight_path.exists():
+        raise FileNotFoundError(f"Trained weight not found: {weight_path}")
+
+    state_dict = load_safetensors(str(weight_path))
+    state_dict = _extract_lm_state_dict(state_dict)
+
+    last_exc = None
+    candidates = [("world_module", world_module)]
+
+    if hasattr(world_module, "lm"):
+        candidates.append(("world_module.lm", world_module.lm))
+    if hasattr(world_module, "model"):
+        candidates.append(("world_module.model", world_module.model))
+
+    for name, module in candidates:
+        try:
+            missing, unexpected = module.load_state_dict(state_dict, strict=False)
+            if logger is not None:
+                logger.warning(
+                    "Loaded world model weights into %s from %s",
+                    name,
+                    str(weight_path),
+                )
+                if missing:
+                    logger.warning("Missing keys when loading trained weights: %d", len(missing))
+                    logger.warning("%s", missing[:20])
+                if unexpected:
+                    logger.warning("Unexpected keys when loading trained weights: %d", len(unexpected))
+                    logger.warning("%s", unexpected[:20])
+            else:
+                print(f"[info] Loaded world model weights into {name} from {weight_path}")
+                if missing:
+                    print(f"[warn] Missing keys when loading trained weights: {len(missing)}")
+                    print(missing[:20])
+                if unexpected:
+                    print(f"[warn] Unexpected keys when loading trained weights: {len(unexpected)}")
+                    print(unexpected[:20])
+            return
+        except Exception as e:
+            last_exc = e
+
+    raise RuntimeError(
+        f"Failed to load trained world model weights from {weight_path} into any candidate module. "
+        f"Last error: {last_exc}"
+    )
+
+def _normalize_rope_for_hf(hf_config, logger=None):
+    def _norm_dict(x):
+        if not isinstance(x, dict):
+            return None
+        x = dict(x)
+        if "type" in x and "rope_type" not in x:
+            x["rope_type"] = x.pop("type")
+        return x
+
+    rs = _norm_dict(getattr(hf_config, "rope_scaling", None))
+    rp = _norm_dict(getattr(hf_config, "rope_parameters", None))
+
+    if rs is None and rp is not None:
+        rs = dict(rp)
+
+    if isinstance(rs, dict) and rs.get("rope_type", "default") == "default":
+        rs = None
+
+    if getattr(hf_config, "rope_theta", None) is None:
+        hf_config.rope_theta = 10000.0
+
+    hf_config.rope_scaling = rs
+
+    try:
+        hf_config.rope_parameters = rp
+    except Exception:
+        hf_config.__dict__["rope_parameters"] = rp
+
+    if logger is not None:
+        logger.warning(
+            "HF rope normalized: rope_scaling=%s rope_parameters=%s rope_theta=%s",
+            getattr(hf_config, "rope_scaling", None),
+            getattr(hf_config, "rope_parameters", None),
+            getattr(hf_config, "rope_theta", None),
+        )
+
+    return hf_config
+
+
+def _normalize_rope_for_vllm(cfg, logger=None):
+    import copy
+
+    cfg = copy.deepcopy(cfg)
+
+    def _rope_type(x):
+        if not isinstance(x, dict):
+            return None
+        return x.get("rope_type", x.get("type"))
+
+    rs = getattr(cfg, "rope_scaling", None)
+    rp = getattr(cfg, "rope_parameters", None)
+
+    # HF側の default は「スケーリングなし」なので vLLM には渡さない
+    if _rope_type(rs) == "default" or _rope_type(rp) == "default":
+        if hasattr(cfg, "rope_scaling"):
+            cfg.rope_scaling = None
+        if hasattr(cfg, "rope_parameters"):
+            cfg.rope_parameters = None
+        return cfg
+
+    # rope_parameters -> rope_scaling に寄せる
+    if isinstance(rp, dict):
+        rp = dict(rp)
+        if "type" in rp and "rope_type" not in rp:
+            rp["rope_type"] = rp.pop("type")
+        cfg.rope_scaling = rp
+        cfg.rope_parameters = None
+
+    rs = getattr(cfg, "rope_scaling", None)
+    if isinstance(rs, dict):
+        rs = dict(rs)
+        if "type" in rs and "rope_type" not in rs:
+            rs["rope_type"] = rs.pop("type")
+        cfg.rope_scaling = rs
+
+    return cfg
 
 
 def _repair_safetensors_metadata_if_needed(model_path: str) -> bool:
@@ -801,7 +981,6 @@ class ActorRolloutRefWorker(Worker):
 
 class WorldModelRolloutWorker(Worker):
 
-
     def __init__(self, config: DictConfig, role: str):
         super().__init__()
         self.config = config
@@ -812,16 +991,21 @@ class WorldModelRolloutWorker(Worker):
         # build device mesh for FSDP
         world_size = torch.distributed.get_world_size()
         # TODO(sgm): support FSDP hybrid shard for larger model
-        self.device_mesh = create_device_mesh(world_size=world_size, fsdp_size=self.config.world_model.fsdp_config.fsdp_size)
+        self.device_mesh = create_device_mesh(
+            world_size=world_size,
+            fsdp_size=self.config.world_model.fsdp_config.fsdp_size
+        )
 
         # build device mesh for Ulysses Sequence Parallel
         self.ulysses_device_mesh = None
         self.ulysses_sequence_parallel_size = self.config.world_model.get('ulysses_sequence_parallel_size', 1)
         dp = world_size // self.ulysses_sequence_parallel_size
         if self.ulysses_sequence_parallel_size > 1:
-            self.ulysses_device_mesh = init_device_mesh('cuda',
-                                                        mesh_shape=(dp, self.ulysses_sequence_parallel_size),
-                                                        mesh_dim_names=['dp', 'sp'])
+            self.ulysses_device_mesh = init_device_mesh(
+                'cuda',
+                mesh_shape=(dp, self.ulysses_sequence_parallel_size),
+                mesh_dim_names=['dp', 'sp']
+            )
 
         self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
 
@@ -839,23 +1023,48 @@ class WorldModelRolloutWorker(Worker):
         # normalize config
         if self._is_wm:
             self.config.world_model.ppo_mini_batch_size *= self.config.rollout.n
-            self.config.world_model.ppo_mini_batch_size //= (self.device_mesh.size() // self.ulysses_sequence_parallel_size)
-            assert self.config.world_model.ppo_mini_batch_size > 0, f'ppo_mini_batch_size {self.config.world_model.ppo_mini_batch_size} should be larger than 0 after normalization'
+            self.config.world_model.ppo_mini_batch_size //= (
+                self.device_mesh.size() // self.ulysses_sequence_parallel_size
+            )
+            assert self.config.world_model.ppo_mini_batch_size > 0, (
+                f'ppo_mini_batch_size {self.config.world_model.ppo_mini_batch_size} '
+                f'should be larger than 0 after normalization'
+            )
+
             # micro bsz
             if self.config.world_model.ppo_micro_batch_size is not None:
-                self.config.world_model.ppo_micro_batch_size //= (self.device_mesh.size() //
-                                                            self.ulysses_sequence_parallel_size)
+                self.config.world_model.ppo_micro_batch_size //= (
+                    self.device_mesh.size() // self.ulysses_sequence_parallel_size
+                )
                 self.config.world_model.ppo_micro_batch_size_per_gpu = self.config.world_model.ppo_micro_batch_size
-                assert self.config.world_model.ppo_mini_batch_size % self.config.world_model.ppo_micro_batch_size_per_gpu == 0, \
-                    f'normalized ppo_mini_batch_size {self.config.world_model.ppo_mini_batch_size} should be divisible by ppo_micro_batch_size_per_gpu {self.config.world_model.ppo_micro_batch_size_per_gpu}'
-                assert self.config.world_model.ppo_mini_batch_size // self.config.world_model.ppo_micro_batch_size_per_gpu > 0, \
-                    f'normalized ppo_mini_batch_size {self.config.world_model.ppo_mini_batch_size} should be larger than ppo_micro_batch_size_per_gpu {self.config.world_model.ppo_micro_batch_size_per_gpu}'
+                assert (
+                    self.config.world_model.ppo_mini_batch_size
+                    % self.config.world_model.ppo_micro_batch_size_per_gpu
+                    == 0
+                ), (
+                    f'normalized ppo_mini_batch_size {self.config.world_model.ppo_mini_batch_size} '
+                    f'should be divisible by ppo_micro_batch_size_per_gpu '
+                    f'{self.config.world_model.ppo_micro_batch_size_per_gpu}'
+                )
+                assert (
+                    self.config.world_model.ppo_mini_batch_size
+                    // self.config.world_model.ppo_micro_batch_size_per_gpu
+                    > 0
+                ), (
+                    f'normalized ppo_mini_batch_size {self.config.world_model.ppo_mini_batch_size} '
+                    f'should be larger than ppo_micro_batch_size_per_gpu '
+                    f'{self.config.world_model.ppo_micro_batch_size_per_gpu}'
+                )
 
         # normalize rollout config
         if self._is_rollout and self.config.rollout.log_prob_micro_batch_size is not None:
-            self.config.rollout.log_prob_micro_batch_size //= (self.device_mesh.size() //
-                                                               self.ulysses_sequence_parallel_size)
-            self.config.rollout.log_prob_micro_batch_size_per_gpu = self.config.rollout.log_prob_micro_batch_size
+            self.config.rollout.log_prob_micro_batch_size //= (
+                self.device_mesh.size() // self.ulysses_sequence_parallel_size
+            )
+            self.config.rollout.log_prob_micro_batch_size_per_gpu = \
+                self.config.rollout.log_prob_micro_batch_size
+
+        self._rollout_model_path = None
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
@@ -864,7 +1073,9 @@ class WorldModelRolloutWorker(Worker):
         import_external_libs(self.config.model.get('external_lib', None))
 
         from omegaconf import OmegaConf
-        override_model_config = OmegaConf.to_container(self.config.model.get('override_config', OmegaConf.create()))
+        override_model_config = OmegaConf.to_container(
+            self.config.model.get('override_config', OmegaConf.create())
+        )
 
         use_remove_padding = self.config.model.get('use_remove_padding', False)
 
@@ -874,6 +1085,7 @@ class WorldModelRolloutWorker(Worker):
                 fsdp_config = self.config.world_model.fsdp_config
             else:
                 fsdp_config = OmegaConf.create()
+
             self.world_module_fsdp, self.world_model_config = self._build_model(
                 model_path=self.config.model.path,
                 fsdp_config=fsdp_config,
@@ -882,68 +1094,261 @@ class WorldModelRolloutWorker(Worker):
                 enable_gradient_checkpointing=self.config.model.get('enable_gradient_checkpointing', False),
                 trust_remote_code=self.config.model.get('trust_remote_code', False),
                 use_liger=self.config.model.get('use_liger', False),
-                role='wm_rollout')
+                role='wm_rollout',
+            )
 
             # get the original unwrapped module
             self.world_module = self.world_module_fsdp._fsdp_wrapped_module
 
-        # load from checkpoint
         if self._is_wm:
             OmegaConf.set_struct(self.config.world_model, True)
             with open_dict(self.config.world_model):
                 self.config.world_model.use_remove_padding = use_remove_padding
-            self.worldmodel = DataParallelWorldModel(config=self.config.world_model,
-                                              world_module=self.world_module_fsdp,
-                                              )
+            self.worldmodel = DataParallelWorldModel(
+                config=self.config.world_model,
+                world_module=self.world_module_fsdp,
+            )
 
         if self._is_rollout:
             self.rollout, self.rollout_sharding_manager = self._build_rollout(
-                trust_remote_code=self.config.model.get('trust_remote_code', False))
+                trust_remote_code=self.config.model.get('trust_remote_code', False)
+            )
+            
+    def _write_vllm_compatible_config(self, cfg, local_path):
+        import json
+        import os
+        from pathlib import Path
 
+        cfg_dict = cfg.to_dict()
 
+        def _rope_type(x):
+            if not isinstance(x, dict):
+                return None
+            return x.get("rope_type", x.get("type"))
+
+        def _sanitize_dict(d):
+            if isinstance(d, dict):
+                # 先に子を再帰的に処理
+                for k in list(d.keys()):
+                    v = d[k]
+                    if isinstance(v, dict):
+                        _sanitize_dict(v)
+                    elif isinstance(v, list):
+                        for item in v:
+                            if isinstance(item, dict):
+                                _sanitize_dict(item)
+
+                rs = d.get("rope_scaling")
+                rp = d.get("rope_parameters")
+
+                # rope_parameters は vLLM に残さない
+                if "rope_parameters" in d:
+                    d.pop("rope_parameters", None)
+
+                # default の rope_scaling は消す
+                if _rope_type(rs) == "default":
+                    d.pop("rope_scaling", None)
+                else:
+                    rs = d.get("rope_scaling")
+                    # factor のない rope_scaling も vLLM 非互換なので消す
+                    if isinstance(rs, dict) and "factor" not in rs:
+                        d.pop("rope_scaling", None)
+
+        _sanitize_dict(cfg_dict)
+
+        out = Path(local_path) / "config.json"
+        tmp = Path(local_path) / f"config.rank{self.rank}.tmp"
+
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cfg_dict, f, ensure_ascii=False, indent=2)
+
+        os.replace(tmp, out)
+
+    def _validate_vllm_config(self, local_path):
+        import json
+        from pathlib import Path
+
+        cfg_path = Path(local_path) / "config.json"
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            saved_cfg = json.load(f)
+
+        def _check_dict(d, prefix="root"):
+            if isinstance(d, dict):
+                rs = d.get("rope_scaling")
+                rp = d.get("rope_parameters")
+
+                if "rope_scaling" in d or "rope_parameters" in d:
+                    if self.rank == 0:
+                        print(f"{prefix}.rope_scaling =", rs)
+                        print(f"{prefix}.rope_parameters =", rp)
+
+                assert rp is None, f"{prefix}.rope_parameters must be removed for vLLM, but got: {rp}"
+                assert rs is None or (isinstance(rs, dict) and "factor" in rs), \
+                    f"{prefix}.rope_scaling must be None or include factor, but got: {rs}"
+
+                for k, v in d.items():
+                    if isinstance(v, dict):
+                        _check_dict(v, f"{prefix}.{k}")
+                    elif isinstance(v, list):
+                        for i, item in enumerate(v):
+                            if isinstance(item, dict):
+                                _check_dict(item, f"{prefix}.{k}[{i}]")
+
+        if self.rank == 0:
+            print("validated config path =", cfg_path)
+
+        _check_dict(saved_cfg)
+            
+    def _sanitize_vllm_hf_config(self, cfg):
+        import copy
+
+        cfg = copy.deepcopy(cfg)
+
+        def _rope_type(x):
+            if not isinstance(x, dict):
+                return None
+            return x.get("rope_type", x.get("type"))
+
+        def _drop_attr(obj, name):
+            try:
+                setattr(obj, name, None)
+            except Exception:
+                pass
+            try:
+                obj.__dict__.pop(name, None)
+            except Exception:
+                pass
+            for internal_name in ("_internal_dict", "internal_dict"):
+                try:
+                    d = getattr(obj, internal_name, None)
+                    if d is not None and hasattr(d, "pop"):
+                        d.pop(name, None)
+                except Exception:
+                    pass
+
+        def _sanitize_obj(obj):
+            if obj is None:
+                return
+
+            rs = getattr(obj, "rope_scaling", None)
+            rp = getattr(obj, "rope_parameters", None)
+
+            if _rope_type(rs) == "default":
+                _drop_attr(obj, "rope_scaling")
+            if _rope_type(rp) == "default":
+                _drop_attr(obj, "rope_parameters")
+
+            rp = getattr(obj, "rope_parameters", None)
+            if isinstance(rp, dict):
+                _drop_attr(obj, "rope_parameters")
+
+            rs = getattr(obj, "rope_scaling", None)
+            if isinstance(rs, dict) and "factor" not in rs:
+                _drop_attr(obj, "rope_scaling")
+
+            for child_name in ("text_config", "language_config", "llm_config", "decoder_config", "generator_config"):
+                child = getattr(obj, child_name, None)
+                if child is not None and child is not obj:
+                    _sanitize_obj(child)
+
+        _sanitize_obj(cfg)
+        return cfg
+    
     def _build_rollout(self, trust_remote_code=False):
         from torch.distributed.device_mesh import init_device_mesh
-        # TODO(sgm): support FSDP hybrid shard for larger model
+        import copy
+
         infer_tp = self.config.rollout.tensor_model_parallel_size
         dp = self.world_size // infer_tp
-        assert self.world_size % infer_tp == 0, f'rollout world_size: {self.world_size} is not divisible by infer_tp: {infer_tp}'
-        rollout_device_mesh = init_device_mesh('cuda', mesh_shape=(dp, infer_tp), mesh_dim_names=['dp', 'infer_tp'])
+        assert self.world_size % infer_tp == 0, (
+            f'rollout world_size: {self.world_size} is not divisible by infer_tp: {infer_tp}'
+        )
+
+        rollout_device_mesh = init_device_mesh(
+            'cuda',
+            mesh_shape=(dp, infer_tp),
+            mesh_dim_names=['dp', 'infer_tp']
+        )
+
         rollout_name = self.config.rollout.name
+
         if rollout_name == 'hf':
             from verl.workers.rollout import HFRollout
             from verl.workers.sharding_manager import BaseShardingManager
+
             rollout = HFRollout(module=self.world_module_fsdp, config=self.config.rollout)
             rollout_sharding_manager = BaseShardingManager()
-            # TODO: a sharding manager that do nothing?
 
         elif rollout_name == 'vllm':
             from verl.workers.rollout.vllm_rollout import vLLMRollout, vllm_mode
             from verl.workers.sharding_manager import FSDPVLLMShardingManager
+
             log_gpu_memory_usage(f'Before building {rollout_name} rollout', logger=None)
-            local_path = copy_to_local(self.config.model.path)
+
+            local_path = self._rollout_model_path
+            if local_path is None:
+                raise ValueError("self._rollout_model_path is None. _build_model() may have failed.")
+
+            cfg_for_vllm = copy.deepcopy(self.world_model_config)
+            cfg_for_vllm = _normalize_rope_for_vllm(cfg_for_vllm, logger=logger)
+            cfg_for_vllm = self._sanitize_vllm_hf_config(cfg_for_vllm)
+            cfg_for_vllm._name_or_path = str(local_path)
+
+            if self.rank == 0:
+                print("before vllm init:")
+                print("cfg_for_vllm._name_or_path =", cfg_for_vllm._name_or_path)
+                print("cfg_for_vllm.rope_scaling =", getattr(cfg_for_vllm, "rope_scaling", None))
+                print("cfg_for_vllm.rope_parameters =", getattr(cfg_for_vllm, "rope_parameters", None))
+                for child_name in ("text_config", "language_config", "llm_config", "decoder_config"):
+                    child = getattr(cfg_for_vllm, child_name, None)
+                    if child is not None:
+                        print(f"{child_name}.rope_scaling =", getattr(child, "rope_scaling", None))
+                        print(f"{child_name}.rope_parameters =", getattr(child, "rope_parameters", None))
+
+            # 各 rank が自分の local_path に対して config を原子的に保存
+            self._write_vllm_compatible_config(cfg_for_vllm, local_path)
+            torch.distributed.barrier()
+
+            # 保存後の on-disk config を必ず検証
+            self._validate_vllm_config(local_path)
+            torch.distributed.barrier()
+
             if vllm_mode == 'customized':
-                rollout = vLLMRollout(world_module=self.world_module_fsdp,
-                                      config=self.config.rollout,
-                                      tokenizer=self.tokenizer,
-                                      model_hf_config=self.world_model_config)
+                rollout = vLLMRollout(
+                    world_module=self.world_module_fsdp,
+                    config=self.config.rollout,
+                    tokenizer=self.tokenizer,
+                    model_hf_config=cfg_for_vllm,
+                )
             elif vllm_mode == 'spmd':
-                rollout = vLLMRollout(model_path=local_path,
-                                      config=self.config.rollout,
-                                      tokenizer=self.tokenizer,
-                                      model_hf_config=self.world_model_config,
-                                      device_mesh=rollout_device_mesh,
-                                      trust_remote_code=trust_remote_code)
+                rollout = vLLMRollout(
+                    model_path=local_path,
+                    config=self.config.rollout,
+                    tokenizer=self.tokenizer,
+                    model_hf_config=cfg_for_vllm,
+                    device_mesh=rollout_device_mesh,
+                    trust_remote_code=trust_remote_code,
+                )
             else:
                 raise NotImplementedError("vllm_mode must be 'customized' or 'spmd'")
+
             log_gpu_memory_usage(f'After building {rollout_name} rollout', logger=None)
+
             if torch.distributed.get_world_size() == 1:
                 self.config.rollout.load_format = 'dummy_hf'
-            rollout_sharding_manager = FSDPVLLMShardingManager(module=self.world_module_fsdp,
-                                                               inference_engine=rollout.inference_engine,
-                                                               model_config=self.world_model_config,
-                                                               full_params='hf' in self.config.rollout.load_format,
-                                                               device_mesh=rollout_device_mesh)
+
+            rollout_sharding_manager = FSDPVLLMShardingManager(
+                module=self.world_module_fsdp,
+                inference_engine=rollout.inference_engine,
+                model_config=cfg_for_vllm,
+                full_params='hf' in self.config.rollout.load_format,
+                device_mesh=rollout_device_mesh,
+            )
+
             log_gpu_memory_usage('After building sharding manager', logger=None)
+
+        else:
+            raise NotImplementedError(f"Unsupported rollout_name: {rollout_name}")
 
         return rollout, rollout_sharding_manager
 
@@ -963,29 +1368,66 @@ class WorldModelRolloutWorker(Worker):
             from transformers import AutoModelForImageTextToText as AutoModelForVision2Seq
         except ImportError:
             from transformers import AutoModelForVision2Seq
-        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, ShardingStrategy, MixedPrecision, CPUOffload
-        from torch import optim
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, MixedPrecision, CPUOffload
 
         assert role in ['wm_rollout'], f'role {role} is not supported'
 
         log_gpu_memory_usage('Before init from HF AutoModel', logger=logger)
-        local_path = copy_to_local(model_path)
+
+        trained_local_path = copy_to_local(model_path)
+
+        base_model_path = self.config.model.get("base_path", None)
+        is_hf_model = _is_hf_model_dir(trained_local_path)
+
+        if is_hf_model:
+            # 学習済みディレクトリ自体がHF完成モデル
+            hf_assets_path = trained_local_path
+        else:
+            # 学習済みディレクトリは重み置き場だけ
+            if base_model_path is None:
+                raise ValueError(
+                    f"{trained_local_path} is not a HF model directory. "
+                    "Please provide self.config.model.base_path."
+                )
+            hf_assets_path = copy_to_local(base_model_path)
+
+        # tokenizer は学習済みディレクトリ側にあればそれを優先
+        if _has_tokenizer_assets(trained_local_path):
+            tokenizer_assets_path = trained_local_path
+        else:
+            tokenizer_assets_path = hf_assets_path
+
+        # processor は trained 側にあればそれを使い、なければ base 側
+        if _has_processor_assets(trained_local_path):
+            processor_assets_path = trained_local_path
+        else:
+            processor_assets_path = hf_assets_path
 
         if torch.distributed.is_initialized():
             if self.rank == 0:
-                repaired = _repair_safetensors_metadata_if_needed(local_path)
+                repaired = _repair_safetensors_metadata_if_needed(trained_local_path)
                 if repaired:
-                    logger.warning('Repaired missing safetensors metadata under %s', local_path)
+                    logger.warning(
+                        'Repaired missing safetensors metadata under %s',
+                        trained_local_path
+                    )
             torch.distributed.barrier()
         else:
-            repaired = _repair_safetensors_metadata_if_needed(local_path)
+            repaired = _repair_safetensors_metadata_if_needed(trained_local_path)
             if repaired:
-                logger.warning('Repaired missing safetensors metadata under %s', local_path)
+                logger.warning(
+                    'Repaired missing safetensors metadata under %s',
+                    trained_local_path
+                )
 
-        # note that we have to create model in fp32. Otherwise, the optimizer is in bf16, which is incorrect
-        # TODO(zhangchi.usc1992): 1. support create from random initialized model. 2. Support init with FSDP directly
-        self.tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
-        self.processor = hf_processor(local_path, trust_remote_code=trust_remote_code)
+        self.tokenizer = hf_tokenizer(
+            tokenizer_assets_path,
+            trust_remote_code=trust_remote_code
+        )
+        self.processor = hf_processor(
+            processor_assets_path,
+            trust_remote_code=trust_remote_code
+        )
 
         torch_dtype = fsdp_config.get('model_dtype', None)
         if torch_dtype is None:
@@ -993,57 +1435,74 @@ class WorldModelRolloutWorker(Worker):
         else:
             torch_dtype = PrecisionType.to_dtype(torch_dtype)
 
-        # override model kwargs
-        world_model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code)
-
-        self.generation_config = get_generation_config(local_path, trust_remote_code=trust_remote_code)
+        # config / generation_config は base(HF) 側から読む
+        world_model_config = AutoConfig.from_pretrained(
+            hf_assets_path,
+            trust_remote_code=trust_remote_code
+        )
+        self.generation_config = get_generation_config(
+            hf_assets_path,
+            trust_remote_code=trust_remote_code
+        )
 
         override_config_kwargs = {
             'bos_token_id': self.config.bos_token_id or self.tokenizer.bos_token_id,
             'eos_token_id': self.config.eos_token_id or self.tokenizer.eos_token_id,
             'pad_token_id': self.config.pad_token_id or self.tokenizer.pad_token_id,
         }
-        # override_config_kwargs = {
-        #     'bos_token_id': self.tokenizer.bos_token_id,
-        #     'eos_token_id': self.tokenizer.eos_token_id,
-        #     'pad_token_id': self.tokenizer.pad_token_id,
-        # }
         override_config_kwargs.update(override_model_config)
         update_model_config(world_model_config, override_config_kwargs=override_config_kwargs)
-        if self.rank == 0:
-            print(f'Model config after override: {world_model_config}')
 
-        # NOTE(fix me): tie_word_embedding causes meta_tensor init to hang
-        init_context = get_init_weight_context_manager(use_meta_tensor=not world_model_config.tie_word_embeddings,
-                                                       mesh=self.device_mesh)
+        world_model_config = _normalize_rope_for_hf(world_model_config, logger=logger)
+
+        init_context = get_init_weight_context_manager(
+            use_meta_tensor=not world_model_config.tie_word_embeddings,
+            mesh=self.device_mesh
+        )
 
         with init_context(), warnings.catch_warnings():
             warnings.simplefilter("ignore")
+
             if type(world_model_config) in AutoModelForVision2Seq._model_mapping.keys():
                 world_module_class = AutoModelForVision2Seq
             else:
                 world_module_class = AutoModelForCausalLM
 
-            world_module = world_module_class.from_pretrained(pretrained_model_name_or_path=local_path,
-                                                              torch_dtype=torch_dtype,
-                                                              config=world_model_config,
-                                                              attn_implementation='flash_attention_2',
-                                                              trust_remote_code=trust_remote_code)
+            # ベース構造は base(HF) 側から作る
+            world_module = world_module_class.from_pretrained(
+                pretrained_model_name_or_path=hf_assets_path,
+                torch_dtype=torch_dtype,
+                config=world_model_config,
+                attn_implementation='flash_attention_2',
+                trust_remote_code=trust_remote_code
+            )
+
+            # 学習済み重みdirが HF 完成モデルでない場合だけ safetensors を上書きロード
+            if not is_hf_model:
+                _load_world_model_weights(
+                    world_module,
+                    trained_local_path,
+                    logger=logger
+                )
 
             if use_remove_padding or self.ulysses_sequence_parallel_size > 1:
                 from verl.models.transformers.monkey_patch import apply_monkey_patch
-                apply_monkey_patch(model=world_module, ulysses_sp_size=self.ulysses_sequence_parallel_size)
+                apply_monkey_patch(
+                    model=world_module,
+                    ulysses_sp_size=self.ulysses_sequence_parallel_size
+                )
 
-            # Apply Liger kernel to the model if use_liger is set to True
             if use_liger:
                 from liger_kernel.transformers.monkey_patch import _apply_liger_kernel_to_instance
                 _apply_liger_kernel_to_instance(model=world_module)
 
-            # some parameters may not in torch_dtype. TODO(zhangchi.usc1992) remove this after we switch to fsdp2
             world_module.to(torch_dtype)
 
             if enable_gradient_checkpointing:
-                world_module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
+                world_module.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={'use_reentrant': False}
+                )
+
         torch.distributed.barrier()
 
         if self.rank == 0:
@@ -1051,23 +1510,37 @@ class WorldModelRolloutWorker(Worker):
 
         log_gpu_memory_usage('After init from HF AutoModel', logger=logger)
 
-        # We wrap FSDP for rollout as well
+        # rollout 側は base_path 側の HF asset をそのまま参照する
+        self._rollout_model_path = hf_assets_path
+
         mixed_precision_config = fsdp_config.get('mixed_precision', None)
         if mixed_precision_config is not None:
-            param_dtype = PrecisionType.to_dtype(mixed_precision_config.get('param_dtype', 'bf16'))
-            reduce_dtype = PrecisionType.to_dtype(mixed_precision_config.get('reduce_dtype', 'fp32'))
-            buffer_dtype = PrecisionType.to_dtype(mixed_precision_config.get('buffer_dtype', 'fp32'))
+            param_dtype = PrecisionType.to_dtype(
+                mixed_precision_config.get('param_dtype', 'bf16')
+            )
+            reduce_dtype = PrecisionType.to_dtype(
+                mixed_precision_config.get('reduce_dtype', 'fp32')
+            )
+            buffer_dtype = PrecisionType.to_dtype(
+                mixed_precision_config.get('buffer_dtype', 'fp32')
+            )
         else:
             param_dtype = torch.bfloat16
             reduce_dtype = torch.float32
             buffer_dtype = torch.float32
 
-        mixed_precision = MixedPrecision(param_dtype=param_dtype, reduce_dtype=reduce_dtype, buffer_dtype=buffer_dtype)
+        mixed_precision = MixedPrecision(
+            param_dtype=param_dtype,
+            reduce_dtype=reduce_dtype,
+            buffer_dtype=buffer_dtype
+        )
 
-        auto_wrap_policy = get_fsdp_wrap_policy(module=world_module, config=fsdp_config.get('wrap_policy', None))
+        auto_wrap_policy = get_fsdp_wrap_policy(
+            module=world_module,
+            config=fsdp_config.get('wrap_policy', None)
+        )
 
         if self._is_rollout and self.config.rollout.name == 'hf':
-            # TODO(zhangchi.usc1992, shengguangming) fix me. Current, auto_wrap_policy causes HFRollout to hang in Gemma
             auto_wrap_policy = None
 
         print(f'wrap_policy: {auto_wrap_policy}')
@@ -1075,10 +1548,8 @@ class WorldModelRolloutWorker(Worker):
         fsdp_mesh = self.device_mesh
         sharding_strategy = get_sharding_strategy(fsdp_mesh)
 
-        # TODO: add transformer policy
-        # We force reference policy to use CPUOffload to save memory.
-        # We force turn off CPUOffload for actor because it causes incorrect results when using grad accumulation
         cpu_offload = None if role == 'actor' else CPUOffload(offload_params=True)
+
         world_module_fsdp = FSDP(
             world_module,
             cpu_offload=cpu_offload,
@@ -1086,17 +1557,15 @@ class WorldModelRolloutWorker(Worker):
             use_orig_params=False,
             auto_wrap_policy=auto_wrap_policy,
             device_id=torch.cuda.current_device(),
-            sharding_strategy=sharding_strategy,  # zero3
-            # mixed_precision=mixed_precision,
+            sharding_strategy=sharding_strategy,
             sync_module_states=True,
             device_mesh=self.device_mesh,
-            forward_prefetch=False)
+            forward_prefetch=False
+        )
 
         log_gpu_memory_usage('After Actor FSDP init', logger=logger)
 
-
         return world_module_fsdp, world_model_config
-
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def generate_sequences(self, prompts: DataProto):
@@ -1105,29 +1574,20 @@ class WorldModelRolloutWorker(Worker):
 
         assert self._is_rollout
         if self._is_offload_param:
-            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+            load_fsdp_model_to_gpu(self.world_module_fsdp)
 
-        # meta_info = {
-        #     'eos_token_id':
-        #         self.generation_config.eos_token_id
-        #         if self.generation_config is not None else self.tokenizer.eos_token_id,
-        #     'pad_token_id':
-        #         self.generation_config.pad_token_id
-        #         if self.generation_config is not None else self.tokenizer.pad_token_id,
-        # }
         meta_info = {
             'eos_token_id': self.config.eos_token_id or self.tokenizer.eos_token_id,
             'pad_token_id': self.config.pad_token_id or self.tokenizer.pad_token_id,
         }
         prompts.meta_info.update(meta_info)
+
         with self.rollout_sharding_manager:
             # after parameters sync with rollout, offload actor model to CPU
             if self._is_offload_param:
                 raise NotImplementedError('offload_param is not supported for world model')
-                offload_fsdp_model_to_cpu(self.world_module_fsdp)
             if self._is_offload_optimizer:
                 raise NotImplementedError('offload_optimizer is not supported for world model')
-                offload_fsdp_optimizer(optimizer=self.actor_optimizer)
 
             log_gpu_memory_usage('After entering rollout sharding manager', logger=logger)
 
@@ -1147,15 +1607,17 @@ class WorldModelRolloutWorker(Worker):
     def compute_log_prob(self, data: DataProto):
         assert self._is_wm
         if self._is_offload_param:
-            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+            load_fsdp_model_to_gpu(self.world_module_fsdp)
 
         # Support all hardwares
         data = data.to(torch.cuda.current_device())
+
         # we should always recompute old_log_probs when it is HybridEngine
         data.meta_info['micro_batch_size'] = self.config.rollout.log_prob_micro_batch_size_per_gpu
         data.meta_info['max_token_len'] = self.config.rollout.log_prob_max_token_len_per_gpu
         data.meta_info['use_dynamic_bsz'] = self.config.rollout.log_prob_use_dynamic_bsz
         data.meta_info['temperature'] = self.config.rollout.temperature
+
         # perform recompute log_prob
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
@@ -1174,7 +1636,6 @@ class WorldModelRolloutWorker(Worker):
             offload_fsdp_model_to_cpu(self.world_module_fsdp)
 
         log_gpu_memory_usage('After compute_log_prob', logger=logger)
-        # breakpoint()
         return output
 
 

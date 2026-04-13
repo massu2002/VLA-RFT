@@ -15,13 +15,15 @@
 
 import enum
 import json
+import copy
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Optional, Union
 
 from transformers import PretrainedConfig
 
 # Add for verl
-from vllm.config import ModelConfig
+import vllm.config as _vllm_config_mod
+from vllm.config import ModelConfig as VLLMBaseModelConfig
 from vllm.logger import init_logger
 from vllm.utils import is_hip
 
@@ -29,6 +31,149 @@ if TYPE_CHECKING:
     from vllm.model_executor.model_loader.loader import BaseModelLoader
 
 logger = init_logger(__name__)
+
+
+def _drop_attr(obj, name):
+    try:
+        setattr(obj, name, None)
+    except Exception:
+        pass
+
+    try:
+        obj.__dict__.pop(name, None)
+    except Exception:
+        pass
+
+    for internal_name in ("_internal_dict", "internal_dict"):
+        try:
+            d = getattr(obj, internal_name, None)
+            if d is not None and hasattr(d, "pop"):
+                d.pop(name, None)
+        except Exception:
+            pass
+
+
+def _rope_type(x):
+    if not isinstance(x, dict):
+        return None
+    return x.get("rope_type", x.get("type"))
+
+
+def _sanitize_rope_in_place(obj, prefix="root"):
+    if obj is None:
+        return
+
+    rp = getattr(obj, "rope_parameters", None)
+    if isinstance(rp, dict):
+        rp = dict(rp)
+        rp_type = _rope_type(rp)
+
+        if "type" in rp and "rope_type" not in rp:
+            rp["rope_type"] = rp.pop("type")
+
+        # default だけ no-scaling として落とす
+        if rp_type == "default":
+            _drop_attr(obj, "rope_parameters")
+        else:
+            try:
+                setattr(obj, "rope_parameters", rp)
+            except Exception:
+                pass
+
+            # rope_scaling が未設定なら補助的に移す
+            rs = getattr(obj, "rope_scaling", None)
+            if rs is None:
+                try:
+                    setattr(obj, "rope_scaling", dict(rp))
+                except Exception:
+                    pass
+
+    elif rp is not None:
+        _drop_attr(obj, "rope_parameters")
+
+    rs = getattr(obj, "rope_scaling", None)
+    if isinstance(rs, dict):
+        rs = dict(rs)
+        rs_type = _rope_type(rs)
+
+        if "type" in rs and "rope_type" not in rs:
+            rs["rope_type"] = rs.pop("type")
+
+        # default だけ落とす
+        if rs_type == "default":
+            _drop_attr(obj, "rope_scaling")
+        else:
+            try:
+                setattr(obj, "rope_scaling", rs)
+            except Exception:
+                pass
+
+    elif rs is not None:
+        _drop_attr(obj, "rope_scaling")
+
+    for child_name in ("text_config", "language_config", "llm_config", "decoder_config", "generator_config"):
+        child = getattr(obj, child_name, None)
+        if child is not None and child is not obj:
+            _sanitize_rope_in_place(child, f"{prefix}.{child_name}")
+
+
+def _safe_to_dict(cfg):
+    try:
+        return cfg.to_dict()
+    except Exception:
+        return None
+
+
+def _log_rope_tree_from_dict(d, prefix="root"):
+    if isinstance(d, dict):
+        rs = d.get("rope_scaling", "__missing__")
+        rp = d.get("rope_parameters", "__missing__")
+
+        if rs != "__missing__" or rp != "__missing__":
+            logger.warning(
+                "DEBUG ROPE %s | rope_scaling=%r | rope_parameters=%r",
+                prefix, None if rs == "__missing__" else rs, None if rp == "__missing__" else rp
+            )
+
+        for k, v in d.items():
+            if isinstance(v, dict):
+                _log_rope_tree_from_dict(v, f"{prefix}.{k}")
+            elif isinstance(v, list):
+                for i, item in enumerate(v):
+                    if isinstance(item, dict):
+                        _log_rope_tree_from_dict(item, f"{prefix}.{k}[{i}]")
+
+
+if not getattr(_vllm_config_mod, "_verl_rope_fix_installed", False):
+    _orig_get_and_verify_max_len = _vllm_config_mod._get_and_verify_max_len
+
+    def _patched_get_and_verify_max_len(*args, **kwargs):
+        hf_config = kwargs.get("hf_config", None)
+        if hf_config is None and len(args) >= 1:
+            hf_config = args[0]
+
+        if hf_config is not None:
+            logger.warning("========== ROPE FIX before _get_and_verify_max_len ==========")
+            logger.warning(
+                "ROPE FIX incoming class=%s _name_or_path=%r",
+                hf_config.__class__.__name__,
+                getattr(hf_config, "_name_or_path", None),
+            )
+
+            before = _safe_to_dict(hf_config)
+            if before is not None:
+                _log_rope_tree_from_dict(before, "before_fix")
+
+            _sanitize_rope_in_place(hf_config)
+
+            after = _safe_to_dict(hf_config)
+            if after is not None:
+                _log_rope_tree_from_dict(after, "after_fix")
+
+        return _orig_get_and_verify_max_len(*args, **kwargs)
+
+    _vllm_config_mod._get_and_verify_max_len = _patched_get_and_verify_max_len
+    _vllm_config_mod._verl_rope_fix_installed = True
 
 
 class LoadFormat(str, enum.Enum):
@@ -41,11 +186,18 @@ class LoadFormat(str, enum.Enum):
     DUMMY_DTENSOR = "dummy_dtensor"
 
 
-class ModelConfig(ModelConfig):
-
+class ModelConfig(VLLMBaseModelConfig):
     def __init__(self, hf_config: PretrainedConfig, *args, **kwargs) -> None:
-        super().__init__(model=hf_config._name_or_path, tokenizer=hf_config._name_or_path, *args, **kwargs)
-        self.hf_config = hf_config
+        safe_hf_config = copy.deepcopy(hf_config)
+        _sanitize_rope_in_place(safe_hf_config)
+
+        super().__init__(
+            model=safe_hf_config._name_or_path,
+            tokenizer=safe_hf_config._name_or_path,
+            *args,
+            **kwargs
+        )
+        self.hf_config = safe_hf_config
 
 
 @dataclass

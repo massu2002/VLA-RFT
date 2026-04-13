@@ -1,13 +1,23 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
 set -x
 
-# Run with: bash scripts/libero/post_train_rlvr.sh
-N_GPUS_PER_NODE=8
+# Run with: bash train/verl/examples/grpo_trainer/run_vla_rft.sh
+
+# 外側から渡されなければデフォルト値を使う
+N_GPUS_PER_NODE="${N_GPUS_PER_NODE:-8}"
+WORLD_MODEL_PATH="${WORLD_MODEL_PATH:-checkpoints/libero/WorldModel/${LIBERO_TASK_NAME}}"
+
+echo "LIBERO_TASK_NAME=${LIBERO_TASK_NAME}"
+echo "N_GPUS_PER_NODE=${N_GPUS_PER_NODE}"
+echo "WORLD_MODEL_PATH=${WORLD_MODEL_PATH}"
 
 python3 -m verl.trainer.main_vla_rft_grpo \
     trainer.total_training_steps=400 \
     trainer.save_freq=50 \
     trainer.nnodes=1 \
-    trainer.n_gpus_per_node=${N_GPUS_PER_NODE} \
+    trainer.n_gpus_per_node="${N_GPUS_PER_NODE}" \
     trainer.use_ac_reward=False \
     trainer.ac_reward_type='l1' \
     trainer.reward_fn=mae \
@@ -18,7 +28,7 @@ python3 -m verl.trainer.main_vla_rft_grpo \
     trainer.save_last_num=2 \
     trainer.val_iters=10 \
     trainer.test_freq=-1 \
-    trainer.default_local_dir=checkpoints/libero/RFT/${LIBERO_TASK_NAME}/${DATE}_${POST_EXP_NAME} \
+    trainer.default_local_dir="checkpoints/libero/RFT/${LIBERO_TASK_NAME}/${DATE}_${POST_EXP_NAME}" \
     trainer.msp_reward_aggregate=mean \
     trainer.msp_reward_discount=0.95 \
     trainer.loss_weight.mse=0 \
@@ -26,7 +36,7 @@ python3 -m verl.trainer.main_vla_rft_grpo \
     trainer.loss_weight.mae=1 \
     data.train_batch_size=16 \
     data.video.dataset_path=data/modified_libero_rlds \
-    data.video.dataset_name=libero_${LIBERO_TASK_NAME}_no_noops \
+    data.video.dataset_name="libero_${LIBERO_TASK_NAME}_no_noops" \
     algorithm.adv_estimator=grpo \
     actor_rollout_ref.actor.log_l1_loss=True \
     actor_rollout_ref.actor.optim.lr=1e-6 \
@@ -49,10 +59,11 @@ python3 -m verl.trainer.main_vla_rft_grpo \
     actor_rollout_ref.rollout.n=16 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
-    actor_rollout_ref.model.ckpt_path=checkpoints/libero/Base/${LIBERO_TASK_NAME} \
-    actor_rollout_ref.model.cfg_path=checkpoints/libero/Base/${LIBERO_TASK_NAME}/config.json \
+    actor_rollout_ref.model.ckpt_path="checkpoints/libero/Base/${LIBERO_TASK_NAME}" \
+    actor_rollout_ref.model.cfg_path="checkpoints/libero/Base/${LIBERO_TASK_NAME}/config.json" \
     algorithm.use_kl_in_reward=False \
-    world_model_rollout.model.path=checkpoints/libero/WorldModel/${LIBERO_TASK_NAME} \
+    world_model_rollout.model.base_path="checkpoints/libero/WorldModel/${LIBERO_TASK_NAME}" \
+    world_model_rollout.model.path="${WORLD_MODEL_PATH}" \
     world_model_rollout.model.use_remove_padding=False \
     world_model_rollout.world_model.vocab_size=9008 \
     world_model_rollout.rollout.tensor_model_parallel_size=1 \
@@ -69,7 +80,7 @@ python3 -m verl.trainer.main_vla_rft_grpo \
     processor.action_dim=7 \
     processor.action_ranges_path=train/verl/ivideogpt/configs/libero_action_ranges.pth \
     processor.tokenizer.path=checkpoints/libero/WorldModel/Tokenizer \
-    processor.interact=True\
+    processor.interact=True \
     processor.tokenizer.name=ctx_cnn \
     data.max_prompt_length=1095 \
     data.max_response_length=568 \
@@ -79,4 +90,4 @@ python3 -m verl.trainer.main_vla_rft_grpo \
     processor.tokens_per_frame=64 \
     processor.processor_type=ctx_msp \
     processor.max_length=1663 \
-    processor.use_img_gt_ac=True \
+    processor.use_img_gt_ac=True

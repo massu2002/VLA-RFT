@@ -15,7 +15,12 @@ from torchvision.transforms import CenterCrop, Compose, Normalize, Resize, ToTen
 from transformers import PreTrainedTokenizerBase
 from transformers.image_processing_utils import BatchFeature, ImageProcessingMixin
 from transformers.processing_utils import ProcessorMixin
-from transformers.tokenization_utils import PaddingStrategy, PreTokenizedInput, TextInput, TruncationStrategy
+from transformers.tokenization_utils_base import (
+    PaddingStrategy,
+    PreTokenizedInput,
+    TextInput,
+    TruncationStrategy,
+)
 from transformers.utils import TensorType
 
 

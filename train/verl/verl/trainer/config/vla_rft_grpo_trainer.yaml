@@ -178,6 +178,7 @@ world_model_rollout:
   hybrid_engine: True
   model:
     path: ~/models/deepseek-llm-7b-chat
+    base_path: null
     external_lib: null
     override_config: { }
     enable_gradient_checkpointing: True

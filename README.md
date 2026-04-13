@@ -38,22 +38,86 @@ cd VLA-RFT
 
 ```bash
 # 1) Set up the environment
+rm -rf .venv
 git submodule update --init --recursive
 uv venv --seed -p 3.10
 source .venv/bin/activate
+python -m pip install -U pip setuptools wheel
 
-# 2) Install dependencies
+# 2) install the shared base FIRST (verl / vLLM side)
+# CUDA 12.4 を使う例。環境に合わせて cu121 / cu122 / cu124 は合わせてください。
+uv pip install --index-url https://download.pytorch.org/whl/cu124 \
+  torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0
+
+uv pip install \
+  numpy==1.26.4 \
+  "fsspec>=2023.1.0,<=2026.2.0" \
+  transformers==4.45.0 \
+  timm==0.9.10 \
+  sentencepiece==0.1.99 \
+  accelerate>=0.25.0 \
+  peft==0.11.1 \
+  protobuf \
+  einops \
+  rich \
+  matplotlib \
+  jsonlines \
+  huggingface_hub \
+  draccus==0.8.0 \
+  imageio \
+  uvicorn \
+  fastapi \
+  wandb
+
+# 3) install verl
 uv pip install -e train/verl/".[gpu]"
-uv pip install 'https://github.com/Dao-AILab/flash-attention/releases/download/v2.6.0.post1/flash_attn-2.6.0.post1+cu122torch2.4cxx11abiFALSE-cp310-cp310-linux_x86_64.whl'
 uv pip install -e train/verl/".[vllm]"
 uv pip install -r train/verl/requirements.txt
 
-# 3) Install vla-adapter
-uv pip install git+https://github.com/moojink/dlimp_openvla.git
-uv pip install -e train/verl/vla-adapter/openvla-oft
+# 4) re-pin shared versions AFTER verl extras
+uv pip install \
+  numpy==1.26.4 \
+  "fsspec>=2023.1.0,<=2026.2.0" \
+  transformers==4.45.0 \
+  torch==2.4.0 \
+  torchvision==0.19.0 \
+  torchaudio==2.4.0
 
-# 4) Install LIBERO requirements
+# 5) flash-attn
+# 既存 wheel を使うなら "torch 2.4.x と CUDA バリアント" を一致させること
+# 一致する wheel がない場合は source build にする
+uv pip install packaging ninja
+uv pip install 'https://github.com/Dao-AILab/flash-attention/releases/download/v2.6.0.post1/flash_attn-2.6.0.post1+cu122torch2.4cxx11abiFALSE-cp310-cp310-linux_x86_64.whl'
+
+# 6) TensorFlow side needed by openvla-oft / dlimp
+uv pip install \
+  tensorflow==2.15.0 \
+  tensorflow-datasets==4.9.3 \
+  tensorflow-graphics==2021.12.3
+
+# 7) install dlimp, but do NOT let it rewrite shared deps
+uv pip install git+https://github.com/moojink/dlimp_openvla.git --no-deps
+
+# 8) install openvla-oft code only (important)
+uv pip install -e train/verl/vla-adapter/openvla-oft --no-deps
+
+# 9) install LIBERO
+# まずは通常。shared deps を壊すようなら --no-deps に切り替える
 uv pip install -e third_party/LIBERO
+
+# 10) verify
+python - <<'PY'
+import torch, torchvision, torchaudio, numpy, transformers
+print("torch       =", torch.__version__)
+print("torchvision =", torchvision.__version__)
+print("torchaudio  =", torchaudio.__version__)
+print("numpy       =", numpy.__version__)
+print("transformers=", transformers.__version__)
+PY
+
+uv pip install json-numpy
+uv pip check
+
 ```
 
 ### Installation(If your network is restricted)

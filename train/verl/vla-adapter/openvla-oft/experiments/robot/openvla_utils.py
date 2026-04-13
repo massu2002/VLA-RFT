@@ -16,7 +16,13 @@ import tensorflow as tf
 import torch
 from huggingface_hub import HfApi, hf_hub_download
 from PIL import Image
-from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor
+from transformers import AutoConfig, AutoImageProcessor, AutoProcessor
+try:
+    from transformers import AutoModelForVision2Seq as AutoModelForVLA
+    AUTO_MODEL_CLASS_NAME = "AutoModelForVision2Seq"
+except ImportError:
+    from transformers import AutoModelForImageTextToText as AutoModelForVLA
+    AUTO_MODEL_CLASS_NAME = "AutoModelForImageTextToText"
 
 # Apply JSON numpy patch for serialization
 json_numpy.patch()
@@ -291,14 +297,14 @@ def get_vla(cfg: Any) -> torch.nn.Module:
         AutoConfig.register("openvla", OpenVLAConfig)
         AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor)
         AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
-        AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
+        AutoModelForVLA.register(OpenVLAConfig, OpenVLAForActionPrediction)
 
         # Update config.json and sync model files
         update_auto_map(cfg.pretrained_checkpoint)
         check_model_logic_mismatch(cfg.pretrained_checkpoint)
 
     # Load the model
-    vla = AutoModelForVision2Seq.from_pretrained(
+    vla = AutoModelForVLA.from_pretrained(
         cfg.pretrained_checkpoint,
         attn_implementation="flash_attention_2",
         torch_dtype=torch.bfloat16,
