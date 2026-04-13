@@ -8,6 +8,7 @@ outputs
 rollouts
 amused
 worldmodel/visualizations
+worldmodel/eval_reports
 
 **/core.*
 **/test

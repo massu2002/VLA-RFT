@@ -39,7 +39,8 @@ class SampleWindow:
 
 
 class LiberoWorldModelIterableDataset(IterableDataset):
-    """Streams fixed-length windows from RLDS LIBERO episodes.
+    """
+    Streams fixed-length windows from RLDS LIBERO episodes.
 
     Each yielded sample contains a raw chunk of frames/actions. The trainer
     prepends the context frame/action, mirroring the paper's stage-I world
