@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from datetime import datetime
 from pathlib import Path
 
@@ -25,6 +26,7 @@ def build_parser():
     parser.add_argument("--tokenizer-micro-batch-size", type=int, default=4)
     parser.add_argument("--batch-size-per-device", type=int, default=1)
     parser.add_argument("--grad-accum", type=int, default=4)
+    parser.add_argument("--global-batch-size", type=int, default=None)
     parser.add_argument("--learning-rate", type=float, default=5e-5)
     parser.add_argument("--warmup-ratio", type=float, default=0.0)
     parser.add_argument("--weight-decay", type=float, default=0.0)
@@ -39,6 +41,9 @@ def build_parser():
     parser.add_argument("--save-total-limit", type=int, default=3)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--lr-scheduler-type", type=str, default="constant")
+    parser.add_argument("--precision", type=str, choices=["auto", "bf16", "fp16", "fp32"], default="auto")
+    parser.add_argument("--tf32", action="store_true", default=False)
+    parser.add_argument("--no-tf32", dest="tf32", action="store_false")
     parser.add_argument("--load-pretrained-weights", action="store_true", default=False)
     parser.add_argument("--gradient-checkpointing", action="store_true", default=True)
     parser.add_argument("--no-gradient-checkpointing", dest="gradient_checkpointing", action="store_false")
@@ -52,9 +57,44 @@ class SimpleCollator:
         return {"pixels": pixels, "actions": actions}
 
 
+def resolve_world_size() -> int:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_world_size()
+    return 1
+
+
+def resolve_precision(precision: str) -> tuple[torch.dtype, bool, bool, str]:
+    if precision == "bf16":
+        return torch.bfloat16, True, False, "bf16"
+    if precision == "fp16":
+        return torch.float16, False, True, "fp16"
+    if precision == "fp32":
+        return torch.float32, False, False, "fp32"
+
+    if torch.cuda.is_available():
+        return torch.float16, False, True, "fp16"
+    return torch.float32, False, False, "fp32"
+
+
 def main():
     args = build_parser().parse_args()
     torch.manual_seed(args.seed)
+    world_size = resolve_world_size()
+
+    if args.batch_size_per_device < 1:
+        raise ValueError("--batch-size-per-device must be at least 1")
+    if args.grad_accum < 1:
+        raise ValueError("--grad-accum must be at least 1")
+    if args.global_batch_size is not None:
+        if args.global_batch_size < 1:
+            raise ValueError("--global-batch-size must be at least 1")
+        args.grad_accum = max(1, math.ceil(args.global_batch_size / (args.batch_size_per_device * world_size)))
+
+    torch_dtype, use_bf16, use_fp16, autocast_dtype = resolve_precision(args.precision)
+
+    if args.tf32 and torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
     task_dataset_name = resolve_dataset_name(args.task_suite)
     raw_chunk_length = args.segment_length
@@ -81,6 +121,7 @@ def main():
         eos_token_id=eos_token_id,
         pad_token_id=pad_token_id,
         tokens_per_frame=64,
+        autocast_dtype=autocast_dtype,
         processor_type="ctx_msp",
         use_img_gt_ac=False,
         interact=False,
@@ -90,7 +131,7 @@ def main():
         lm_path=args.model_template,
         visual_tokenizer_path=args.visual_tokenizer,
         runtime_cfg=runtime_cfg,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=torch_dtype,
         gradient_checkpointing=args.gradient_checkpointing,
         load_pretrained_weights=args.load_pretrained_weights,
     )
@@ -106,7 +147,7 @@ def main():
         shuffle_windows=True,
     )
 
-    training_args = TrainingArguments(
+    training_kwargs = dict(
         output_dir=str(output_dir),
         per_device_train_batch_size=args.batch_size_per_device,
         gradient_accumulation_steps=args.grad_accum,
@@ -120,18 +161,22 @@ def main():
         adam_epsilon=args.adam_epsilon,
         max_grad_norm=args.max_grad_norm,
         max_steps=args.max_steps,
-        bf16=True,
-        fp16=False,
+        bf16=use_bf16,
+        fp16=use_fp16,
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
         save_total_limit=args.save_total_limit,
         report_to=["tensorboard"],
         remove_unused_columns=False,
         dataloader_num_workers=args.num_workers,
-        ddp_find_unused_parameters=False,
         logging_dir=str(output_dir / "logs"),
         seed=args.seed,
+        dataloader_pin_memory=torch.cuda.is_available(),
     )
+    if world_size > 1:
+        training_kwargs["ddp_find_unused_parameters"] = False
+
+    training_args = TrainingArguments(**training_kwargs)
 
     trainer = Trainer(
         model=model,
@@ -154,6 +199,15 @@ def main():
             "max_steps": args.max_steps,
             "segment_length": args.segment_length,
             "raw_chunk_length": raw_chunk_length,
+            "world_size": world_size,
+            "batch_size_per_device": args.batch_size_per_device,
+            "grad_accum": args.grad_accum,
+            "global_batch_size": args.batch_size_per_device * args.grad_accum * world_size,
+            "precision": args.precision,
+            "resolved_torch_dtype": str(torch_dtype),
+            "autocast_dtype": autocast_dtype,
+            "bf16": use_bf16,
+            "fp16": use_fp16,
             "timestamp": datetime.now().isoformat(),
         }
         with open(output_dir / "worldmodel_training_summary.json", "w", encoding="utf-8") as f:

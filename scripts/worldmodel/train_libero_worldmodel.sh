@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+# cd ~/VLA-RFT && bash scripts/worldmodel/train_libero_worldmodel.sh
+
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -12,9 +14,13 @@ export TOKENIZERS_PARALLELISM="false"
 
 DATE="${DATE:-$(date +%Y%m%d)}"
 EXP_NAME="${EXP_NAME:-worldmodel_scratch}"
-NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
+DETECTED_GPU_COUNT=$(./.venv/bin/python -c 'import torch; print(max(torch.cuda.device_count(), 1))')
+NPROC_PER_NODE="${NPROC_PER_NODE:-${DETECTED_GPU_COUNT}}"
 WORLD_MODEL_BATCH_SIZE="${WORLD_MODEL_BATCH_SIZE:-16}"
 BATCH_SIZE_PER_DEVICE="${BATCH_SIZE_PER_DEVICE:-1}"
+TOKENIZER_MICRO_BATCH_SIZE="${TOKENIZER_MICRO_BATCH_SIZE:-4}"
+MAX_STEPS="${MAX_STEPS:-15000}"
+PRECISION="${PRECISION:-bf16}"
 
 if [ -n "${LIBERO_TASKS:-}" ]; then
   read -r -a TASKS <<< "${LIBERO_TASKS}"
@@ -26,6 +32,8 @@ mkdir -p "${REPO_ROOT}/logs/libero/WorldModel/${DATE}"
 
 echo "REPO_ROOT=${REPO_ROOT}"
 echo "PYTHONPATH=${PYTHONPATH}"
+echo "Detected GPU count: ${DETECTED_GPU_COUNT}"
+echo "Using NPROC_PER_NODE=${NPROC_PER_NODE}"
 echo "LIBERO tasks: ${TASKS[*]}"
 
 TOTAL_PER_STEP=$((NPROC_PER_NODE * BATCH_SIZE_PER_DEVICE))
@@ -64,34 +72,43 @@ for task_name in "${TASKS[@]}"; do
   echo "Tokenizer: ${visual_tokenizer_dir}"
   echo "Output: ${output_dir}"
 
+  train_cmd=(
+    -m worldmodel.libero.train
+    --task-suite "${task_name}"
+    --data-root "${REPO_ROOT}/data/modified_libero_rlds"
+    --model-template "${model_template_dir}"
+    --visual-tokenizer "${visual_tokenizer_dir}"
+    --output-dir "${output_dir}"
+    --max-steps "${MAX_STEPS}"
+    --segment-length 8
+    --context-length 1
+    --tokenizer-micro-batch-size "${TOKENIZER_MICRO_BATCH_SIZE}"
+    --batch-size-per-device "${BATCH_SIZE_PER_DEVICE}"
+    --grad-accum "${GRAD_ACCUM}"
+    --precision "${PRECISION}"
+    --learning-rate 5e-5
+    --warmup-ratio 0.0
+    --weight-decay 0.0
+    --adam-beta1 0.9
+    --adam-beta2 0.999
+    --adam-epsilon 1e-8
+    --max-grad-norm 1.0
+    --optim adamw_torch
+    --save-steps 5000
+    --logging-steps 10
+    --save-total-limit 3
+    "${extra_args[@]}"
+  )
+
   (
     cd "${REPO_ROOT}"
-    torchrun --standalone --nnodes=1 \
-      --nproc_per_node="${NPROC_PER_NODE}" \
-      -m worldmodel.libero.train \
-      --task-suite "${task_name}" \
-      --data-root "${REPO_ROOT}/data/modified_libero_rlds" \
-      --model-template "${model_template_dir}" \
-      --visual-tokenizer "${visual_tokenizer_dir}" \
-      --output-dir "${output_dir}" \
-      --max-steps 150000 \
-      --segment-length 8 \
-      --context-length 1 \
-      --tokenizer-micro-batch-size 4 \
-      --batch-size-per-device 1 \
-      --grad-accum "${GRAD_ACCUM}" \
-      --learning-rate 5e-5 \
-      --warmup-ratio 0.0 \
-      --weight-decay 0.0 \
-      --adam-beta1 0.9 \
-      --adam-beta2 0.999 \
-      --adam-epsilon 1e-8 \
-      --max-grad-norm 1.0 \
-      --optim adamw_torch \
-      --save-steps 5000 \
-      --logging-steps 10 \
-      --save-total-limit 3 \
-      "${extra_args[@]}"
+    if (( NPROC_PER_NODE == 1 )); then
+      ./.venv/bin/python "${train_cmd[@]}"
+    else
+      torchrun --standalone --nnodes=1 \
+        --nproc_per_node="${NPROC_PER_NODE}" \
+        "${train_cmd[@]}"
+    fi
   ) 2>&1 | tee "${task_log}"
 
   echo "===== Finished LIBERO world-model training: ${task_name} ====="

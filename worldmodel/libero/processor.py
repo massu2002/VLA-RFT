@@ -44,7 +44,15 @@ class ContextMultiStepPredictionProcessor:
         return "cuda" if tensor.is_cuda else "cpu"
 
     def _autocast_dtype(self, tensor: torch.Tensor) -> torch.dtype:
-        return torch.bfloat16 if tensor.is_cuda else torch.float32
+        if not tensor.is_cuda:
+            return torch.float32
+
+        dtype_name = getattr(self.config, "autocast_dtype", "bf16")
+        if dtype_name == "bf16":
+            return torch.bfloat16
+        if dtype_name == "fp16":
+            return torch.float16
+        return torch.float32
 
     def _discretize_actions(self, actions, num_bins=256):
         if actions.dim() == 3:

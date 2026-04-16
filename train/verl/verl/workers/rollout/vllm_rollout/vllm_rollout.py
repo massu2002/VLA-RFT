@@ -163,6 +163,7 @@ class vLLMRollout(BaseRollout):
             self.inference_engine.init_cache_engine()
 
         idx = prompts.batch['input_ids']  # (bs, prompt_length)
+        prompt_length = idx.size(1)
 
         # left-padded attention_mask
         attention_mask = prompts.batch['attention_mask']
@@ -227,7 +228,7 @@ class vLLMRollout(BaseRollout):
                         for j in range(len(output[0])):
                             gt_idx_list[j] += output[0][j].cpu().numpy().tolist()
                             gt_idx_list[j] += gt_actions[j, t+1].detach().cpu().numpy().tolist()
-                        gt_response = torch.tensor(gt_idx_list)[:, self.config.prompt_length:].to(idx.device)
+                        gt_response = torch.tensor(gt_idx_list)[:, prompt_length:].to(idx.device)
                 for t in range(actions.shape[1]-1):  # T-1
                     output = self.inference_engine.generate(
                         prompt_token_ids=idx_list,
@@ -239,7 +240,7 @@ class vLLMRollout(BaseRollout):
                     for j in range(len(output[0])):
                         idx_list[j] += output[0][j].cpu().numpy().tolist()
                         idx_list[j] += actions[j, t+1].detach().cpu().numpy().tolist()
-                response = torch.tensor(idx_list)[:, self.config.prompt_length:].to(idx.device)
+                response = torch.tensor(idx_list)[:, prompt_length:].to(idx.device)
 
             else:
                 raise NotImplementedError("vLLMRollout_wm does not support non-interact mode")

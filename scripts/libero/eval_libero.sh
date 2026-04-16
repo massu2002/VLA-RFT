@@ -14,12 +14,13 @@ export HF_ENDPOINT="https://hf-mirror.com"
 # ==============================
 # POST_EXP_NAME="BASE"
 POST_EXP_NAME="RFT_400"
+ACTOR_MODEL_VERSION="20260414_vla_adapter_w_fm_head"
 
 CUDA_VISIBLE_DEVICES="0"
-LIBERO_TASKS=(goal 10)
-# LIBERO_TASKS=(spatial object)
 
-# タスクごとに別のモデルディレクトリを使う場合はここを編集してください。
+# デフォルトタスク（引数がないときだけ使う）
+DEFAULT_LIBERO_TASKS=(spatial object goal 10)
+
 declare -A BASE_MODEL_DIRS=(
   [spatial]="${REPO_ROOT}/checkpoints/libero/Base/spatial"
   [object]="${REPO_ROOT}/checkpoints/libero/Base/object"
@@ -28,11 +29,41 @@ declare -A BASE_MODEL_DIRS=(
 )
 
 declare -A ACTOR_MODEL_DIRS=(
-  [spatial]="${REPO_ROOT}/checkpoints/libero/RFT/spatial/20260404_vla_adapter_w_fm_head/global_step_400/actor"
-  [object]="${REPO_ROOT}/checkpoints/libero/RFT/object/20260404_vla_adapter_w_fm_head/global_step_400/actor"
-  [goal]="${REPO_ROOT}/checkpoints/libero/RFT/goal/20260404_vla_adapter_w_fm_head/global_step_400/actor"
-  [10]="${REPO_ROOT}/checkpoints/libero/RFT/10/20260404_vla_adapter_w_fm_head/global_step_400/actor"
+  [spatial]="${REPO_ROOT}/checkpoints/libero/RFT/spatial/${ACTOR_MODEL_VERSION}/global_step_400/actor"
+  [object]="${REPO_ROOT}/checkpoints/libero/RFT/object/${ACTOR_MODEL_VERSION}/global_step_400/actor"
+  [goal]="${REPO_ROOT}/checkpoints/libero/RFT/goal/${ACTOR_MODEL_VERSION}/global_step_400/actor"
+  [10]="${REPO_ROOT}/checkpoints/libero/RFT/10/${ACTOR_MODEL_VERSION}/global_step_400/actor"
 )
+
+usage() {
+  cat <<EOF
+Usage:
+  bash scripts/libero/eval_libero.sh [task1] [task2] ...
+
+Examples:
+  bash scripts/libero/eval_libero.sh spatial
+  bash scripts/libero/eval_libero.sh object
+  bash scripts/libero/eval_libero.sh spatial object
+  bash scripts/libero/eval_libero.sh goal
+  bash scripts/libero/eval_libero.sh 10
+
+If no task is given, defaults to:
+  ${DEFAULT_LIBERO_TASKS[*]}
+EOF
+}
+
+# ヘルプ表示
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+# 引数があればそれを使う。なければデフォルトを使う
+if (($# > 0)); then
+  LIBERO_TASKS=("$@")
+else
+  LIBERO_TASKS=("${DEFAULT_LIBERO_TASKS[@]}")
+fi
 
 current_time=$(date "+%Y-%m-%d_%H-%M-%S")
 echo "Current Time: ${current_time}"
@@ -49,7 +80,8 @@ resolve_model_dir() {
     return
   fi
 
-  echo "Please set ${array_name} in scripts/libero/eval_libero.sh" >&2
+  echo "Unknown task '${task_name}'." >&2
+  echo "Available tasks: ${!model_dirs[*]}" >&2
   exit 1
 }
 
@@ -83,7 +115,10 @@ for task_name in "${LIBERO_TASKS[@]}"; do
 
   ACTOR_ARGS=()
   if [ -n "${ACTOR_PATH}" ]; then
-    ACTOR_ARGS=(--actor_path "${ACTOR_PATH}")
+    ACTOR_ARGS=(
+      --actor_path "${ACTOR_PATH}"
+      --actor_model_version "${ACTOR_MODEL_VERSION}"
+    )
   fi
 
   (

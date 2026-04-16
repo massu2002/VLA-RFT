@@ -92,6 +92,7 @@ class GenerateConfig:
     #################################################################################################################
     model_family: str = "openvla"                    # Model family
     pretrained_checkpoint: Union[str, Path] = ""     # Pretrained checkpoint path
+    actor_model_version: Optional[str] = None        # Oprional trained actor model version
     actor_path: Optional[Union[str, Path]] = None    # Optional trained actor checkpoint path
     use_l1_regression: bool = False                   # If True, uses continuous action head with L1 regression objective
     use_diffusion: bool = True                      # If True, uses continuous action head with diffusion modeling objective (DDIM)
@@ -287,7 +288,7 @@ def get_rollout_root_dir(cfg: GenerateConfig) -> Path:
     repo_root = Path(os.environ.get("REPO_ROOT", Path.cwd())).resolve()
     post_exp_name = sanitize_for_path(cfg.run_id_note or "default")
     libero_task_name = cfg.task_suite_name.replace("libero_", "", 1)
-    return repo_root / "rollouts" / "libero" / post_exp_name / libero_task_name
+    return repo_root / "rollouts" / "libero" / post_exp_name / cfg.actor_model_version / libero_task_name
 
 
 def prepare_observation(obs, resize_size):

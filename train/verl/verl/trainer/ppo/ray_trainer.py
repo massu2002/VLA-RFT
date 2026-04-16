@@ -1212,6 +1212,22 @@ class RayVLARFTGRPOTrainer(RayPPOTrainer):
             cv2.putText(img_np, f"Reward: {reward:.4f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
                         1, (255, 0, 0), 2, cv2.LINE_AA)
         cv2.imwrite(filename, img_np)
+
+    def _build_world_model_prompt_from_ctx_tokens(self, batch: DataProto, ctx_tokens: DataProto) -> DataProto:
+        ctx_tensor = ctx_tokens.batch['ctx_tokens']
+        prompt_input_ids = ctx_tensor.reshape(ctx_tensor.shape[0], -1).long()
+        prompt_attention_mask = torch.ones_like(prompt_input_ids, dtype=batch.batch['attention_mask'].dtype)
+        prompt_position_ids = torch.arange(
+            prompt_input_ids.shape[1],
+            device=prompt_input_ids.device,
+            dtype=batch.batch['position_ids'].dtype,
+        ).unsqueeze(0).expand(prompt_input_ids.shape[0], -1)
+
+        batch.batch['input_ids'] = prompt_input_ids
+        batch.batch['attention_mask'] = prompt_attention_mask
+        batch.batch['position_ids'] = prompt_position_ids
+        return batch
+
     def reward_fn(self, batch: DataProto, pixels, return_reward_tensor=True, save_pred=False, pixels_before_repeat=None):
         if pixels_before_repeat is None:
             pixels_before_repeat = pixels
@@ -1665,6 +1681,9 @@ class RayVLARFTGRPOTrainer(RayPPOTrainer):
                             ctx_tokens = wm_batch.pop(batch_keys=['ctx_tokens'])
                         else:
                             ctx_tokens = None
+                        if self.config.world_model_rollout.rollout.interact and ctx_tokens is not None:
+                            # Match visualize_base.py by priming the world model with ctx tokens only.
+                            wm_batch = self._build_world_model_prompt_from_ctx_tokens(wm_batch, ctx_tokens)
                         # pop those keys for generation
                         if self.config.world_model_rollout.rollout.interact:
                             if self.config.world_model_rollout.rollout.w_gt_ac:

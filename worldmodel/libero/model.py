@@ -29,6 +29,7 @@ class WorldModelRuntimeConfig:
     eos_token_id: int
     pad_token_id: int
     tokens_per_frame: int
+    autocast_dtype: str = "bf16"
     processor_type: str = "ctx_msp"
     use_img_gt_ac: bool = False
     interact: bool = False

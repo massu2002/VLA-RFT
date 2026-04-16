@@ -1056,7 +1056,6 @@ class WorldModelRolloutWorker(Worker):
                     f'{self.config.world_model.ppo_micro_batch_size_per_gpu}'
                 )
 
-        # normalize rollout config
         if self._is_rollout and self.config.rollout.log_prob_micro_batch_size is not None:
             self.config.rollout.log_prob_micro_batch_size //= (
                 self.device_mesh.size() // self.ulysses_sequence_parallel_size
@@ -1391,13 +1390,11 @@ class WorldModelRolloutWorker(Worker):
                 )
             hf_assets_path = copy_to_local(base_model_path)
 
-        # tokenizer は学習済みディレクトリ側にあればそれを優先
         if _has_tokenizer_assets(trained_local_path):
             tokenizer_assets_path = trained_local_path
         else:
             tokenizer_assets_path = hf_assets_path
 
-        # processor は trained 側にあればそれを使い、なければ base 側
         if _has_processor_assets(trained_local_path):
             processor_assets_path = trained_local_path
         else:
@@ -1435,7 +1432,6 @@ class WorldModelRolloutWorker(Worker):
         else:
             torch_dtype = PrecisionType.to_dtype(torch_dtype)
 
-        # config / generation_config は base(HF) 側から読む
         world_model_config = AutoConfig.from_pretrained(
             hf_assets_path,
             trust_remote_code=trust_remote_code
@@ -1468,7 +1464,6 @@ class WorldModelRolloutWorker(Worker):
             else:
                 world_module_class = AutoModelForCausalLM
 
-            # ベース構造は base(HF) 側から作る
             world_module = world_module_class.from_pretrained(
                 pretrained_model_name_or_path=hf_assets_path,
                 torch_dtype=torch_dtype,
@@ -1477,7 +1472,6 @@ class WorldModelRolloutWorker(Worker):
                 trust_remote_code=trust_remote_code
             )
 
-            # 学習済み重みdirが HF 完成モデルでない場合だけ safetensors を上書きロード
             if not is_hf_model:
                 _load_world_model_weights(
                     world_module,
@@ -1510,7 +1504,6 @@ class WorldModelRolloutWorker(Worker):
 
         log_gpu_memory_usage('After init from HF AutoModel', logger=logger)
 
-        # rollout 側は base_path 側の HF asset をそのまま参照する
         self._rollout_model_path = hf_assets_path
 
         mixed_precision_config = fsdp_config.get('mixed_precision', None)
