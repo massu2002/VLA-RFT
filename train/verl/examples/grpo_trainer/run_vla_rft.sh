@@ -90,4 +90,4 @@ python3 -m verl.trainer.main_vla_rft_grpo \
     processor.tokens_per_frame=64 \
     processor.processor_type=ctx_msp \
     processor.max_length=1663 \
-    processor.use_img_gt_ac=False
+    processor.use_img_gt_ac=True

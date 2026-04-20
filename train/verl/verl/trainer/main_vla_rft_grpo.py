@@ -90,19 +90,15 @@ class TaskRunner:
         # define worker classes
         if config.actor_rollout_ref.actor.strategy == 'fsdp':
             assert config.actor_rollout_ref.actor.strategy == config.critic.strategy
-            from verl.workers.fsdp_workers import ActorRolloutRefWorker, CriticWorker, TokenizerWorker
+            from verl.workers.fsdp_workers import ActorRolloutRefWorker, CriticWorker, TokenizerWorker, WorldModelRolloutWorker  # TODO: add WorldModel if needed
             from verl.single_controller.ray import RayWorkerGroup
             ray_worker_group_cls = RayWorkerGroup
-            use_world_model = config.world_model_rollout.rollout.interact
-            if use_world_model:
-                from verl.workers.fsdp_workers import WorldModelRolloutWorker
 
         elif config.actor_rollout_ref.actor.strategy == 'megatron':
             assert config.actor_rollout_ref.actor.strategy == config.critic.strategy
             from verl.workers.megatron_workers import ActorRolloutRefWorker, CriticWorker
             from verl.single_controller.ray.megatron import NVMegatronRayWorkerGroup
             ray_worker_group_cls = NVMegatronRayWorkerGroup
-            use_world_model = False
 
         else:
             raise NotImplementedError
@@ -113,9 +109,8 @@ class TaskRunner:
             Role.ActorRollout: ray.remote(ActorRolloutRefWorker),
             Role.Critic: ray.remote(CriticWorker),
             Role.Tokenizer: ray.remote(TokenizerWorker),
+            Role.WorldModelRollout: ray.remote(WorldModelRolloutWorker),  
         }
-        if use_world_model:
-            role_worker_mapping[Role.WorldModelRollout] = ray.remote(WorldModelRolloutWorker)
 
         global_pool_id = 'global_pool'
         resource_pool_spec = {
@@ -125,9 +120,8 @@ class TaskRunner:
             Role.ActorRollout: global_pool_id,
             Role.Critic: global_pool_id,
             Role.Tokenizer: global_pool_id,
+            Role.WorldModelRollout: global_pool_id,  
         }
-        if use_world_model:
-            mapping[Role.WorldModelRollout] = global_pool_id
 
         # we should adopt a multi-source reward function here
         # - for rule-based rm, we directly call a reward score

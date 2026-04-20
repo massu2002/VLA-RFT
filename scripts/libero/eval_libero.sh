@@ -14,7 +14,7 @@ export HF_ENDPOINT="https://hf-mirror.com"
 # ==============================
 # POST_EXP_NAME="BASE"
 POST_EXP_NAME="RFT_400"
-ACTOR_MODEL_VERSION="20260414_vla_adapter_w_fm_head"
+ACTOR_MODEL_VERSION="20260416_vla_adapter_w_fm_head"
 
 CUDA_VISIBLE_DEVICES="0"
 

@@ -17,7 +17,7 @@ export VLLM_ATTENTION_BACKEND=XFORMERS
 export PYTHONPATH="${REPO_ROOT}/train/verl:${PYTHONPATH:-}"
 export N_GPUS_PER_NODE=8
 
-WORLD_MODEL_VERSION="20260410_worldmodel_scratch"
+WORLD_MODEL_VERSION="20260416_worldmodel_scratch"
 WORLD_MODEL_PATH_TEMPLATE="checkpoints/libero/WorldModel/{task}/${WORLD_MODEL_VERSION}"
 
 # =========================
