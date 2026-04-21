@@ -5,7 +5,7 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 export REPO_ROOT=$(cd "${SCRIPT_DIR}/../.." && pwd)
 
-source "${REPO_ROOT}/.venv/bin/activate"
+source "${REPO_ROOT}/.venv5090_eval/bin/activate"
 export PYTHONPATH="${REPO_ROOT}/worldmodel/_compat:${REPO_ROOT}/train/verl:${REPO_ROOT}/third_party/LIBERO:${PYTHONPATH:-}"
 export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 export TOKENIZERS_PARALLELISM="false"
@@ -13,7 +13,7 @@ export TOKENIZERS_PARALLELISM="false"
 # ---------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------
-DATE="${DATE:-20260410}"
+DATE="${DATE:-20260416}"
 EXP_NAME="${EXP_NAME:-worldmodel_scratch}"
 TRAINED_MODEL_DIR="${TRAINED_MODEL_DIR:-}"
 
