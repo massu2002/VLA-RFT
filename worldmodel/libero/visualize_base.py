@@ -17,8 +17,8 @@ import torch
 
 from libero.libero import benchmark
 
-from .data import resolve_dataset_name
-from .model import LiberoWorldModelTrainer, WorldModelRuntimeConfig
+from ..datasets.libero.data import resolve_dataset_name
+from ..core.model import WorldModelTrainer as LiberoWorldModelTrainer, WorldModelRuntimeConfig
 
 
 def build_parser() -> argparse.ArgumentParser:

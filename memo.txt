@@ -1,12 +1,11 @@
-# VLA-RFTで提案されている世界モデルを使用したGRPOは効果があるのか検証
+WorldModel/0410 → 実装版世界モデル
+WorldModel/0416 → 15000ステップでAR-Pixelで学習した世界モデル
+ResidualWorldModel/sweep_baseline → 15000ステップで隣接差分予測で学習した世界モデル
 
 RFT/0404 → Huggingface版世界モデルを使用して元コードで学習した場合
 RFT/0414 → WorldModel/0410を使用して元コードで学習した場合
 RFT/0416 → WorldModel/0410を使用して世界モデル可視化方法に合わせて世界モデルの学習時の挙動を修正して学習した場合
 RFT/0420 → WorldModel/0416で学習した場合
-
-WorldModel/0410 → 実装版世界モデル
-WorldModel/0416 → 学習ステップ数を10分の1にした世界モデル
 
 rollouts/0414 → RFT/0414の結果
 rollouts/0417 → RFT/0416の結果

@@ -73,7 +73,7 @@ for task_name in "${TASKS[@]}"; do
   echo "Output: ${output_dir}"
 
   train_cmd=(
-    -m worldmodel.libero.train
+    -m worldmodel.train
     --task-suite "${task_name}"
     --data-root "${REPO_ROOT}/data/modified_libero_rlds"
     --model-template "${model_template_dir}"
