@@ -4,7 +4,7 @@ import argparse
 import json
 import os
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import lpips
 import matplotlib
@@ -19,6 +19,13 @@ from libero.libero import benchmark
 
 from ..datasets.libero.data import resolve_dataset_name
 from ..core.model import WorldModelTrainer as LiberoWorldModelTrainer, WorldModelRuntimeConfig
+from ..eval_roi_utils import (
+    load_roi_config,
+    get_goal_roi_center,
+    get_roi_half,
+    motion_com_np,
+    compute_roi_metrics_np,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -34,6 +41,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--display-frames", type=int, default=12)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument(
+        "--enable-roi-metrics",
+        action="store_true",
+        default=os.getenv("ENABLE_ROI_METRICS", "0") == "1",
+        help="Compute ROI metrics (gripper/goal MSE/LPIPS) and save metrics.json.",
+    )
+    parser.add_argument(
+        "--debug-roi",
+        action="store_true",
+        help="Save goal ROI overlay PNG for each task (implies --enable-roi-metrics).",
+    )
     return parser
 
 
@@ -272,9 +290,49 @@ def _render_episode_figure(
     plt.close(fig)
 
 
+def _save_roi_debug_png(
+    frame: np.ndarray,           # [H, W, 3] uint8 — first GT frame
+    gripper_center: Tuple[float, float],
+    goal_center: Tuple[float, float],
+    roi_half: int,
+    out_path: Path,
+    title: str = "",
+) -> None:
+    """Save a PNG showing the ROI boxes overlaid on the reference frame."""
+    H, W = frame.shape[:2]
+    fig, ax = plt.subplots(figsize=(5, 4))
+    ax.imshow(frame)
+    ax.axis("off")
+
+    def _draw_box(cy_frac, cx_frac, color, label):
+        cy = cy_frac * H
+        cx = cx_frac * W
+        y0 = max(0, cy - roi_half)
+        x0 = max(0, cx - roi_half)
+        h  = min(H, cy + roi_half) - y0
+        w  = min(W, cx + roi_half) - x0
+        rect = plt.Rectangle((x0, y0), w, h, linewidth=2,
+                              edgecolor=color, facecolor="none")
+        ax.add_patch(rect)
+        ax.text(x0 + 2, y0 - 4, label, color=color,
+                fontsize=7, fontweight="bold",
+                bbox=dict(facecolor="white", alpha=0.5, pad=1, edgecolor="none"))
+
+    _draw_box(gripper_center[0], gripper_center[1], "#00e5ff", "gripper (motion COM)")
+    _draw_box(goal_center[0],    goal_center[1],    "#ff9100", "goal (roi_coords_v1)")
+
+    if title:
+        ax.set_title(title, fontsize=8, pad=4)
+    fig.tight_layout(pad=0.5)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
 def visualize_one_task(args: argparse.Namespace):
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
+
+    enable_roi = args.enable_roi_metrics or args.debug_roi
 
     task_names = get_task_names(args.task_suite)
     if args.task_index < 0 or args.task_index >= len(task_names):
@@ -301,7 +359,7 @@ def visualize_one_task(args: argparse.Namespace):
     task_out_dir = Path(args.output_dir)
     task_out_dir.mkdir(parents=True, exist_ok=True)
     slug = task_name.lower().replace(" ", "_")
-    out_png = task_out_dir / f"task{args.task_index + 1:02d}_{slug}.png"
+    out_png  = task_out_dir / f"task{args.task_index + 1:02d}_{slug}.png"
     out_json = task_out_dir / f"task{args.task_index + 1:02d}_{slug}.json"
 
     _render_episode_figure(
@@ -318,19 +376,109 @@ def visualize_one_task(args: argparse.Namespace):
         args.display_frames,
     )
 
-    summary = {
-        "task_suite": args.task_suite,
-        "task_index": args.task_index,
-        "task_name": task_name,
-        "episode_index": args.episode_index,
-        "episode_file": file_path,
-        "base_model_dir": base_model_dir,
-        "base_avg_mse": float(np.mean(base_mse)),
-        "base_avg_lpips": float(np.mean(base_lpips)),
-        "frame_count": len(base_pred),
+    # ------------------------------------------------------------------
+    # ROI metrics (enabled via --enable-roi-metrics or --debug-roi)
+    # ------------------------------------------------------------------
+    roi_metrics: Dict = {}
+    gripper_center = (0.5, 0.5)
+    goal_center    = (0.3, 0.5)
+    roi_half       = 40
+
+    if enable_roi:
+        roi_config      = load_roi_config()
+        gripper_center  = motion_com_np(frames[0], frames[-1])
+        goal_center_y, goal_center_x = get_goal_roi_center(
+            args.task_suite, args.task_index, roi_config
+        )
+        goal_center = (goal_center_y, goal_center_x)
+        roi_half    = get_roi_half(args.task_suite, args.task_index, roi_config)
+
+        # numpy-friendly LPIPS wrapper
+        def _lpips_np(pred_np: np.ndarray, gt_np: np.ndarray) -> float:
+            pred_t = (
+                torch.from_numpy(pred_np)
+                .to(device).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+            )
+            gt_t = (
+                torch.from_numpy(gt_np)
+                .to(device).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+            )
+            return float(lpips_model(pred_t * 2.0 - 1.0, gt_t * 2.0 - 1.0).item())
+
+        roi_metrics = compute_roi_metrics_np(
+            base_pred, list(gt_frames), _lpips_np, gripper_center, goal_center, roi_half
+        )
+
+        print(
+            f"[ROI debug] suite={args.task_suite}  task_idx={args.task_index}"
+            f"  task={task_name}"
+        )
+        print(
+            f"  gripper_center (motion COM) : y={gripper_center[0]:.3f}"
+            f"  x={gripper_center[1]:.3f}"
+        )
+        print(
+            f"  goal_center   (roi_coords_v1): y={goal_center[0]:.3f}"
+            f"  x={goal_center[1]:.3f}  half={roi_half}px"
+        )
+        for key in ("roi/gripper_mse", "roi/gripper_lpips", "roi/goal_mse", "roi/goal_lpips"):
+            val = roi_metrics.get(key, float("nan"))
+            print(f"  {key:<30} {val:.5f}")
+
+    if args.debug_roi and len(frames) > 0:
+        roi_png = task_out_dir / f"task{args.task_index + 1:02d}_{slug}_roi_debug.png"
+        _save_roi_debug_png(
+            frames[0], gripper_center, goal_center, roi_half, roi_png,
+            title=f"{args.task_suite}/task{args.task_index+1:02d} ROI overlay",
+        )
+        print(f"  Saved ROI debug PNG → {roi_png}")
+
+    # ------------------------------------------------------------------
+    # Summary JSON (extends per-task JSON with ROI metrics)
+    # ------------------------------------------------------------------
+    summary: Dict = {
+        "task_suite":      args.task_suite,
+        "task_index":      args.task_index,
+        "task_name":       task_name,
+        "episode_index":   args.episode_index,
+        "episode_file":    file_path,
+        "base_model_dir":  base_model_dir,
+        "base_avg_mse":    float(np.mean(base_mse)),
+        "base_avg_lpips":  float(np.mean(base_lpips)),
+        "frame_count":     len(base_pred),
+        "roi_enabled":     enable_roi,
     }
+    if roi_metrics:
+        # scalar ROI metrics
+        for k, v in roi_metrics.items():
+            if not isinstance(v, list):
+                summary[k] = v
+        # expand multi-step lists → first / last / max / drift_ratio
+        for mk in ("roi/multi_step_gripper_mse", "roi/multi_step_goal_mse",
+                   "roi/multi_step_gripper_lpips", "roi/multi_step_goal_lpips"):
+            lst = roi_metrics.get(mk, [])
+            if lst:
+                summary[mk + "_first"]       = float(lst[0])
+                summary[mk + "_last"]        = float(lst[-1])
+                summary[mk + "_max"]         = float(max(lst))
+                summary[mk + "_drift_ratio"] = float(lst[-1] / (lst[0] + 1e-8))
+
     with open(out_json, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
+
+    # Also write a metrics.json compatible with collect_results.sh expectations
+    if enable_roi and roi_metrics:
+        metrics_path = task_out_dir / f"task{args.task_index + 1:02d}_{slug}_metrics.json"
+        metrics_out: Dict = {
+            "task_suite": args.task_suite,
+            "task_index": args.task_index,
+            "task_name":  task_name,
+            "future_image_mse": float(np.mean(base_mse)),
+            "future_image_lpips": float(np.mean(base_lpips)),
+        }
+        metrics_out.update({k: v for k, v in roi_metrics.items() if not isinstance(v, list)})
+        with open(metrics_path, "w", encoding="utf-8") as f:
+            json.dump(metrics_out, f, indent=2)
 
     return out_png, out_json
 

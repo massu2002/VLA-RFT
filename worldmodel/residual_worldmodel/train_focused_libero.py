@@ -51,6 +51,16 @@ from .losses import (
     focus_metrics,
     image_reconstruction_metrics,
 )
+from .tiered_rank_eval import (
+    TieredEvalDataset,
+    build_tiered_eval_dataset,
+    run_tiered_rank_eval,
+)
+from .rank_benchmark import (
+    RankingBenchmark,
+    load_or_build_benchmark,
+    run_ranking_benchmark_eval,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -197,6 +207,244 @@ class MetricsLogger:
 
 
 # ---------------------------------------------------------------------------
+# Residual-analysis diagnostic helpers (A-F)
+# ---------------------------------------------------------------------------
+
+def _pearson_corr_batch(x: torch.Tensor, y: torch.Tensor) -> float:
+    """Pearson correlation between x and y averaged over batch. x,y: [B, N]."""
+    x = x.float();  y = y.float()
+    xc = x - x.mean(dim=1, keepdim=True)
+    yc = y - y.mean(dim=1, keepdim=True)
+    num = (xc * yc).sum(dim=1)
+    den = (xc.norm(dim=1) * yc.norm(dim=1)).clamp(min=1e-8)
+    return (num / den).mean().item()
+
+
+def _image_grad_l1(img: torch.Tensor) -> float:
+    """Mean L1 spatial-gradient magnitude. img: [B,3,H,W] in [0,1]."""
+    img = img.float()
+    gx = (img[:, :, :, 1:] - img[:, :, :, :-1]).abs().mean()
+    gy = (img[:, :, 1:, :] - img[:, :, :-1, :]).abs().mean()
+    return ((gx + gy) / 2).item()
+
+
+def _binary_entropy_mean(p: torch.Tensor) -> float:
+    """Mean binary entropy of a probability tensor [B, N]."""
+    p = p.float().clamp(1e-6, 1 - 1e-6)
+    return (-(p * p.log() + (1 - p) * (1 - p).log())).mean().item()
+
+
+def _batch_iou_soft(pred: torch.Tensor, gt: torch.Tensor, threshold: float = 0.5) -> float:
+    """Mean IoU (binary at threshold) over batch. pred, gt: [B, N]."""
+    pb = (pred.float() >= threshold).float()
+    gb = (gt.float()   >= threshold).float()
+    inter = (pb * gb).sum(dim=1)
+    union = (pb + gb - pb * gb).sum(dim=1).clamp(min=1)
+    return (inter / union).mean().item()
+
+
+def _batch_dice_soft(pred: torch.Tensor, gt: torch.Tensor, threshold: float = 0.5) -> float:
+    """Mean Dice (binary at threshold) over batch. pred, gt: [B, N]."""
+    pb = (pred.float() >= threshold).float()
+    gb = (gt.float()   >= threshold).float()
+    inter = (pb * gb).sum(dim=1)
+    denom = (pb.sum(dim=1) + gb.sum(dim=1)).clamp(min=1)
+    return (2 * inter / denom).mean().item()
+
+
+def _compute_phase_diagnostics(
+    out: dict,
+    cfg,
+    *,
+    prefix: str = "diag/",
+) -> dict:
+    """Compute A-F diagnostic metrics from a full model forward() output dict.
+
+    Covers both single-mask (legacy) and dual-mask (Phase 4) modes.
+    All tensors are detached / float cast here — no gradient risk.
+    """
+    result: dict = {}
+
+    focus_map     = out.get("focus_map")                     # [B, N]  = context_mask alias
+    context_mask_t = out.get("context_mask")                 # [B, N]  (Phase 4)
+    write_mask_t  = out.get("write_mask")                    # [B, N]  (Phase 4)
+    delta_tok     = out.get("predicted_delta_tokens")        # [B, N, D]
+    residual      = out.get("predicted_residual_image")      # [B, 3, H, W]
+    pred_img      = out.get("pred_future_image")             # [B, 3, H, W]
+    current_f     = out.get("current_pixels_float")          # [B, 3, H, W] float32
+    future_f      = out.get("future_pixels_float")           # [B, 3, H, W] or None
+
+    if focus_map is None or delta_tok is None or residual is None:
+        return result
+
+    # Resolve context/write masks (fall back to single focus_map in legacy mode)
+    ctx_t = context_mask_t if context_mask_t is not None else focus_map
+    wrt_t = write_mask_t   if write_mask_t   is not None else focus_map
+
+    with torch.no_grad():
+        ctx = ctx_t.detach().float()  # [B, N] context mask
+        wrt = wrt_t.detach().float()  # [B, N] write   mask
+        fg  = ctx                      # alias: "foreground" = context_mask
+        bg  = 1.0 - fg
+        bg_wrt = 1.0 - wrt
+
+        # ---- A. Dual-mask basic statistics ------------------------------
+        result[f"{prefix}context_mask_mean"]    = ctx.mean().item()
+        result[f"{prefix}write_mask_mean"]      = wrt.mean().item()
+        result[f"{prefix}context_mask_entropy"] = _binary_entropy_mean(ctx)
+        result[f"{prefix}write_mask_entropy"]   = _binary_entropy_mean(wrt)
+        result[f"{prefix}write_context_gap"]    = (wrt - ctx).abs().mean().item()
+        result[f"{prefix}write_context_ratio"]  = (wrt.mean() / (ctx.mean() + 1e-6)).item()
+        result[f"{prefix}context_write_overlap"] = (ctx.clamp(0, 1) * wrt.clamp(0, 1)).mean().item()
+
+        # ---- A. Token-update locality — context + write weighted --------
+        dt_f = delta_tok.detach().float()
+        dn   = dt_f.norm(dim=-1)          # [B, N]
+
+        ctx_fn = (ctx * dn).sum() / (ctx.sum() + 1e-8)
+        ctx_bn = (bg  * dn).sum() / (bg.sum()  + 1e-8)
+        wrt_fn = (wrt * dn).sum() / (wrt.sum() + 1e-8)
+        wrt_bn = (bg_wrt * dn).sum() / (bg_wrt.sum() + 1e-8)
+
+        result[f"{prefix}delta_norm"]                 = dn.mean().item()
+        result[f"{prefix}context_fg_delta_norm"]      = ctx_fn.item()
+        result[f"{prefix}context_bg_delta_norm"]      = ctx_bn.item()
+        result[f"{prefix}context_bg_fg_delta_ratio"]  = (ctx_bn / (ctx_fn + 1e-6)).item()
+        result[f"{prefix}write_fg_delta_norm"]        = wrt_fn.item()
+        result[f"{prefix}write_bg_delta_norm"]        = wrt_bn.item()
+        result[f"{prefix}write_bg_fg_delta_ratio"]    = (wrt_bn / (wrt_fn + 1e-6)).item()
+        # Legacy keys (used by existing log lines)
+        result[f"{prefix}fg_delta_norm"]              = ctx_fn.item()
+        result[f"{prefix}bg_delta_norm"]              = ctx_bn.item()
+        result[f"{prefix}bg_fg_delta_ratio"]          = (ctx_bn / (ctx_fn + 1e-6)).item()
+
+        # Shift = actual token update = write * delta
+        actual_shift = (wrt.unsqueeze(-1) * dt_f).norm(dim=-1)  # [B, N]
+        result[f"{prefix}future_token_shift_l2"]   = actual_shift.mean().item()
+        result[f"{prefix}context_fg_shift"]        = ((ctx    * actual_shift).sum() / (ctx.sum()    + 1e-8)).item()
+        result[f"{prefix}context_bg_shift"]        = ((bg     * actual_shift).sum() / (bg.sum()     + 1e-8)).item()
+        result[f"{prefix}write_fg_shift"]          = ((wrt    * actual_shift).sum() / (wrt.sum()    + 1e-8)).item()
+        result[f"{prefix}write_bg_shift"]          = ((bg_wrt * actual_shift).sum() / (bg_wrt.sum() + 1e-8)).item()
+        # Legacy token-shift keys
+        result[f"{prefix}fg_token_shift_l2"]       = result[f"{prefix}context_fg_shift"]
+        result[f"{prefix}bg_token_shift_l2"]       = result[f"{prefix}context_bg_shift"]
+
+        # ---- A. Correlations: context + write vs delta / residual ------
+        _r    = residual.detach().float()   # [B,3,H,W]
+        _rabs = _r.abs()
+        B_, _, H_, W_ = _r.shape
+        ph    = cfg.patch_hw
+        res_pool = F.adaptive_avg_pool2d(_rabs, (ph, ph))  # [B,3,ph,ph]
+        res_e    = res_pool.mean(dim=1).reshape(B_, -1)     # [B, N]
+
+        result[f"{prefix}corr_context_delta_norm"]       = _pearson_corr_batch(ctx, dn)
+        result[f"{prefix}corr_write_delta_norm"]         = _pearson_corr_batch(wrt, dn)
+        result[f"{prefix}corr_context_residual_energy"]  = _pearson_corr_batch(ctx, res_e)
+        result[f"{prefix}corr_write_residual_energy"]    = _pearson_corr_batch(wrt, res_e)
+        # Legacy
+        result[f"{prefix}corr_focus_delta_norm"]         = result[f"{prefix}corr_context_delta_norm"]
+        result[f"{prefix}corr_focus_residual_energy"]    = result[f"{prefix}corr_context_residual_energy"]
+
+        # ---- D. Image-residual locality — context + write weighted ------
+        ctx_2d   = ctx.reshape(B_, 1, ph, ph)
+        ctx_img  = F.interpolate(ctx_2d, size=(H_, W_), mode="bilinear", align_corners=False)
+        bg_ctx_img = 1.0 - ctx_img
+        wrt_2d   = wrt.reshape(B_, 1, ph, ph)
+        wrt_img  = F.interpolate(wrt_2d, size=(H_, W_), mode="bilinear", align_corners=False)
+        bg_wrt_img = 1.0 - wrt_img
+
+        ctx_fgr = (ctx_img   * _rabs).sum() / (ctx_img.sum()   * 3 + 1e-8)
+        ctx_bgr = (bg_ctx_img * _rabs).sum() / (bg_ctx_img.sum() * 3 + 1e-8)
+        wrt_fgr = (wrt_img   * _rabs).sum() / (wrt_img.sum()   * 3 + 1e-8)
+        wrt_bgr = (bg_wrt_img * _rabs).sum() / (bg_wrt_img.sum() * 3 + 1e-8)
+
+        result[f"{prefix}residual_l1_mean"]              = _rabs.mean().item()
+        result[f"{prefix}residual_l2_mean"]              = _r.pow(2).mean().sqrt().item()
+        result[f"{prefix}residual_abs_max"]              = _rabs.amax().item()
+        result[f"{prefix}residual_signed_mean"]          = _r.mean().item()
+        result[f"{prefix}context_fg_residual_l1"]        = ctx_fgr.item()
+        result[f"{prefix}context_bg_residual_l1"]        = ctx_bgr.item()
+        result[f"{prefix}context_bg_fg_residual_ratio"]  = (ctx_bgr / (ctx_fgr + 1e-6)).item()
+        result[f"{prefix}write_fg_residual_l1"]          = wrt_fgr.item()
+        result[f"{prefix}write_bg_residual_l1"]          = wrt_bgr.item()
+        result[f"{prefix}write_bg_fg_residual_ratio"]    = (wrt_bgr / (wrt_fgr + 1e-6)).item()
+        # Legacy keys
+        result[f"{prefix}fg_residual_l1"]                = ctx_fgr.item()
+        result[f"{prefix}bg_residual_l1"]                = ctx_bgr.item()
+        result[f"{prefix}bg_fg_residual_ratio"]          = (ctx_bgr / (ctx_fgr + 1e-6)).item()
+
+        # ---- B. Dual-mask vs change target (only when available) --------
+        ctgt = out.get("dino_change_target")   # [B, N] or None
+        if ctgt is not None:
+            ct = ctgt.detach().float()
+            result[f"{prefix}context_iou"]              = _batch_iou_soft(ctx, ct)
+            result[f"{prefix}context_dice"]             = _batch_dice_soft(ctx, ct)
+            result[f"{prefix}write_iou"]                = _batch_iou_soft(wrt, ct)
+            result[f"{prefix}write_dice"]               = _batch_dice_soft(wrt, ct)
+            result[f"{prefix}write_minus_context_iou"]  = (
+                result[f"{prefix}write_iou"] - result[f"{prefix}context_iou"]
+            )
+            result[f"{prefix}write_minus_context_dice"] = (
+                result[f"{prefix}write_dice"] - result[f"{prefix}context_dice"]
+            )
+
+        # ---- C, F, G: require GT future ---------------------------------
+        if current_f is not None and future_f is not None and pred_img is not None:
+            cur  = current_f.detach().float()
+            fut  = future_f.detach().float()
+            pred = pred_img.detach().float()
+
+            # C: change magnitude ratio
+            gt_change   = (fut - cur).abs().mean()
+            pred_change = (pred - cur).abs().mean()
+            result[f"{prefix}gt_future_change_l1"]    = gt_change.item()
+            result[f"{prefix}pred_future_change_l1"]  = pred_change.item()
+            result[f"{prefix}change_magnitude_ratio"] = (pred_change / (gt_change + 1e-6)).item()
+
+            # F: recon error — context + write mask weighted
+            err   = (pred - fut).abs()      # [B,3,H,W]
+            err_sq = (pred - fut).pow(2)
+
+            # Use change_target for fg mask if available, else write_mask
+            if ctgt is not None:
+                _ct = ctgt.detach().float().reshape(B_, 1, ph, ph)
+                fg_mask = F.interpolate(_ct, size=(H_, W_), mode="bilinear", align_corners=False)
+            else:
+                fg_mask = wrt_img
+
+            fgrl1 = (fg_mask      * err).sum()    / (fg_mask.sum()      * 3 + 1e-8)
+            bgrl1 = ((1 - fg_mask) * err).sum()   / ((1 - fg_mask).sum() * 3 + 1e-8)
+            fgmse = (fg_mask      * err_sq).sum() / (fg_mask.sum()      * 3 + 1e-8)
+            bgmse = ((1 - fg_mask) * err_sq).sum() / ((1 - fg_mask).sum() * 3 + 1e-8)
+            result[f"{prefix}fg_recon_l1"]        = fgrl1.item()
+            result[f"{prefix}bg_recon_l1"]        = bgrl1.item()
+            result[f"{prefix}fg_recon_mse"]       = fgmse.item()
+            result[f"{prefix}bg_recon_mse"]       = bgmse.item()
+            result[f"{prefix}fg_bg_recon_ratio"]  = (bgrl1 / (fgrl1 + 1e-6)).item()
+
+            # Context-mask weighted recon
+            ctx_fgl1 = (ctx_img     * err).sum() / (ctx_img.sum()     * 3 + 1e-8)
+            ctx_bgl1 = (bg_ctx_img  * err).sum() / (bg_ctx_img.sum()  * 3 + 1e-8)
+            # Write-mask weighted recon
+            wrt_fgl1 = (wrt_img     * err).sum() / (wrt_img.sum()     * 3 + 1e-8)
+            wrt_bgl1 = (bg_wrt_img  * err).sum() / (bg_wrt_img.sum()  * 3 + 1e-8)
+            result[f"{prefix}fg_recon_l1_context"]      = ctx_fgl1.item()
+            result[f"{prefix}bg_recon_l1_context"]      = ctx_bgl1.item()
+            result[f"{prefix}fg_recon_l1_write"]        = wrt_fgl1.item()
+            result[f"{prefix}bg_recon_l1_write"]        = wrt_bgl1.item()
+            result[f"{prefix}fg_bg_recon_ratio_write"]  = (wrt_bgl1 / (wrt_fgl1 + 1e-6)).item()
+
+            # G: sharpness
+            pg = _image_grad_l1(pred)
+            gg = _image_grad_l1(fut)
+            result[f"{prefix}pred_grad_l1"]  = pg
+            result[f"{prefix}gt_grad_l1"]    = gg
+            result[f"{prefix}grad_l1_gap"]   = pg - gg
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Checkpoint manager
 # ---------------------------------------------------------------------------
 
@@ -236,7 +484,8 @@ class CheckpointManager:
             self._best["best_dino_feature"] = dino_feat
             tags.append("best_dino_feature")
 
-        rank_acc = metrics.get("pairwise_acc")
+        # prefer strict_order_acc (tiered) over legacy pairwise_acc
+        rank_acc = metrics.get("strict_order_acc") or metrics.get("pairwise_acc")
         if rank_acc is not None and rank_acc > self._best["best_rank"]:
             self._best["best_rank"] = rank_acc
             tags.append("best_rank")
@@ -428,6 +677,10 @@ class FocusedWMTrainer:
         # --- Probe batches for action-rank eval ---
         self._probe_batches: Optional[List[Dict[str, torch.Tensor]]] = None
         self._n_probe = args.num_rank_eval_batches
+        # --- Tiered 3-layer eval dataset (built lazily from probe_batches) ---
+        self._tiered_eval_dataset: Optional[TieredEvalDataset] = None
+        # --- Fixed ranking benchmark (built/loaded once, opt-in) ---
+        self._ranking_benchmark: Optional[RankingBenchmark] = None
 
         # --- Output / logging ---
         self._out = Path(args.output_dir)
@@ -493,7 +746,28 @@ class FocusedWMTrainer:
 
         comps = {k: v.item() for k, v in out["loss_components"].items()
                  if hasattr(v, "item") and k != "total"}
-        return {"loss": loss.item(), **comps}
+        _STEP_STAT_KEYS = (
+            # A: token update locality — context-mask side
+            "delta_norm", "fg_delta_norm", "bg_delta_norm", "bg_fg_delta_ratio",
+            "future_token_shift_l2", "fg_future_token_shift_l2", "bg_future_token_shift_l2",
+            # A: token update locality — write-mask side (Phase 4)
+            "fg_delta_norm_write", "bg_delta_norm_write", "bg_fg_delta_ratio_write",
+            # B: image residual locality — context-mask side
+            "residual_l1_mean", "residual_l2_mean", "residual_abs_max",
+            "residual_signed_mean", "fg_residual_l1", "bg_residual_l1",
+            "bg_fg_residual_ratio",
+            # B: image residual locality — write-mask side (Phase 4)
+            "fg_residual_l1_write", "bg_residual_l1_write", "bg_fg_residual_ratio_write",
+            # Phase 4 mask statistics
+            "write_mask_mean", "context_mask_mean", "write_context_gap",
+            "context_write_overlap", "write_context_ratio",
+        )
+        extra_stats = {
+            k: out[k].item()
+            for k in _STEP_STAT_KEYS
+            if k in out and hasattr(out[k], "item")
+        }
+        return {"loss": loss.item(), **comps, **extra_stats}
 
     def _optimizer_step(self) -> float:
         """Apply gradients; return current grad norm."""
@@ -518,17 +792,108 @@ class FocusedWMTrainer:
         if not _is_main():
             return {}
 
-        # Collect probe batches lazily
+        # Collect probe batches lazily (shared between legacy and tiered eval)
         if self._probe_batches is None:
             self._probe_batches = self._collect_probe_batches(self._n_probe)
 
+        # Legacy pairwise eval (always runs when run_rank_eval=True)
         rank_metrics = run_action_rank_eval(
             self._model_inner(),
             self._probe_batches,
             self.device,
             self.cfg,
         )
-        return {f"rank/{k}": v for k, v in rank_metrics.items()}
+        result = {f"rank/{k}": v for k, v in rank_metrics.items()}
+
+        # Tiered 3-layer eval (opt-in via cfg.use_tiered_rank_eval)
+        if self.cfg.use_tiered_rank_eval:
+            if self._tiered_eval_dataset is None:
+                # Optionally limit number of items
+                probe_for_tiered = self._probe_batches
+                max_items = self.cfg.num_rank_eval_items
+                if max_items > 0:
+                    # Trim probe batches so total items ≤ max_items
+                    trimmed, count = [], 0
+                    for b in probe_for_tiered:
+                        bs = b["current_pixels"].shape[0]
+                        trimmed.append(b)
+                        count += bs
+                        if count >= max_items:
+                            break
+                    probe_for_tiered = trimmed
+
+                self._tiered_eval_dataset = build_tiered_eval_dataset(
+                    probe_batches=probe_for_tiered,
+                    n_near_success=self.cfg.num_near_success_candidates,
+                    n_failure=self.cfg.num_failure_candidates,
+                    near_noise_std=self.cfg.near_success_noise_std,
+                    fail_noise_std=self.cfg.failure_noise_std,
+                    seed=getattr(self.args, "seed", 42),
+                    task_name=getattr(self.args, "task_suite", ""),
+                )
+                logger.info(
+                    "Built TieredEvalDataset: %d items, K=%d candidates "
+                    "(n_ns=%d n_f=%d near_std=%.3f fail_std=%.3f)",
+                    self._tiered_eval_dataset.n_items,
+                    self._tiered_eval_dataset.K,
+                    self.cfg.num_near_success_candidates,
+                    self.cfg.num_failure_candidates,
+                    self.cfg.near_success_noise_std,
+                    self.cfg.failure_noise_std,
+                )
+
+            tiered_metrics = run_tiered_rank_eval(
+                model=self._model_inner(),
+                dataset=self._tiered_eval_dataset,
+                device=self.device,
+                cfg=self.cfg,
+                output_dir=str(self._out),
+                step=self._step,
+                task_name=getattr(self.args, "task_suite", ""),
+                task_suite=getattr(self.args, "task_suite", ""),
+            )
+            result.update(tiered_metrics)
+
+        # Fixed ranking benchmark (opt-in via cfg.use_fixed_rank_eval_dataset)
+        if self.cfg.use_fixed_rank_eval_dataset:
+            if self._ranking_benchmark is None:
+                try:
+                    dataset_name = resolve_dataset_name(
+                        getattr(self.args, "task_suite", "spatial")
+                    )
+                    self._ranking_benchmark = load_or_build_benchmark(
+                        out_dir=str(self._out),
+                        dataset_name=dataset_name,
+                        data_dir=self.args.data_root,
+                        segment_length=self.args.segment_length,
+                        task_name=getattr(self.args, "task_suite", ""),
+                        cfg=self.cfg,
+                        seed=self.cfg.fixed_rank_eval_seed,
+                        regenerate=self.cfg.regenerate_rank_eval_dataset,
+                    )
+                    logger.info(
+                        "RankingBenchmark ready: %d items  K=%d",
+                        self._ranking_benchmark.n_items,
+                        self._ranking_benchmark.K,
+                    )
+                except Exception as _bench_err:
+                    logger.warning(
+                        "Failed to build/load RankingBenchmark: %s", _bench_err
+                    )
+                    self._ranking_benchmark = None
+
+            if self._ranking_benchmark is not None:
+                bench_metrics = run_ranking_benchmark_eval(
+                    model=self._model_inner(),
+                    benchmark=self._ranking_benchmark,
+                    device=self.device,
+                    cfg=self.cfg,
+                    output_dir=str(self._out),
+                    step=self._step,
+                )
+                result.update(bench_metrics)
+
+        return result
 
     def _collect_probe_batches(self, n: int) -> List[Dict[str, torch.Tensor]]:
         """Collect n batches from the data loader for use as fixed probe set."""
@@ -545,7 +910,7 @@ class FocusedWMTrainer:
 
     @torch.no_grad()
     def _compute_feature_metrics(self, batch: Dict[str, torch.Tensor]) -> dict:
-        """No-grad forward pass to compute DINO cosine-sim and focus metrics."""
+        """No-grad forward pass: DINO/focus metrics + A-F residual diagnostics."""
         model = self._model_inner()
         model.eval()
         cur  = batch["current_pixels"].to(self.device, non_blocking=True)
@@ -560,17 +925,23 @@ class FocusedWMTrainer:
 
         result: dict = {}
 
+        # DINO feature metrics
         pred_tok = out.get("predicted_future_tokens")
         gt_proj  = out.get("gt_projected_dino")
         if pred_tok is not None and gt_proj is not None:
             dm = dino_feature_metrics(pred_tok, gt_proj)
             result.update({f"feat/{k}": v for k, v in dm.items()})
 
+        # Focus quality metrics
         fm   = out.get("focus_map")
         ctgt = out.get("dino_change_target")
         if fm is not None:
             fmet = focus_metrics(fm, ctgt)
             result.update({f"focus/{k}": v for k, v in fmet.items()})
+
+        # A-F residual diagnostics (Phase 1-3 structural metrics)
+        diag = _compute_phase_diagnostics(out, self.cfg, prefix="diag/")
+        result.update(diag)
 
         return result
 
@@ -593,7 +964,16 @@ class FocusedWMTrainer:
             self._metric_logger.log(metrics)
 
         # --- Best tracking (higher = better for rank; lower = better for losses) ---
-        _rank_keys   = {"rank/pairwise_acc", "pairwise_acc", "rank/top1_acc", "top1_acc"}
+        _rank_keys   = {
+            "rank/pairwise_acc", "pairwise_acc",
+            "rank/top1_acc",     "top1_acc",
+            # tiered metrics
+            "tiered/strict_order_acc",
+            "tiered/acc_success_gt_nearsuccess",
+            "tiered/acc_nearsuccess_gt_failure",
+            "tiered/acc_success_gt_failure",
+            "tiered/spearman_tier_corr",
+        }
         _loss_keys   = {"recon", "dino_feature"}
         for k, v in metrics.items():
             if k in _rank_keys:
@@ -619,6 +999,9 @@ class FocusedWMTrainer:
                 ("dino_feature",     "dino"),
                 ("focus_supervision","focus"),
                 ("focus_sparsity",   "sparsity"),
+                ("fg_recon",         "fg_recon"),
+                ("bg_residual_penalty", "bg_pen"),
+                ("fg_grad",          "fg_grad"),
             ]:
                 if k in metrics:
                     train_parts.append(f"{label}={metrics[k]:.4f}")
@@ -649,7 +1032,60 @@ class FocusedWMTrainer:
             if focus_parts:
                 logger.info("[Focus]   %s", " | ".join(focus_parts))
 
-        # --- [Eval] line (fires whenever action-ranking eval was run) ---
+            # [Mask] line — dual-mask statistics (A)
+            mask_parts = []
+            for k, label in [
+                ("write_mask_mean",                  "wrt"),
+                ("context_mask_mean",                "ctx"),
+                ("write_context_ratio",              "wrt/ctx"),
+                ("write_context_gap",                "gap"),
+                ("diag/write_mask_entropy",          "wrt_ent"),
+                ("diag/context_mask_entropy",        "ctx_ent"),
+                ("diag/context_write_overlap",       "ovlp"),
+                ("diag/write_iou",                   "wrt_iou"),
+                ("diag/write_minus_context_iou",     "Δiou"),
+            ]:
+                if k in metrics:
+                    mask_parts.append(f"{label}={metrics[k]:.4f}")
+            if mask_parts:
+                logger.info("[Mask]    %s", " | ".join(mask_parts))
+
+            # [Delta] line — token-update locality (A, context + write mask)
+            delta_parts = []
+            for k, label in [
+                ("bg_fg_delta_ratio",                "bg/fg_δ_ctx"),
+                ("bg_fg_delta_ratio_write",          "bg/fg_δ_wrt"),
+                ("diag/context_fg_shift",            "ctx_fg_sh"),
+                ("diag/write_fg_shift",              "wrt_fg_sh"),
+                ("diag/write_bg_shift",              "wrt_bg_sh"),
+                ("diag/corr_context_delta_norm",     "corr_ctx_δ"),
+                ("diag/corr_write_delta_norm",       "corr_wrt_δ"),
+            ]:
+                if k in metrics:
+                    delta_parts.append(f"{label}={metrics[k]:.4f}")
+            if delta_parts:
+                logger.info("[Delta]   %s", " | ".join(delta_parts))
+
+            # [Residual] line — image-residual + change + sharpness (D/C/F, context + write)
+            res_parts = []
+            for k, label in [
+                ("bg_fg_residual_ratio",                  "bg/fg_res_ctx"),
+                ("bg_fg_residual_ratio_write",            "bg/fg_res_wrt"),
+                ("diag/write_bg_fg_residual_ratio",       "bg/fg_res_wrt(d)"),
+                ("diag/change_magnitude_ratio",           "chg_ratio"),
+                ("diag/fg_recon_l1_write",                "fg_err_wrt"),
+                ("diag/bg_recon_l1_write",                "bg_err_wrt"),
+                ("diag/fg_bg_recon_ratio_write",          "bg/fg_err_wrt"),
+                ("diag/grad_l1_gap",                      "grad_gap"),
+                ("diag/corr_context_residual_energy",     "corr_ctx_res"),
+                ("diag/corr_write_residual_energy",       "corr_wrt_res"),
+            ]:
+                if k in metrics:
+                    res_parts.append(f"{label}={metrics[k]:.4f}")
+            if res_parts:
+                logger.info("[Residual]%s", " | ".join(res_parts))
+
+        # --- [Eval] line (fires whenever legacy ranking eval was run) ---
         if eval_metrics:
             eval_parts = [f"step={self._step}"]
             for k, label in [
@@ -663,6 +1099,42 @@ class FocusedWMTrainer:
                 if k in metrics:
                     eval_parts.append(f"{label}={metrics[k]:.4f}")
             logger.info("[Eval]    %s", " | ".join(eval_parts))
+
+        # --- [TieredRank] line (fires whenever tiered eval was run) ---
+        if any(k.startswith("tiered/") for k in eval_metrics):
+            tr_parts = [f"step={self._step}"]
+            for k, label in [
+                ("tiered/strict_order_acc",             "strict"),
+                ("tiered/acc_success_gt_nearsuccess",   "s>ns"),
+                ("tiered/acc_nearsuccess_gt_failure",   "ns>f"),
+                ("tiered/acc_success_gt_failure",       "s>f"),
+                ("tiered/margin_success_minus_failure", "margin_s_f"),
+                ("tiered/spearman_tier_corr",           "spearman"),
+                ("tiered/tier_score_success",           "score_s"),
+                ("tiered/tier_score_nearsuccess",       "score_ns"),
+                ("tiered/tier_score_failure",           "score_f"),
+            ]:
+                if k in metrics:
+                    tr_parts.append(f"{label}={metrics[k]:.4f}")
+            logger.info("[TieredRank] %s", " | ".join(tr_parts))
+
+        # --- [Benchmark] line (fires whenever fixed benchmark eval was run) ---
+        if any(k.startswith("bench/") for k in eval_metrics):
+            bm_parts = [f"step={self._step}"]
+            for k, label in [
+                ("bench/strict_order_acc",                  "strict"),
+                ("bench/acc_success_gt_nearsuccess",        "s>ns"),
+                ("bench/acc_nearsuccess_gt_failure",        "ns>f"),
+                ("bench/spearman_tier_corr",                "spearman"),
+                ("bench/acc_gt_temporal_neighbor",          "s>tn"),
+                ("bench/acc_gt_same_task_hard",             "s>sth"),
+                ("bench/acc_gt_same_task_mismatch",         "s>stm"),
+                ("bench/mean_score_temporal_neighbor",      "sc_tn"),
+                ("bench/mean_score_same_task_hard",         "sc_sth"),
+            ]:
+                if k in metrics:
+                    bm_parts.append(f"{label}={metrics[k]:.4f}")
+            logger.info("[Benchmark]  %s", " | ".join(bm_parts))
 
     # ------------------------------------------------------------------ Main loop
 
@@ -891,6 +1363,11 @@ def main() -> None:
         image_height=args.image_height,
         image_width=args.image_width,
         use_focus_head=args.use_focus_head,
+        decoder_upsample_mode=args.decoder_upsample_mode,
+        decoder_interp_mode=args.decoder_interp_mode,
+        use_decoder_refine=args.use_decoder_refine,
+        num_decoder_refine_blocks=args.num_decoder_refine_blocks,
+        write_mask_temperature=args.write_mask_temperature,
         recon_loss_weight=args.recon_loss_weight,
         use_lpips_loss=args.use_lpips_loss,
         lpips_loss_weight=args.lpips_loss_weight,
@@ -903,11 +1380,36 @@ def main() -> None:
         use_focus_sparsity=args.use_focus_sparsity,
         focus_sparsity_mode=args.focus_sparsity_mode,
         focus_sparsity_weight=args.focus_sparsity_weight,
+        use_fg_recon_loss=args.use_fg_recon_loss,
+        fg_recon_weight=args.fg_recon_weight,
+        use_bg_residual_penalty=args.use_bg_residual_penalty,
+        bg_residual_weight=args.bg_residual_weight,
+        use_fg_grad_loss=args.use_fg_grad_loss,
+        fg_grad_weight=args.fg_grad_weight,
         ranking_score_type=args.ranking_score_type,
         ranking_image_weight=args.ranking_image_weight,
         negative_mode=args.negative_mode,
         noise_std=args.noise_std,
         num_action_candidates=args.num_action_candidates,
+        # tiered eval
+        use_tiered_rank_eval=args.use_tiered_rank_eval,
+        num_rank_eval_items=args.num_rank_eval_items,
+        num_near_success_candidates=args.num_near_success_candidates,
+        num_failure_candidates=args.num_failure_candidates,
+        near_success_noise_std=args.near_success_noise_std,
+        failure_noise_std=args.failure_noise_std,
+        save_rank_eval_json=args.save_rank_eval_json,
+        save_rank_eval_csv=args.save_rank_eval_csv,
+        save_rank_eval_plots=args.save_rank_eval_plots,
+        # fixed ranking benchmark
+        use_fixed_rank_eval_dataset=args.use_fixed_rank_eval_dataset,
+        rank_eval_dataset_path=args.rank_eval_dataset_path,
+        regenerate_rank_eval_dataset=args.regenerate_rank_eval_dataset,
+        num_benchmark_pool_episodes=args.num_benchmark_pool_episodes,
+        num_benchmark_anchors_per_episode=args.num_benchmark_anchors_per_episode,
+        near_success_modes_bench=args.near_success_modes_bench,
+        failure_modes_bench=args.failure_modes_bench,
+        fixed_rank_eval_seed=args.fixed_rank_eval_seed,
         eval_every=args.eval_every,
         save_viz_every=args.save_viz_every,
         debug_mode=args.debug_mode,

@@ -59,6 +59,12 @@ SEED=42
 DEVICE="auto"
 DATASET_PATH="${DATASET_PATH:-}"
 
+# Evaluation protocol extensions (safe defaults: disabled)
+ENABLE_ROI_METRICS="${ENABLE_ROI_METRICS:-0}"
+ENABLE_RANK_LOGGING="${ENABLE_RANK_LOGGING:-0}"
+ENABLE_FAILURE_TEMPLATE_EXPORT="${ENABLE_FAILURE_TEMPLATE_EXPORT:-0}"
+EVAL_PROTOCOL="${EVAL_PROTOCOL:-configs/libero/eval_protocol_v1.yaml}"
+
 ######################################################################
 ########## END USER CONFIG ##########
 ######################################################################
@@ -82,6 +88,10 @@ for _arg in "$@"; do
     SEED=*)                  SEED="${_arg#*=}" ;;
     NUM_RANK_EVAL_BATCHES=*) NUM_RANK_EVAL_BATCHES="${_arg#*=}" ;;
     DATASET_PATH=*)          DATASET_PATH="${_arg#*=}" ;;
+    ENABLE_ROI_METRICS=*)    ENABLE_ROI_METRICS="${_arg#*=}" ;;
+    ENABLE_RANK_LOGGING=*)   ENABLE_RANK_LOGGING="${_arg#*=}" ;;
+    ENABLE_FAILURE_TEMPLATE_EXPORT=*) ENABLE_FAILURE_TEMPLATE_EXPORT="${_arg#*=}" ;;
+    EVAL_PROTOCOL=*)         EVAL_PROTOCOL="${_arg#*=}" ;;
     *)                       echo "[WARN] Unknown argument: ${_arg}" >&2 ;;
   esac
 done
@@ -257,6 +267,13 @@ echo ""
 echo "  Evaluation done."
 echo "  Results: ${OUTPUT_DIR}"
 echo "  Log    : ${LOGFILE}"
+
+# Failure taxonomy template export (Task D)
+if [ "${ENABLE_FAILURE_TEMPLATE_EXPORT:-0}" = "1" ]; then
+  python -m worldmodel.libero.export_failure_taxonomy_template \
+    --sweep-dir "${OUTPUT_DIR}" \
+    --output    "${OUTPUT_DIR}/taxonomy_template.csv" || true
+fi
 
 # Print key metrics if metrics.json exists
 METRICS_JSON="${OUTPUT_DIR}/metrics.json"

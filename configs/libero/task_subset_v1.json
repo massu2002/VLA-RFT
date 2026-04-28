@@ -1,0 +1,32 @@
+{
+  "_comment": "Task subset for fast WorldModel evaluation (v1). Indices match LIBERO suite task ordering.",
+  "version": "1.0.0",
+  "purpose": "Representative subset for quantifying why baseline WM did not improve RFT.",
+  "suites": {
+    "spatial": {
+      "task_indices": [0, 2, 5, 8],
+      "rationale": "Mix of near/far reach and bi-manual tasks typical of LIBERO-Spatial."
+    },
+    "object": {
+      "task_indices": [0, 3, 6, 9],
+      "rationale": "Covers pick-place, stack, and container insertion object types."
+    },
+    "goal": {
+      "task_indices": [0, 2, 5, 7],
+      "rationale": "Covers easy and hard goal-conditioned variants."
+    },
+    "long": {
+      "task_indices": [0, 2],
+      "rationale": "Two long-horizon tasks; more are expensive to evaluate."
+    }
+  },
+  "small_run": {
+    "_comment": "Minimal subset for smoke tests and quick iteration.",
+    "suites": {
+      "spatial": {"task_indices": [0]},
+      "object":  {"task_indices": [0]},
+      "goal":    {"task_indices": [0]},
+      "long":    {"task_indices": [0]}
+    }
+  }
+}

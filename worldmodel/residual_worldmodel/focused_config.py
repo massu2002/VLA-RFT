@@ -72,6 +72,51 @@ class FocusedWMConfig:
     # ----------------------------------------------------- Focus head toggle
     use_focus_head: bool = True
 
+    # -------------------------------------------------- Image residual options
+    # If True, upsample focus_map to image space and gate pred_residual_image
+    # before adding to current_image:
+    #   pred_future = clamp(current + focus_img * residual, 0, 1)
+    # If False (default), plain residual:
+    #   pred_future = clamp(current + residual, 0, 1)
+    use_focus_gated_image_residual: bool = False
+
+    # ----------------------------------------- Decoder skip connection options
+    # If True, a shallow CNN encodes current_image at two resolutions and injects
+    # the features into the last 2 upsample stages of FutureImageDecoder.
+    use_decoder_skip_connection: bool = True
+    # Number of channels in each skip feature map.
+    skip_base_channels: int = 32
+    # Decoder upsampling mode:
+    #   "convtranspose" : legacy ConvTranspose2d-based decoder
+    #   "resize_conv"   : interpolate + conv + norm + activation
+    decoder_upsample_mode: str = "convtranspose"
+    # Interpolation mode used by resize_conv stages and refinement blocks.
+    decoder_interp_mode: str = "bilinear"
+    # If True, add light residual refinement after the highest-resolution stages.
+    use_decoder_refine: bool = False
+    # Number of high-resolution stages to refine (typically 1-2).
+    num_decoder_refine_blocks: int = 2
+
+    # ----------------------------------------- Dual focus mask (Phase 4)
+    # If True, splits focus_logits into two masks:
+    #   context_mask = sigmoid(focus_logits)          — soft/broad (predictor context)
+    #   write_mask   = sigmoid(focus_logits / tau)    — sharp (token & image update)
+    # If False, context_mask == write_mask (legacy single-mask behaviour).
+    use_dual_focus_mask: bool = True
+    # Temperature for write_mask sharpening.  Must be in (0, 1] — lower = sharper.
+    write_mask_temperature: float = 0.5
+
+    # ----------------------------------------- Optional auxiliary losses (Phase 4)
+    # A. Foreground-weighted reconstruction (fg mask = upsampled change_target or write_mask)
+    use_fg_recon_loss: bool = True
+    fg_recon_weight: float = 0.1
+    # B. Background residual penalty (suppresses residual in non-focus regions)
+    use_bg_residual_penalty: bool = False
+    bg_residual_weight: float = 0.01
+    # C. Foreground gradient consistency (sharpens edges via gradient matching in fg)
+    use_fg_grad_loss: bool = True
+    fg_grad_weight: float = 0.02
+
     # --------------------------------------------------------- Loss weights
     # 1. Image reconstruction
     recon_loss_weight: float = 1.0
@@ -110,6 +155,43 @@ class FocusedWMConfig:
     negative_mode: str = "all"   # "roll" | "noise" | "shuffle" | "all"
     noise_std: float = 0.05
     num_action_candidates: int = 4
+
+    # ---------------------------------------- Tiered 3-layer ranking eval
+    # Replaces/extends the simple GT-vs-negative pairwise eval with a
+    # 3-tier hierarchy: success / near_success / failure.
+    # Set use_tiered_rank_eval=False to keep legacy-only behaviour.
+    use_tiered_rank_eval: bool = True
+    # 0 = use all items from probe_batches (no sub-sampling)
+    num_rank_eval_items: int = 0
+    num_near_success_candidates: int = 2
+    num_failure_candidates: int = 3
+    # near_success: GT + N(0, near_success_noise_std)
+    near_success_noise_std: float = 0.05
+    # failure: large noise / shuffle / roll (cycled)
+    failure_noise_std: float = 0.30
+    # artifact saving flags
+    save_rank_eval_json: bool = True
+    save_rank_eval_csv: bool = True
+    save_rank_eval_plots: bool = True
+
+    # -------------------------------- Fixed ranking benchmark (opt-in)
+    # Set use_fixed_rank_eval_dataset=True to enable the paper-quality benchmark
+    # that uses temporal-neighbor near-success and same-task hard negatives.
+    use_fixed_rank_eval_dataset: bool = False
+    # Non-empty: load benchmark from this path instead of auto-building it.
+    rank_eval_dataset_path: str = ""
+    # Force rebuild even if ranking_benchmark.pt already exists.
+    regenerate_rank_eval_dataset: bool = False
+    # How many episodes to include in the pool (more → richer hard negatives).
+    num_benchmark_pool_episodes: int = 20
+    # Anchor frames sampled per episode (interior windows only).
+    num_benchmark_anchors_per_episode: int = 5
+    # Comma-separated near-success candidate modes (tried in order per slot).
+    near_success_modes_bench: str = "temporal_neighbor,small_noise"
+    # Comma-separated failure candidate modes (cycled in order per slot).
+    failure_modes_bench: str = "same_task_hard,same_task_mismatch,large_noise,shuffle"
+    # Independent seed for the fixed benchmark (separate from training seed).
+    fixed_rank_eval_seed: int = 1337
 
     # ------------------------------------------------------ Eval / viz schedule
     eval_every: int = 500
@@ -152,6 +234,20 @@ class FocusedWMConfig:
             parts.append("nodino")
         if self.use_pixel_focus_supervision and not self.use_dino_focus_supervision:
             parts.append("pixelfocus")
+        if self.decoder_upsample_mode != "convtranspose":
+            parts.append(f"dup={self.decoder_upsample_mode}")
+        if self.decoder_interp_mode != "bilinear":
+            parts.append(f"dint={self.decoder_interp_mode}")
+        if self.use_decoder_refine:
+            parts.append(f"drf={self.num_decoder_refine_blocks}")
+        if self.use_dual_focus_mask and self.write_mask_temperature != 0.5:
+            parts.append(f"wmt={self.write_mask_temperature}")
+        if self.use_fg_recon_loss:
+            parts.append(f"fgr={self.fg_recon_weight}")
+        if self.use_bg_residual_penalty:
+            parts.append(f"bgp={self.bg_residual_weight}")
+        if self.use_fg_grad_loss:
+            parts.append(f"fgg={self.fg_grad_weight}")
         parts.append(f"rank={self.ranking_score_type}")
         return "_".join(parts)
 
@@ -210,6 +306,17 @@ def add_focused_wm_args(parser: argparse.ArgumentParser) -> None:
     g.add_argument("--use-focus-head", action="store_true", default=True)
     g.add_argument("--no-focus-head", dest="use_focus_head", action="store_false")
 
+    # Decoder
+    g.add_argument("--decoder-upsample-mode", type=str, default="convtranspose",
+                   choices=["convtranspose", "resize_conv"])
+    g.add_argument("--decoder-interp-mode", type=str, default="bilinear",
+                   choices=["nearest", "bilinear", "bicubic"])
+    g.add_argument("--use-decoder-refine", action="store_true", default=False)
+    g.add_argument("--no-decoder-refine", dest="use_decoder_refine", action="store_false")
+    g.add_argument("--num-decoder-refine-blocks", type=int, default=2)
+    g.add_argument("--write-mask-temperature", type=float, default=0.5,
+                   help="Temperature for dual focus write_mask sharpening.")
+
     # Loss weights
     g.add_argument("--recon-loss-weight", type=float, default=1.0)
 
@@ -233,6 +340,18 @@ def add_focused_wm_args(parser: argparse.ArgumentParser) -> None:
                    choices=["l1", "entropy"])
     g.add_argument("--focus-sparsity-weight", type=float, default=0.01)
 
+    # Optional auxiliary losses
+    g.add_argument("--use-fg-recon-loss", action="store_true", default=True)
+    g.add_argument("--no-fg-recon-loss", dest="use_fg_recon_loss", action="store_false")
+    g.add_argument("--fg-recon-weight", type=float, default=0.1)
+    g.add_argument("--use-bg-residual-penalty", action="store_true", default=False)
+    g.add_argument("--no-bg-residual-penalty",
+                   dest="use_bg_residual_penalty", action="store_false")
+    g.add_argument("--bg-residual-weight", type=float, default=0.01)
+    g.add_argument("--use-fg-grad-loss", action="store_true", default=True)
+    g.add_argument("--no-fg-grad-loss", dest="use_fg_grad_loss", action="store_false")
+    g.add_argument("--fg-grad-weight", type=float, default=0.02)
+
     # Ranking
     g.add_argument("--ranking-score-type", type=str, default="dino_only",
                    choices=["dino_only", "image_only", "combined"])
@@ -243,6 +362,42 @@ def add_focused_wm_args(parser: argparse.ArgumentParser) -> None:
                    choices=["roll", "noise", "shuffle", "all"])
     g.add_argument("--noise-std", type=float, default=0.05)
     g.add_argument("--num-action-candidates", type=int, default=4)
+
+    # Tiered 3-layer ranking eval
+    g.add_argument("--use-tiered-rank-eval", action="store_true", default=True)
+    g.add_argument("--no-tiered-rank-eval",
+                   dest="use_tiered_rank_eval", action="store_false")
+    g.add_argument("--num-rank-eval-items", type=int, default=0,
+                   help="Max items for tiered eval (0 = all probe batches).")
+    g.add_argument("--num-near-success-candidates", type=int, default=2)
+    g.add_argument("--num-failure-candidates", type=int, default=3)
+    g.add_argument("--near-success-noise-std", type=float, default=0.05)
+    g.add_argument("--failure-noise-std", type=float, default=0.30)
+    g.add_argument("--save-rank-eval-json", action="store_true", default=True)
+    g.add_argument("--no-save-rank-eval-json",
+                   dest="save_rank_eval_json", action="store_false")
+    g.add_argument("--save-rank-eval-csv", action="store_true", default=True)
+    g.add_argument("--no-save-rank-eval-csv",
+                   dest="save_rank_eval_csv", action="store_false")
+    g.add_argument("--save-rank-eval-plots", action="store_true", default=True)
+    g.add_argument("--no-save-rank-eval-plots",
+                   dest="save_rank_eval_plots", action="store_false")
+
+    # Fixed ranking benchmark
+    g.add_argument("--use-fixed-rank-eval-dataset", action="store_true", default=False)
+    g.add_argument("--no-fixed-rank-eval-dataset",
+                   dest="use_fixed_rank_eval_dataset", action="store_false")
+    g.add_argument("--rank-eval-dataset-path", type=str, default="",
+                   help="Path to pre-built ranking_benchmark.pt; empty = auto-build.")
+    g.add_argument("--regenerate-rank-eval-dataset", action="store_true", default=False,
+                   help="Force rebuild even if ranking_benchmark.pt exists.")
+    g.add_argument("--num-benchmark-pool-episodes", type=int, default=20)
+    g.add_argument("--num-benchmark-anchors-per-episode", type=int, default=5)
+    g.add_argument("--near-success-modes-bench", type=str,
+                   default="temporal_neighbor,small_noise")
+    g.add_argument("--failure-modes-bench", type=str,
+                   default="same_task_hard,same_task_mismatch,large_noise,shuffle")
+    g.add_argument("--fixed-rank-eval-seed", type=int, default=1337)
 
     # Eval / viz
     g.add_argument("--eval-every", type=int, default=500)

@@ -27,6 +27,14 @@ from libero.libero import benchmark
 
 from ..datasets.libero.data import resolve_dataset_name
 from ..core.model import WorldModelTrainer as LiberoWorldModelTrainer, WorldModelRuntimeConfig
+from ..eval_roi_utils import (
+    load_roi_config,
+    get_goal_roi_center,
+    get_roi_half,
+    motion_com_np,
+    compute_roi_metrics_np,
+    append_ranking_jsonl,
+)
 
 
 # =========================================================
@@ -111,6 +119,31 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--compare-base", action="store_true", default=False)
     parser.add_argument("--run-action-sensitivity", action="store_true", default=False)
     parser.add_argument("--run-diagnostic-chunk", action="store_true", default=False)
+
+    # Evaluation protocol extensions (Tasks A / C)
+    _env_roi  = os.environ.get("ENABLE_ROI_METRICS",   "0")
+    _env_rank = os.environ.get("ENABLE_RANK_LOGGING",  "0")
+    _env_prot = os.environ.get("EVAL_PROTOCOL", "configs/libero/eval_protocol_v1.yaml")
+    parser.add_argument(
+        "--enable-roi-metrics",
+        action="store_true",
+        default=_env_roi in ("1", "true", "True", "yes"),
+        help="Compute ROI metrics (gripper / goal) via eval_roi_utils. "
+             "Set ENABLE_ROI_METRICS=1 to enable by default.",
+    )
+    parser.add_argument(
+        "--enable-rank-logging",
+        action="store_true",
+        default=_env_rank in ("1", "true", "True", "yes"),
+        help="Append action-sensitivity results to ranking JSONL. "
+             "Set ENABLE_RANK_LOGGING=1 to enable by default.",
+    )
+    parser.add_argument(
+        "--eval-protocol",
+        type=str,
+        default=_env_prot,
+        help="Path to eval_protocol_v1.yaml (used for ROI coord config resolution).",
+    )
     parser.add_argument("--chunk-future-length", type=int, default=7)
 
     # Casebook
@@ -956,14 +989,39 @@ def aggregate_metric_curves(case_records: List[Dict], horizon: int) -> Dict:
 
 
 @torch.no_grad()
+def _make_lpips_fn(lpips_model, device: torch.device):
+    """Return a per-crop lpips callable (pred, gt: uint8 HWC numpy) -> float."""
+    import torch
+
+    def _call(pred_np: np.ndarray, gt_np: np.ndarray) -> float:
+        def _to_t(arr):
+            return (
+                torch.from_numpy(arr).to(device).permute(2, 0, 1)
+                .unsqueeze(0).float() / 255.0
+            )
+        try:
+            p = _to_t(pred_np) * 2.0 - 1.0
+            g = _to_t(gt_np)   * 2.0 - 1.0
+            return float(lpips_model(p, g).item())
+        except Exception:
+            return float("nan")
+
+    return _call
+
+
 def evaluate_rollout_fidelity(
     model: LiberoWorldModelTrainer,
     windows: List[EvalWindow],
     lpips_model,
     device: torch.device,
     decode_chunk_size: int,
+    # ROI extension (Task A) — defaults keep existing behaviour unchanged
+    enable_roi: bool = False,
+    roi_config: Optional[Dict] = None,
+    task_suite: str = "",
 ) -> Dict:
     case_records = []
+    lpips_fn = _make_lpips_fn(lpips_model, device) if enable_roi else None
 
     for idx, w in enumerate(windows):
         pred_frames, gt_frames = rollout_episode_single_pass(
@@ -974,23 +1032,38 @@ def evaluate_rollout_fidelity(
         )
         metrics = compute_sequence_metrics_all(gt_frames, pred_frames, lpips_model, device)
 
-        case_records.append(
-            {
-                "case_id": idx,
-                "task_name": w.task_name,
-                "task_index": w.task_index,
-                "episode_file": w.episode_file,
-                "start": w.start,
-                "frames": w.frames,
-                "pred_frames": pred_frames,
-                "gt_frames": gt_frames,
-                "metrics_full": metrics,
-                "avg_mse": float(metrics["avg_mse"]),
-                "avg_psnr": float(metrics["avg_psnr"]),
-                "avg_ssim": float(metrics["avg_ssim"]),
-                "avg_lpips": float(metrics["avg_lpips"]),
-            }
-        )
+        record: Dict = {
+            "case_id": idx,
+            "task_name": w.task_name,
+            "task_index": w.task_index,
+            "episode_file": w.episode_file,
+            "start": w.start,
+            "frames": w.frames,
+            "pred_frames": pred_frames,
+            "gt_frames": gt_frames,
+            "metrics_full": metrics,
+            "avg_mse": float(metrics["avg_mse"]),
+            "avg_psnr": float(metrics["avg_psnr"]),
+            "avg_ssim": float(metrics["avg_ssim"]),
+            "avg_lpips": float(metrics["avg_lpips"]),
+        }
+
+        # ---- ROI metrics (Task A) ----------------------------------------
+        if enable_roi and lpips_fn is not None and len(w.frames) >= 2:
+            try:
+                roi_half = get_roi_half(task_suite, w.task_index, roi_config)
+                # gripper proxy: COM of motion from initial to final GT frame
+                gripper_center = motion_com_np(w.frames[0], w.frames[-1])
+                goal_center    = get_goal_roi_center(task_suite, w.task_index, roi_config)
+                roi_met = compute_roi_metrics_np(
+                    pred_frames, gt_frames, lpips_fn,
+                    gripper_center, goal_center, roi_half,
+                )
+                record["roi"] = roi_met
+            except Exception as _roi_err:
+                record["roi"] = {}
+
+        case_records.append(record)
 
     scalar_summary = {
         "mse": _summarize_values([r["avg_mse"] for r in case_records]),
@@ -998,6 +1071,17 @@ def evaluate_rollout_fidelity(
         "ssim": _summarize_values([r["avg_ssim"] for r in case_records]),
         "lpips": _summarize_values([r["avg_lpips"] for r in case_records]),
     }
+
+    # ---- ROI scalar summary (Task A) ------------------------------------
+    if enable_roi and any("roi" in r for r in case_records):
+        roi_keys = [
+            "roi/gripper_mse", "roi/gripper_lpips", "roi/gripper_psnr", "roi/gripper_ssim",
+            "roi/goal_mse",    "roi/goal_lpips",    "roi/goal_psnr",    "roi/goal_ssim",
+        ]
+        for k in roi_keys:
+            vals = [r["roi"].get(k) for r in case_records if "roi" in r and k in r["roi"]]
+            vals = [v for v in vals if v is not None and v == v]   # drop None / NaN
+            scalar_summary[k] = _summarize_values(vals) if vals else None
 
     horizon = len(windows[0].actions) if len(windows) > 0 else 0
     curves = aggregate_metric_curves(case_records, horizon)
@@ -1576,12 +1660,71 @@ def save_eval_report(
 # =========================================================
 
 
+def _emit_baseline_ranking_jsonl(
+    action_sensitivity: Dict,
+    args: argparse.Namespace,
+    exp_label: str,
+    model_label: str,
+    output_root: Path,
+) -> None:
+    """Write action-sensitivity result to shared ranking JSONL (Task C).
+
+    Uses K=2 candidates: index-0 = GT action (success proxy),
+    index-1 = shuffled action (failure proxy).
+    Scores are -LPIPS (higher = better), matching the residual convention.
+    """
+    n = int(action_sensitivity.get("num_windows", 0))
+    if n == 0:
+        return
+
+    correct_lpips = action_sensitivity.get("correct_lpips", {}).get("mean", None)
+    shuffled_lpips = action_sensitivity.get("shuffled_lpips", {}).get("mean", None)
+    lpips_gap = action_sensitivity.get("lpips_gap", {}).get("mean", None)
+    correct_mse = action_sensitivity.get("correct_mse", {}).get("mean", None)
+    shuffled_mse = action_sensitivity.get("shuffled_mse", {}).get("mean", None)
+
+    metrics = {
+        # pairwise_acc: fraction where GT scores better than shuffled
+        # (here measured as: correct_lpips < shuffled_lpips, i.e. lower = better)
+        "pairwise_acc": (
+            1.0 if (correct_lpips is not None and shuffled_lpips is not None
+                    and correct_lpips < shuffled_lpips) else 0.0
+        ),
+        "mean_margin": -lpips_gap if lpips_gap is not None else None,
+        "pos_score_mean": (-correct_lpips  if correct_lpips  is not None else None),
+        "neg_score_mean": (-shuffled_lpips if shuffled_lpips is not None else None),
+    }
+    per_item = [
+        {"item_id": 0, "scores": [
+            -float(correct_lpips  or 0.0),
+            -float(shuffled_lpips or 0.0),
+        ]},
+    ]
+    jsonl_dir = output_root / "ranking_eval"
+    jsonl_path = jsonl_dir / f"{model_label}__{exp_label}__{args.task_suite}.jsonl"
+    append_ranking_jsonl(
+        out_path=jsonl_path,
+        step=-1,
+        model_type="baseline",
+        task_name="",
+        task_suite=args.task_suite,
+        n_items=n,
+        K=2,
+        tiers=["success", "failure"],
+        modes=["gt", "shuffled"],
+        metrics=metrics,
+        per_item=per_item,
+        score_breakdown={"image_l1": -float(correct_mse or 0.0), "dino_cosine": None, "combined": None},
+    )
+
+
 def run_single_model_evaluation(
     model: LiberoWorldModelTrainer,
     windows: List[EvalWindow],
     args: argparse.Namespace,
     lpips_model,
     device: torch.device,
+    roi_config: Optional[Dict] = None,
 ) -> Dict:
     token_loss_summary = evaluate_token_loss(
         model=model,
@@ -1595,6 +1738,9 @@ def run_single_model_evaluation(
         lpips_model=lpips_model,
         device=device,
         decode_chunk_size=args.decode_chunk_size,
+        enable_roi=getattr(args, "enable_roi_metrics", False),
+        roi_config=roi_config,
+        task_suite=getattr(args, "task_suite", ""),
     )
 
     action_sensitivity_summary = None
@@ -1647,6 +1793,9 @@ def run_evaluation(args: argparse.Namespace) -> Path:
     output_root = Path(args.output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
 
+    # ---- Load ROI config once (Task A / B) ---------------------------------
+    roi_config = load_roi_config() if getattr(args, "enable_roi_metrics", False) else None
+
     device = _device_for_run(args.device)
     trained_model_dir = _resolve_trained_model_dir(args)
     exp_label = _experiment_label(args, trained_model_dir)
@@ -1675,7 +1824,19 @@ def run_evaluation(args: argparse.Namespace) -> Path:
         args=args,
         lpips_model=lpips_model,
         device=device,
+        roi_config=roi_config,
     )
+
+    # ---- Ranking JSONL from action sensitivity (Task C) --------------------
+    if getattr(args, "enable_rank_logging", False) \
+            and trained_eval.get("action_sensitivity_summary") is not None:
+        _emit_baseline_ranking_jsonl(
+            action_sensitivity=trained_eval["action_sensitivity_summary"],
+            args=args,
+            exp_label=exp_label,
+            model_label="trained",
+            output_root=output_root,
+        )
 
     trained_casebook_dir = output_root / f"casebook__trained__{exp_label}"
     trained_casebook_paths = render_casebook(

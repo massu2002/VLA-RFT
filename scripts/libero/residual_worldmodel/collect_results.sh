@@ -49,6 +49,18 @@ EVAL_METRICS_TO_COLLECT=(
   "focus_entropy"
   "iou_vs_change"
   "dice_vs_change"
+  # ROI metrics (Task A / B — same keys for baseline and residual)
+  "roi/gripper_mse"
+  "roi/gripper_lpips"
+  "roi/gripper_psnr"
+  "roi/gripper_ssim"
+  "roi/object_mse"
+  "roi/object_lpips"
+  "roi/goal_mse"
+  "roi/goal_lpips"
+  "roi/gripper_l1"
+  "roi/object_l1"
+  "roi/goal_l1"
 )
 
 # ---- 収集する ranking metrics (checkpoint-best_rank/meta.json より) -
@@ -58,6 +70,12 @@ RANK_METRICS_TO_COLLECT=(
   "mean_margin"
   "pos_score_mean"
   "neg_score_mean"
+  # Tiered ranking metrics (shared JSONL schema — both baseline and residual)
+  "strict_order_acc"
+  "acc_success_gt_nearsuccess"
+  "acc_nearsuccess_gt_failure"
+  "spearman_tier_corr"
+  "margin_success_minus_failure"
 )
 
 # ---- 出力 -------------------------------------------------------

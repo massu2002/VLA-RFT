@@ -21,7 +21,7 @@ set -euo pipefail
 ######################################################################
 
 # ---- Sweep identity -------------------------------------------------
-SWEEP_NAME="baseline"
+SWEEP_NAME="baseline_v3"
 SWEEP_MODE="baseline_core"   # baseline_core | focus_ablation | ranking_ablation | model_ablation | robustness
 
 # ---- Paths ----------------------------------------------------------
@@ -44,13 +44,18 @@ OVERRIDE_SAVE_VIZ_EVERY_LIST=()
 
 LR_LIST=("1e-4")
 BATCH_SIZE_LIST=(4)
-ACTION_HORIZON_LIST=(7)
+ACTION_HORIZON_LIST=(8)
 MODEL_VARIANT_LIST=("full")
 DINO_BACKBONE_LIST=("dinov2_vits14")
 DINO_FROZEN_LIST=(true)
 DINO_INPUT_SIZE_LIST=(224)
 IMAGE_HEIGHT_LIST=(256)
 PRECISION_LIST=("bf16")
+DECODER_UPSAMPLE_MODE_LIST=("resize_conv")
+DECODER_INTERP_MODE_LIST=("bilinear")
+USE_DECODER_REFINE_LIST=(true)
+NUM_DECODER_REFINE_BLOCKS_LIST=(2)
+WRITE_MASK_TEMPERATURE_LIST=("0.35")
 
 RECON_LOSS_WEIGHT_LIST=("1.0")
 DINO_FEATURE_LOSS_WEIGHT_LIST=("0.1")
@@ -59,6 +64,12 @@ FOCUS_SUPERVISION_WEIGHT_LIST=("0.1")
 USE_FOCUS_SPARSITY_LIST=(true)
 FOCUS_SPARSITY_MODE_LIST=("l1")
 FOCUS_SPARSITY_WEIGHT_LIST=("0.01")
+USE_FG_RECON_LOSS_LIST=(true)
+FG_RECON_WEIGHT_LIST=("0.1")
+USE_BG_RESIDUAL_PENALTY_LIST=(false)
+BG_RESIDUAL_WEIGHT_LIST=("0.01")
+USE_FG_GRAD_LOSS_LIST=(true)
+FG_GRAD_WEIGHT_LIST=("0.02")
 
 RANKING_SCORE_TYPE_LIST=("dino_only") # alias許可: recon_only->image_only, mixed->combined
 NEGATIVE_MODE_LIST=("all")
@@ -70,11 +81,14 @@ SEED_LIST=(42)
 case "${SWEEP_MODE}" in
   baseline_core)
     TASK_NAME_LIST=("spatial" "object" "goal" "long")
-    LR_LIST=("1e-4" "3e-4" "1e-3")
-    BATCH_SIZE_LIST=(2 4 8)
-    ACTION_HORIZON_LIST=(4 7 10)
-    DINO_FEATURE_LOSS_WEIGHT_LIST=("0.05" "0.1" "0.5" "1.0")
-    RANKING_SCORE_TYPE_LIST=("dino_only" "mixed")
+    LR_LIST=("1e-4")
+    BATCH_SIZE_LIST=(4)
+    ACTION_HORIZON_LIST=(8)
+    WRITE_MASK_TEMPERATURE_LIST=("0.67" "0.5" "0.35")
+    DINO_FEATURE_LOSS_WEIGHT_LIST=("0.1" "0.5")
+    USE_BG_RESIDUAL_PENALTY_LIST=(false true)
+    BG_RESIDUAL_WEIGHT_LIST=("0.01")
+    RANKING_SCORE_TYPE_LIST=("dino_only")
     SEED_LIST=(42)
     ;;
   focus_ablation)
@@ -125,6 +139,34 @@ SAVE_TOTAL_LIMIT=3
 NUM_WORKERS=2
 DEBUG_MODE="normal"
 NOISE_STD=0.05
+
+# ---- Tiered 3-layer ranking eval ------------------------------------
+# 3段階評価 (success / near_success / failure) を有効化する。
+# strict_order_acc・spearman_tier_corr など論文品質のメトリクスが得られる。
+USE_TIERED_RANK_EVAL=true
+# 0 = probe_batches の全サンプルを使用 (≈128 items for 32 batches × bs4)
+NUM_RANK_EVAL_ITEMS=0
+NUM_NEAR_SUCCESS_CANDIDATES=2
+NUM_FAILURE_CANDIDATES=3
+NEAR_SUCCESS_NOISE_STD="0.05"
+FAILURE_NOISE_STD="0.30"
+
+# ---- Fixed ranking benchmark (temporal-neighbor + same-task hard neg) --
+# held-out 固定ベンチマークを有効化する。
+#   true  → 初回 eval 時にデータセットをスキャンしてベンチマークを構築・保存、
+#            以降は ranking_benchmark.pt を再利用 → 再現可能な評価
+#   false → 通常の tiered eval のみ (速いが毎回ランダムにノイズを生成)
+USE_FIXED_RANK_EVAL_DATASET=true
+# プールに含める episode 数 (多いほど same-task hard negative の多様性が増す)
+NUM_BENCHMARK_POOL_EPISODES=20
+# episode ごとのアンカーフレーム数
+NUM_BENCHMARK_ANCHORS_PER_EPISODE=5
+# near-success 候補のソースタイプ (カンマ区切り、順に試みる)
+NEAR_SUCCESS_MODES_BENCH="temporal_neighbor,small_noise"
+# failure 候補のソースタイプ (カンマ区切り、slot ごとにサイクル)
+FAILURE_MODES_BENCH="same_task_hard,same_task_mismatch,large_noise,shuffle"
+# ベンチマーク構築シード (学習シードとは独立して固定)
+FIXED_RANK_EVAL_SEED=1337
 
 RUN_VIS_AFTER_TRAIN=true
 VIS_SPLIT="heldout"
@@ -341,18 +383,40 @@ for task_idx in "${!TASK_DISPLAY_NAMES[@]}"; do
               for img_h in "${IMAGE_HEIGHT_LIST[@]}"; do
                 for prec in "${PRECISION_LIST[@]}"; do
                   for dino_frozen in "${DINO_FROZEN_LIST[@]}"; do
-                    for recon_w in "${RECON_LOSS_WEIGHT_LIST[@]}"; do
-                      for dino_w in "${DINO_FEATURE_LOSS_WEIGHT_LIST[@]}"; do
-                        for focus_type in "${FOCUS_SUPERVISION_TYPE_LIST[@]}"; do
-                          for focus_w in "${FOCUS_SUPERVISION_WEIGHT_LIST[@]}"; do
-                            for use_sp in "${USE_FOCUS_SPARSITY_LIST[@]}"; do
-                              for sp_mode in "${FOCUS_SPARSITY_MODE_LIST[@]}"; do
-                                for sp_w in "${FOCUS_SPARSITY_WEIGHT_LIST[@]}"; do
-                                  for rank in "${RANKING_SCORE_TYPE_LIST[@]}"; do
-                                    for neg in "${NEGATIVE_MODE_LIST[@]}"; do
-                                      for ncan in "${NUM_CANDIDATES_LIST[@]}"; do
-                                        for seed in "${SEED_LIST[@]}"; do
-                                          ALL_CONDITIONS+=("${task_idx}|${lr}|${bs}|${hor}|${mv}|${dino_bb}|${dino_in}|${img_h}|${prec}|${dino_frozen}|${recon_w}|${dino_w}|${focus_type}|${focus_w}|${use_sp}|${sp_mode}|${sp_w}|${rank}|${neg}|${ncan}|${seed}")
+                    for dec_up in "${DECODER_UPSAMPLE_MODE_LIST[@]}"; do
+                      for dec_interp in "${DECODER_INTERP_MODE_LIST[@]}"; do
+                        for dec_refine in "${USE_DECODER_REFINE_LIST[@]}"; do
+                          for dec_refine_n in "${NUM_DECODER_REFINE_BLOCKS_LIST[@]}"; do
+                            for wmt in "${WRITE_MASK_TEMPERATURE_LIST[@]}"; do
+                            for recon_w in "${RECON_LOSS_WEIGHT_LIST[@]}"; do
+                              for dino_w in "${DINO_FEATURE_LOSS_WEIGHT_LIST[@]}"; do
+                                for focus_type in "${FOCUS_SUPERVISION_TYPE_LIST[@]}"; do
+                                  for focus_w in "${FOCUS_SUPERVISION_WEIGHT_LIST[@]}"; do
+                                    for use_sp in "${USE_FOCUS_SPARSITY_LIST[@]}"; do
+                                      for sp_mode in "${FOCUS_SPARSITY_MODE_LIST[@]}"; do
+                                        for sp_w in "${FOCUS_SPARSITY_WEIGHT_LIST[@]}"; do
+                                          for use_fgr in "${USE_FG_RECON_LOSS_LIST[@]}"; do
+                                            for fgr_w in "${FG_RECON_WEIGHT_LIST[@]}"; do
+                                              for use_bgr in "${USE_BG_RESIDUAL_PENALTY_LIST[@]}"; do
+                                                for bgr_w in "${BG_RESIDUAL_WEIGHT_LIST[@]}"; do
+                                                  for use_fgg in "${USE_FG_GRAD_LOSS_LIST[@]}"; do
+                                                    for fgg_w in "${FG_GRAD_WEIGHT_LIST[@]}"; do
+                                                      for rank in "${RANKING_SCORE_TYPE_LIST[@]}"; do
+                                                        for neg in "${NEGATIVE_MODE_LIST[@]}"; do
+                                                          for ncan in "${NUM_CANDIDATES_LIST[@]}"; do
+                                                            for seed in "${SEED_LIST[@]}"; do
+                                                              ALL_CONDITIONS+=("${task_idx}|${lr}|${bs}|${hor}|${mv}|${dino_bb}|${dino_in}|${img_h}|${prec}|${dino_frozen}|${dec_up}|${dec_interp}|${dec_refine}|${dec_refine_n}|${wmt}|${recon_w}|${dino_w}|${focus_type}|${focus_w}|${use_sp}|${sp_mode}|${sp_w}|${use_fgr}|${fgr_w}|${use_bgr}|${bgr_w}|${use_fgg}|${fgg_w}|${rank}|${neg}|${ncan}|${seed}")
+                            done
+                          done
+                        done
+                      done
+                                                      done
+                                                    done
+                                                  done
+                                                done
+                                              done
+                                            done
+                                          done
                                         done
                                       done
                                     done
@@ -390,18 +454,18 @@ if [ "${LIST_ONLY}" = "true" ]; then
   print_header "Sweep: ${SWEEP_NAME}  mode=${SWEEP_MODE}  (${TOTAL} conditions)"
   printf "  %-25s %s\n" "Task source" "${TASK_SOURCE}"
   printf "  %-25s %s\n" "Tasks" "${TASK_DISPLAY_NAMES[*]}"
-  printf "  %-4s %-8s %-8s %-8s %-5s %-5s %-10s %-7s %-6s %-5s %-8s %-8s %-3s %-7s %-7s %-6s %-6s\n" \
-    "IDX" "task" "max" "lr" "batch" "hor" "model" "dino_w" "f_type" "f_w" "sp_on" "sp_mode" "sp_w" "rank" "neg" "cand" "seed"
-  printf "  %s\n" "$(printf '%0.s-' {1..175})"
+  printf "  %-4s %-8s %-8s %-8s %-5s %-5s %-10s %-12s %-8s %-5s %-7s %-6s %-5s %-7s %-7s %-7s %-7s %-8s %-8s %-3s %-7s %-7s %-6s %-6s\n" \
+    "IDX" "task" "max" "lr" "batch" "hor" "model" "dec_up" "dec_ref" "wmt" "dino_w" "f_type" "f_w" "fgr" "bgr" "fgg" "sp_on" "sp_mode" "sp_w" "rank" "neg" "cand" "seed"
+  printf "  %s\n" "$(printf '%0.s-' {1..255})"
 
   for i in "${!ALL_CONDITIONS[@]}"; do
-    IFS='|' read -r task_idx lr bs hor mv dino_bb dino_in img_h prec dino_frozen recon_w dino_w focus_type focus_w use_sp sp_mode sp_w rank neg ncan seed <<< "${ALL_CONDITIONS[$i]}"
-    printf "  %-4d %-8s %-8s %-8s %-5s %-5s %-10s %-7s %-6s %-5s %-8s %-8s %-3s %-7s %-7s %-6s %-6s\n" \
+    IFS='|' read -r task_idx lr bs hor mv dino_bb dino_in img_h prec dino_frozen dec_up dec_interp dec_refine dec_refine_n wmt recon_w dino_w focus_type focus_w use_sp sp_mode sp_w use_fgr fgr_w use_bgr bgr_w use_fgg fgg_w rank neg ncan seed <<< "${ALL_CONDITIONS[$i]}"
+    printf "  %-4d %-8s %-8s %-8s %-5s %-5s %-10s %-12s %-8s %-5s %-7s %-6s %-5s %-7s %-7s %-7s %-7s %-8s %-8s %-3s %-7s %-7s %-6s %-6s\n" \
       "${i}" \
       "${TASK_DISPLAY_NAMES[$task_idx]}" \
       "${TASK_MAX_STEPS[$task_idx]}" \
-      "${lr}" "${bs}" "${hor}" "${mv}" "${dino_w}" "${focus_type}" "${focus_w}" \
-      "${use_sp}" "${sp_mode}" "${sp_w}" "${rank}" "${neg}" "${ncan}" "${seed}"
+      "${lr}" "${bs}" "${hor}" "${mv}" "${dec_up}" "${dec_refine}:${dec_refine_n}" "${wmt}" "${dino_w}" "${focus_type}" "${focus_w}" \
+      "${use_fgr}:${fgr_w}" "${use_bgr}:${bgr_w}" "${use_fgg}:${fgg_w}" "${use_sp}" "${sp_mode}" "${sp_w}" "${rank}" "${neg}" "${ncan}" "${seed}"
   done
   exit 0
 fi
@@ -420,6 +484,10 @@ printf "  %-25s %s\n" "START_IDX" "${START_IDX}"
 printf "  %-25s %s\n" "MAX_RUNS" "${MAX_RUNS} (0=unlimited)"
 printf "  %-25s %s\n" "Dataset root" "${DATASET_PATH}"
 printf "  %-25s %s\n" "Output root" "${OUTPUT_ROOT}"
+printf "  %-25s %s\n" "Tiered rank eval" "${USE_TIERED_RANK_EVAL}  (items=${NUM_RANK_EVAL_ITEMS} ns=${NUM_NEAR_SUCCESS_CANDIDATES} f=${NUM_FAILURE_CANDIDATES})"
+printf "  %-25s %s\n" "Fixed benchmark" "${USE_FIXED_RANK_EVAL_DATASET}  (pool_eps=${NUM_BENCHMARK_POOL_EPISODES} anchors/ep=${NUM_BENCHMARK_ANCHORS_PER_EPISODE} seed=${FIXED_RANK_EVAL_SEED})"
+printf "  %-25s %s\n" "  ns_modes" "${NEAR_SUCCESS_MODES_BENCH}"
+printf "  %-25s %s\n" "  f_modes" "${FAILURE_MODES_BENCH}"
 printf '%*s\n' 68 '' | tr ' ' '-'
 printf "  %-10s  %-10s  %-10s  %-10s\n" "TASK" "MAX" "EVAL" "VIS"
 for task_idx in "${!TASK_DISPLAY_NAMES[@]}"; do
@@ -446,8 +514,10 @@ printf '%*s\n' 68 '' | tr ' ' '-'
   echo "list_sizes:"
   echo "  tasks=${#TASK_DISPLAY_NAMES[@]} lr=${#LR_LIST[@]} bs=${#BATCH_SIZE_LIST[@]} hor=${#ACTION_HORIZON_LIST[@]} model=${#MODEL_VARIANT_LIST[@]}"
   echo "  dino_backbone=${#DINO_BACKBONE_LIST[@]} dino_input=${#DINO_INPUT_SIZE_LIST[@]} image_h=${#IMAGE_HEIGHT_LIST[@]} precision=${#PRECISION_LIST[@]}"
-  echo "  dino_frozen=${#DINO_FROZEN_LIST[@]} recon_w=${#RECON_LOSS_WEIGHT_LIST[@]} dino_w=${#DINO_FEATURE_LOSS_WEIGHT_LIST[@]}"
+  echo "  dino_frozen=${#DINO_FROZEN_LIST[@]} dec_up=${#DECODER_UPSAMPLE_MODE_LIST[@]} dec_interp=${#DECODER_INTERP_MODE_LIST[@]} dec_refine=${#USE_DECODER_REFINE_LIST[@]} dec_refine_n=${#NUM_DECODER_REFINE_BLOCKS_LIST[@]} wmt=${#WRITE_MASK_TEMPERATURE_LIST[@]}"
+  echo "  recon_w=${#RECON_LOSS_WEIGHT_LIST[@]} dino_w=${#DINO_FEATURE_LOSS_WEIGHT_LIST[@]}"
   echo "  focus_type=${#FOCUS_SUPERVISION_TYPE_LIST[@]} focus_w=${#FOCUS_SUPERVISION_WEIGHT_LIST[@]} use_sp=${#USE_FOCUS_SPARSITY_LIST[@]} sp_mode=${#FOCUS_SPARSITY_MODE_LIST[@]} sp_w=${#FOCUS_SPARSITY_WEIGHT_LIST[@]}"
+  echo "  use_fgr=${#USE_FG_RECON_LOSS_LIST[@]} fgr_w=${#FG_RECON_WEIGHT_LIST[@]} use_bgr=${#USE_BG_RESIDUAL_PENALTY_LIST[@]} bgr_w=${#BG_RESIDUAL_WEIGHT_LIST[@]} use_fgg=${#USE_FG_GRAD_LOSS_LIST[@]} fgg_w=${#FG_GRAD_WEIGHT_LIST[@]}"
   echo "  rank=${#RANKING_SCORE_TYPE_LIST[@]} neg=${#NEGATIVE_MODE_LIST[@]} candidates=${#NUM_CANDIDATES_LIST[@]} seed=${#SEED_LIST[@]}"
   echo "conditions:"
   for c in "${ALL_CONDITIONS[@]}"; do echo "  ${c}"; done
@@ -468,7 +538,7 @@ for i in "${!ALL_CONDITIONS[@]}"; do
     break
   fi
 
-  IFS='|' read -r task_idx lr bs hor mv dino_bb dino_in img_h prec dino_frozen recon_w dino_w focus_type focus_w use_sp sp_mode sp_w rank neg ncan seed <<< "${ALL_CONDITIONS[$i]}"
+  IFS='|' read -r task_idx lr bs hor mv dino_bb dino_in img_h prec dino_frozen dec_up dec_interp dec_refine dec_refine_n wmt recon_w dino_w focus_type focus_w use_sp sp_mode sp_w use_fgr fgr_w use_bgr bgr_w use_fgg fgg_w rank neg ncan seed <<< "${ALL_CONDITIONS[$i]}"
 
   model_cli="$(normalize_model_variant "${mv}")"
   rank_cli="$(normalize_ranking_score_type "${rank}")"
@@ -490,6 +560,8 @@ for i in "${!ALL_CONDITIONS[@]}"; do
     "${lr}" \
     "${bs}" \
     "${hor}" \
+    "dup${dec_up}" "dint${dec_interp}" "drf$(short_bool "${dec_refine}")${dec_refine_n}" "wmt${wmt}" \
+    "fgr$(short_bool "${use_fgr}")${fgr_w}" "bgp$(short_bool "${use_bgr}")${bgr_w}" "fgg$(short_bool "${use_fgg}")${fgg_w}" \
     "mode${SWEEP_MODE}" "dw${dino_w}" "ft${focus_type}" "fw${focus_w}" \
     "sp$(short_bool "${use_sp}")${sp_mode}${sp_w}" "rk${rank}" "neg${neg}" "nc${ncan}" \
     "df$(short_bool "${dino_frozen}")" "rw${recon_w}" "s${seed}")"
@@ -500,8 +572,13 @@ for i in "${!ALL_CONDITIONS[@]}"; do
   echo ""
   printf "  [%d/%d] task=%s max=%s lr=%s batch=%s hor=%s model=%s dino_w=%s rank=%s seed=%s\n" \
     "$((i+1))" "${TOTAL}" "${TASK_LABEL}" "${MAX_STEPS}" "${lr}" "${bs}" "${hor}" "${mv}" "${dino_w}" "${rank}" "${seed}"
-  printf "         focus=%s/%s sparsity=%s(%s,%s) neg=%s candidates=%s frozen=%s recon_w=%s\n" \
-    "${focus_type}" "${focus_w}" "${use_sp}" "${sp_mode}" "${sp_w}" "${neg}" "${ncan}" "${dino_frozen}" "${recon_w}"
+  printf "         decoder=%s/%s refine=%s(%s) focus=%s/%s sparsity=%s(%s,%s)\n" \
+    "${dec_up}" "${dec_interp}" "${dec_refine}" "${dec_refine_n}" "${focus_type}" "${focus_w}" "${use_sp}" "${sp_mode}" "${sp_w}"
+  printf "         dualmask write_mask_temperature=%s\n" "${wmt}"
+  printf "         optloss=fgr:%s(%s) bgp:%s(%s) fgg:%s(%s)\n" \
+    "${use_fgr}" "${fgr_w}" "${use_bgr}" "${bgr_w}" "${use_fgg}" "${fgg_w}"
+  printf "         neg=%s candidates=%s frozen=%s recon_w=%s\n" \
+    "${neg}" "${ncan}" "${dino_frozen}" "${recon_w}"
   printf "         Save dir: %s\n" "${SAVE_DIR}"
 
   if [ "${DRY_RUN}" = "true" ]; then
@@ -530,6 +607,11 @@ for i in "${!ALL_CONDITIONS[@]}"; do
     "dino_backbone=${dino_bb}" \
     "dino_input_size=${dino_in}" \
     "dino_frozen=${dino_frozen}" \
+    "decoder_upsample_mode=${dec_up}" \
+    "decoder_interp_mode=${dec_interp}" \
+    "use_decoder_refine=${dec_refine}" \
+    "num_decoder_refine_blocks=${dec_refine_n}" \
+    "write_mask_temperature=${wmt}" \
     "image_height=${img_h}" \
     "image_width=${IMAGE_WIDTH_CUR}" \
     "recon_loss_weight=${recon_w}" \
@@ -539,11 +621,29 @@ for i in "${!ALL_CONDITIONS[@]}"; do
     "use_focus_sparsity=${use_sp}" \
     "focus_sparsity_mode=${sp_mode}" \
     "focus_sparsity_weight=${sp_w}" \
+    "use_fg_recon_loss=${use_fgr}" \
+    "fg_recon_weight=${fgr_w}" \
+    "use_bg_residual_penalty=${use_bgr}" \
+    "bg_residual_weight=${bgr_w}" \
+    "use_fg_grad_loss=${use_fgg}" \
+    "fg_grad_weight=${fgg_w}" \
     "ranking_score_type=${rank}" \
     "ranking_score_type_cli=${rank_cli}" \
     "negative_mode=${neg}" \
     "num_candidates=${ncan}" \
     "seed=${seed}" \
+    "use_tiered_rank_eval=${USE_TIERED_RANK_EVAL}" \
+    "num_rank_eval_items=${NUM_RANK_EVAL_ITEMS}" \
+    "num_near_success_candidates=${NUM_NEAR_SUCCESS_CANDIDATES}" \
+    "num_failure_candidates=${NUM_FAILURE_CANDIDATES}" \
+    "near_success_noise_std=${NEAR_SUCCESS_NOISE_STD}" \
+    "failure_noise_std=${FAILURE_NOISE_STD}" \
+    "use_fixed_rank_eval_dataset=${USE_FIXED_RANK_EVAL_DATASET}" \
+    "num_benchmark_pool_episodes=${NUM_BENCHMARK_POOL_EPISODES}" \
+    "num_benchmark_anchors_per_episode=${NUM_BENCHMARK_ANCHORS_PER_EPISODE}" \
+    "near_success_modes_bench=${NEAR_SUCCESS_MODES_BENCH}" \
+    "failure_modes_bench=${FAILURE_MODES_BENCH}" \
+    "fixed_rank_eval_seed=${FIXED_RANK_EVAL_SEED}" \
     "dataset_path=${DATASET_PATH}" \
     "run_name=${RUN_NAME}" \
     "save_dir=${SAVE_DIR}"
@@ -576,16 +676,35 @@ for i in "${!ALL_CONDITIONS[@]}"; do
     --image-height "${img_h}"
     --image-width "${IMAGE_WIDTH_CUR}"
     --model-variant "${model_cli}"
+    --decoder-upsample-mode "${dec_up}"
+    --decoder-interp-mode "${dec_interp}"
+    --num-decoder-refine-blocks "${dec_refine_n}"
+    --write-mask-temperature "${wmt}"
     --recon-loss-weight "${recon_w}"
     --dino-feature-loss-weight "${dino_w}"
     --focus-supervision-weight "${focus_w}"
     --focus-sparsity-mode "${sp_mode}"
     --focus-sparsity-weight "${sp_w}"
+    --fg-recon-weight "${fgr_w}"
+    --bg-residual-weight "${bgr_w}"
+    --fg-grad-weight "${fgg_w}"
     --ranking-score-type "${rank_cli}"
     --negative-mode "${neg}"
     --noise-std "${NOISE_STD}"
     --num-action-candidates "${ncan}"
     --run-rank-eval
+    # tiered 3-layer ranking eval
+    --num-rank-eval-items "${NUM_RANK_EVAL_ITEMS}"
+    --num-near-success-candidates "${NUM_NEAR_SUCCESS_CANDIDATES}"
+    --num-failure-candidates "${NUM_FAILURE_CANDIDATES}"
+    --near-success-noise-std "${NEAR_SUCCESS_NOISE_STD}"
+    --failure-noise-std "${FAILURE_NOISE_STD}"
+    # fixed ranking benchmark
+    --num-benchmark-pool-episodes "${NUM_BENCHMARK_POOL_EPISODES}"
+    --num-benchmark-anchors-per-episode "${NUM_BENCHMARK_ANCHORS_PER_EPISODE}"
+    --near-success-modes-bench "${NEAR_SUCCESS_MODES_BENCH}"
+    --failure-modes-bench "${FAILURE_MODES_BENCH}"
+    --fixed-rank-eval-seed "${FIXED_RANK_EVAL_SEED}"
   )
 
   if [ "${dino_frozen}" = "true" ]; then
@@ -598,6 +717,30 @@ for i in "${!ALL_CONDITIONS[@]}"; do
     TRAIN_ARGS+=(--use-focus-sparsity)
   else
     TRAIN_ARGS+=(--no-focus-sparsity)
+  fi
+
+  if [ "${use_fgr}" = "true" ]; then
+    TRAIN_ARGS+=(--use-fg-recon-loss)
+  else
+    TRAIN_ARGS+=(--no-fg-recon-loss)
+  fi
+
+  if [ "${use_bgr}" = "true" ]; then
+    TRAIN_ARGS+=(--use-bg-residual-penalty)
+  else
+    TRAIN_ARGS+=(--no-bg-residual-penalty)
+  fi
+
+  if [ "${use_fgg}" = "true" ]; then
+    TRAIN_ARGS+=(--use-fg-grad-loss)
+  else
+    TRAIN_ARGS+=(--no-fg-grad-loss)
+  fi
+
+  if [ "${dec_refine}" = "true" ]; then
+    TRAIN_ARGS+=(--use-decoder-refine)
+  else
+    TRAIN_ARGS+=(--no-decoder-refine)
   fi
 
   case "${focus_type}" in
@@ -620,6 +763,18 @@ for i in "${!ALL_CONDITIONS[@]}"; do
     TRAIN_ARGS+=(--no-dino-feature-loss)
   else
     TRAIN_ARGS+=(--use-dino-feature-loss)
+  fi
+
+  if [ "${USE_TIERED_RANK_EVAL}" = "true" ]; then
+    TRAIN_ARGS+=(--use-tiered-rank-eval)
+  else
+    TRAIN_ARGS+=(--no-tiered-rank-eval)
+  fi
+
+  if [ "${USE_FIXED_RANK_EVAL_DATASET}" = "true" ]; then
+    TRAIN_ARGS+=(--use-fixed-rank-eval-dataset)
+  else
+    TRAIN_ARGS+=(--no-fixed-rank-eval-dataset)
   fi
 
   save_cmd "${SAVE_DIR}" python "${TRAIN_ARGS[@]}"

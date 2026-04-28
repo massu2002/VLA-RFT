@@ -1,0 +1,110 @@
+# LIBERO WorldModel Evaluation Protocol v1
+# Purpose: Quantify why the original world model did not improve RFT.
+# Used by: analyze_worldmodel_eval.py, focused_visualize.run_full_evaluation
+# Compatible: baseline worldmodel (WorldModel/) and residual worldmodel (FocusedWM/)
+
+protocol_name: libero_wm_eval_v1
+version: "1.0.0"
+
+# ---------------------------------------------------------------------------
+# Task suites to include in evaluation
+# ---------------------------------------------------------------------------
+task_suites:
+  - spatial
+  - object
+  - goal
+  - long
+
+# Subset config reference (used by analyze_worldmodel_eval.py --use-subset)
+task_subset_file: configs/libero/task_subset_v1.json
+
+# ---------------------------------------------------------------------------
+# Metric groups
+# ---------------------------------------------------------------------------
+metrics:
+  full_image:
+    enabled: true
+    keys:
+      - future_image_smooth_l1     # primary reconstruction loss proxy
+      - future_image_psnr
+      - future_image_ssim
+      - dino_cosine_sim            # DINO feature alignment
+      - focus_weighted_recon       # recon weighted by focus map
+      - motion_sensitive_recon     # recon in high-change patches only
+
+  roi:
+    enabled: true
+    # Half-size of the square ROI crop in pixels (applied to pred/GT images).
+    # Default image size is 256×256; roi_half=40 → 80×80 crop.
+    roi_half_pixels: 40
+    keys:
+      - roi/gripper_l1   # L1 inside write-mask center-of-mass crop (gripper proxy)
+      - roi/object_l1    # L1 inside change-target center-of-mass crop (moved object)
+      - roi/goal_l1      # L1 inside fixed goal region (position defined below)
+
+  ranking:
+    enabled: true
+    keys:
+      - tiered/strict_order_acc
+      - tiered/acc_success_gt_nearsuccess
+      - tiered/acc_nearsuccess_gt_failure
+      - tiered/acc_success_gt_failure
+      - tiered/spearman_tier_corr
+      - tiered/margin_success_minus_nearsuccess
+      - tiered/margin_success_minus_failure
+
+  mask:
+    enabled: true
+    keys:
+      - context_mask_mean
+      - write_mask_mean
+      - write_context_gap
+      - write_iou           # write-mask IoU vs DINO change-target
+      - context_iou         # context-mask IoU vs DINO change-target
+
+# ---------------------------------------------------------------------------
+# ROI positions
+# ---------------------------------------------------------------------------
+# Goal ROI: fixed relative position on image (y ∈ [0,1] top-to-bottom).
+# LIBERO-SPATIAL/OBJECT: gripper workspace is centre of frame.
+# Use centroid of write_mask per-sample for gripper; change_target for object.
+# Goal uses a fixed position as a proxy (no per-sample annotation available).
+roi:
+  gripper:
+    source: write_mask_com         # per-sample center-of-mass of write mask
+  object:
+    source: change_target_com      # per-sample COM of DINO change-target
+    fallback: write_mask_com       # if change_target unavailable
+  goal:
+    source: fixed                  # fixed image-relative position
+    y: 0.30                        # upper-center (approx where goal indicators appear)
+    x: 0.50
+
+# ---------------------------------------------------------------------------
+# JSONL logging
+# ---------------------------------------------------------------------------
+jsonl_logging:
+  enabled: true
+  # File written (appended) each eval step alongside existing rank_eval_metrics.json
+  candidate_log_file: rank_eval/rank_eval_candidates.jsonl
+  # Fields per line: step, task_name, n_items, K, tiers, modes, metrics, per_item
+  include_per_item_scores: true
+
+# ---------------------------------------------------------------------------
+# Output conventions (relative to checkpoint run directory)
+# ---------------------------------------------------------------------------
+paths:
+  rank_eval_dir: rank_eval/
+  full_eval_metrics: eval_reports/libero/{task_suite}/metrics.json
+  jsonl_log: rank_eval/rank_eval_candidates.jsonl
+
+# ---------------------------------------------------------------------------
+# Analysis aggregation (used by analyze_worldmodel_eval.py)
+# ---------------------------------------------------------------------------
+analysis:
+  # Primary metric for ranking runs
+  primary_ranking_metric: tiered/strict_order_acc
+  # Primary metric for reconstruction quality
+  primary_recon_metric: future_image_smooth_l1
+  # ROI metric to highlight
+  primary_roi_metric: roi/gripper_l1

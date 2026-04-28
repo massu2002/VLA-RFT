@@ -305,12 +305,16 @@ class FocusHead(nn.Module):
 # ---------------------------------------------------------------------------
 
 class ResidualFuturePredictor(nn.Module):
-    """Predict future patch tokens as a focus-weighted residual.
+    """Predict delta patch tokens conditioned on action and focus map.
 
-    static = (1 - focus) * F        ← unchanged background
-    x = [action_tok | focus * F]    ← action-conditioned foreground
-    x → transformer → delta [B, N, D]
-    future = static + fuser(concat[delta, F])
+    Returns delta_tokens [B, N, D] — caller applies strict masked residual:
+        future_tokens = current_tokens + focus.unsqueeze(-1) * delta_tokens
+
+    focused_tokens = focus * F                    ← mask background before transformer
+    x = [action_tok | focused_tokens]             ← action-conditioned foreground only
+    x → transformer → delta_ctx [B, N, D]
+    delta_tokens = fuser(concat[delta_ctx, focused_tokens])
+                                                  ← fuser sees focused input, not full F
     """
 
     def __init__(self, cfg: FocusedWMConfig) -> None:
@@ -335,24 +339,137 @@ class ResidualFuturePredictor(nn.Module):
             nn.GELU(),
             nn.Linear(D, D),
         )
+        # Zero-init output linear: initial delta ≈ 0 for stable warm-up
+        nn.init.zeros_(self.fuser[-1].weight)
+        nn.init.zeros_(self.fuser[-1].bias)
 
     def forward(
         self,
         patch_tokens: torch.Tensor,  # [B, N, D]
         action_emb: torch.Tensor,    # [B, Da]
         focus_map: torch.Tensor,     # [B, N]
-    ) -> torch.Tensor:               # [B, N, D]
-        focus = focus_map.unsqueeze(-1)                            # [B, N, 1]
-        static  = (1.0 - focus) * patch_tokens                    # [B, N, D]
-        focused = focus * patch_tokens                             # [B, N, D]
+    ) -> torch.Tensor:               # [B, N, D]  delta_tokens
+        focus = focus_map.unsqueeze(-1)                                        # [B, N, 1]
+        focused_tokens = focus * patch_tokens                                  # [B, N, D]
 
-        action_tok = self.action_tok_proj(action_emb).unsqueeze(1)  # [B, 1, D]
-        x = torch.cat([action_tok, focused], dim=1)                 # [B, N+1, D]
-        x = self.transformer(x)                                      # [B, N+1, D]
-        delta = x[:, 1:, :]                                         # [B, N, D]
+        action_tok = self.action_tok_proj(action_emb).unsqueeze(1)            # [B, 1, D]
+        x = torch.cat([action_tok, focused_tokens], dim=1)                    # [B, N+1, D]
+        x = self.transformer(x)                                                # [B, N+1, D]
+        delta_ctx = x[:, 1:, :]                                               # [B, N, D]
 
-        fused = self.fuser(torch.cat([delta, patch_tokens], dim=-1))  # [B, N, D]
-        return static + fused                                          # [B, N, D]
+        delta_tokens = self.fuser(torch.cat([delta_ctx, focused_tokens], dim=-1))  # [B, N, D]
+        return delta_tokens
+
+
+# ---------------------------------------------------------------------------
+# CurrentImageSkipEncoder
+# ---------------------------------------------------------------------------
+
+class CurrentImageSkipEncoder(nn.Module):
+    """Shallow CNN that extracts multi-scale spatial features from current_image.
+
+    Produces skip features at two resolutions (H and H/2) that are injected
+    into the last two upsample stages of FutureImageDecoder.
+
+    Kept as float32 weights (not cast to bf16) so current_f [float32] can be
+    fed directly.  Inside the decoder each skip tensor is cast to match the
+    decoder feature dtype (e.g. bf16 during autocast).
+
+    Output: dict  spatial_size → tensor [B, skip_base_channels, H', W']
+    """
+
+    def __init__(self, cfg: FocusedWMConfig) -> None:
+        super().__init__()
+        base = cfg.skip_base_channels
+
+        # Full resolution: [B, 3, H, W] → [B, base, H, W]
+        self.conv_full = nn.Sequential(
+            nn.Conv2d(3, base, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(base),
+            nn.GELU(),
+        )
+        # Half resolution: [B, base, H, W] → [B, base, H/2, W/2]
+        self.conv_half = nn.Sequential(
+            nn.Conv2d(base, base, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(base),
+            nn.GELU(),
+        )
+
+    def forward(self, x: torch.Tensor) -> dict:
+        """x [B, 3, H, W] → {H: [B, base, H, W], H//2: [B, base, H//2, W//2]}"""
+        s_full = self.conv_full(x)          # [B, base, H, W]
+        s_half = self.conv_half(s_full)     # [B, base, H/2, W/2]
+        return {x.shape[-1]: s_full, x.shape[-1] // 2: s_half}
+
+
+# ---------------------------------------------------------------------------
+# Decoder blocks
+# ---------------------------------------------------------------------------
+
+def _decoder_norm(channels: int) -> nn.Module:
+    return nn.BatchNorm2d(channels)
+
+
+class DecoderUpsampleStage(nn.Module):
+    """Single decoder upsample stage with legacy and resize-conv modes."""
+
+    def __init__(
+        self,
+        in_ch: int,
+        out_ch: int,
+        upsample_mode: str,
+        interp_mode: str,
+    ) -> None:
+        super().__init__()
+        self.upsample_mode = upsample_mode
+        self.interp_mode = interp_mode
+
+        if upsample_mode == "convtranspose":
+            self.block = nn.Sequential(
+                nn.ConvTranspose2d(in_ch, out_ch, kernel_size=4, stride=2, padding=1),
+                _decoder_norm(out_ch),
+                nn.GELU(),
+            )
+        elif upsample_mode == "resize_conv":
+            self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False)
+            self.norm = _decoder_norm(out_ch)
+            self.act = nn.GELU()
+        else:
+            raise ValueError(f"Unsupported decoder_upsample_mode: {upsample_mode}")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.upsample_mode == "convtranspose":
+            return self.block(x)
+
+        kwargs = {}
+        if self.interp_mode != "nearest":
+            kwargs["align_corners"] = False
+        x = F.interpolate(x, scale_factor=2, mode=self.interp_mode, **kwargs)
+        x = self.conv(x)
+        x = self.norm(x)
+        return self.act(x)
+
+
+class DecoderRefineBlock(nn.Module):
+    """Light residual refinement block for high-resolution decoder features."""
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.norm1 = _decoder_norm(channels)
+        self.act = nn.GELU()
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.norm2 = _decoder_norm(channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        y = x
+        y = self.conv1(y)
+        y = self.norm1(y)
+        y = self.act(y)
+        y = self.conv2(y)
+        y = self.norm2(y)
+        return self.act(residual + y)
 
 
 # ---------------------------------------------------------------------------
@@ -360,7 +477,14 @@ class ResidualFuturePredictor(nn.Module):
 # ---------------------------------------------------------------------------
 
 class FutureImageDecoder(nn.Module):
-    """Decode patch tokens [B, N, D] → image [B, 3, H, W] via ConvTranspose2d.
+    """Decode future patch tokens → residual image [B, 3, H, W] (unconstrained).
+
+    Caller adds residual to current_image and clamps to [0, 1]:
+        pred_future_image = clamp(current_image + decoder(future_tokens, ...), 0, 1)
+
+    When skip_features (dict: spatial_size → tensor) is provided, the last
+    `n_skip_stages` upsample stages concat and fuse the matching skip feature.
+    This injects high-frequency current-image detail into the residual path.
 
     Number of ×2 upsample steps is derived from cfg.n_decoder_upsample_steps.
     Works for any patch_hw that is a power-of-2 divisor of image_height.
@@ -369,29 +493,100 @@ class FutureImageDecoder(nn.Module):
     def __init__(self, cfg: FocusedWMConfig) -> None:
         super().__init__()
         D       = cfg.hidden_dim
-        n_steps = cfg.n_decoder_upsample_steps  # e.g. 3 for 16×16 → 128×128
+        n_steps = cfg.n_decoder_upsample_steps  # e.g. 4 for 16×16 → 256×256
 
-        layers = []
+        # Build upsample stages as explicit ModuleList so skip can be injected
+        self.stages: nn.ModuleList = nn.ModuleList()
+        self.stage_out_ch: list    = []
+        self.patch_hw = cfg.patch_hw
+        self.decoder_upsample_mode = cfg.decoder_upsample_mode
+        self.decoder_interp_mode = cfg.decoder_interp_mode
+        self.use_decoder_refine = cfg.use_decoder_refine
+
         in_ch = D
         for _ in range(n_steps):
             out_ch = max(in_ch // 2, 32)
-            layers += [
-                nn.ConvTranspose2d(in_ch, out_ch, kernel_size=4, stride=2, padding=1),
-                nn.BatchNorm2d(out_ch),
-                nn.GELU(),
-            ]
+            self.stages.append(
+                DecoderUpsampleStage(
+                    in_ch=in_ch,
+                    out_ch=out_ch,
+                    upsample_mode=cfg.decoder_upsample_mode,
+                    interp_mode=cfg.decoder_interp_mode,
+                )
+            )
+            self.stage_out_ch.append(out_ch)
             in_ch = out_ch
 
-        layers.append(nn.Conv2d(in_ch, 3, kernel_size=1))
-        self.net     = nn.Sequential(*layers)
-        self.patch_hw = cfg.patch_hw
+        # Skip fusion convs — applied to the last min(2, n_steps) upsample stages.
+        # skip_fuse[str(i)] fuses (stage_out_ch[i] + skip_ch) → stage_out_ch[i].
+        n_skip = min(2, n_steps)
+        self._skip_stage_ids: set = set(range(n_steps - n_skip, n_steps))
 
-    def forward(self, future_tokens: torch.Tensor) -> torch.Tensor:
-        """future_tokens [B, N, D] → pred_img [B, 3, H, W] ∈ [0, 1]."""
+        if cfg.use_decoder_skip_connection:
+            skip_ch = cfg.skip_base_channels
+            self.skip_fuse: Optional[nn.ModuleDict] = nn.ModuleDict({
+                str(i): nn.Sequential(
+                    nn.Conv2d(self.stage_out_ch[i] + skip_ch,
+                              self.stage_out_ch[i],
+                              kernel_size=3, padding=1),
+                    nn.GELU(),
+                )
+                for i in self._skip_stage_ids
+            })
+        else:
+            self.skip_fuse = None
+
+        max_refine = min(max(cfg.num_decoder_refine_blocks, 0), n_steps, 2)
+        self._refine_stage_ids: set = set(range(n_steps - max_refine, n_steps))
+        if self.use_decoder_refine and max_refine > 0:
+            self.refine_blocks: Optional[nn.ModuleDict] = nn.ModuleDict({
+                str(i): DecoderRefineBlock(
+                    channels=self.stage_out_ch[i],
+                )
+                for i in self._refine_stage_ids
+            })
+        else:
+            self.refine_blocks = None
+
+        self.out_conv = nn.Conv2d(self.stage_out_ch[-1], 3, kernel_size=1)
+        # Zero-init: initial residual ≈ 0 → pred_future ≈ current at init
+        nn.init.zeros_(self.out_conv.weight)
+        nn.init.zeros_(self.out_conv.bias)
+
+    def forward(
+        self,
+        future_tokens: torch.Tensor,
+        skip_features: Optional[dict] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            future_tokens  : [B, N, D]
+            skip_features  : dict {spatial_size: [B, skip_ch, H', W']} or None
+        Returns:
+            pred_residual_image : [B, 3, H, W]  (unconstrained, raw residual)
+        """
         B, N, D = future_tokens.shape
         ph = self.patch_hw
-        x = future_tokens.permute(0, 2, 1).reshape(B, D, ph, ph)  # [B, D, ph, ph]
-        return self.net(x).sigmoid()
+        x = future_tokens.permute(0, 2, 1).reshape(B, D, ph, ph)   # [B, D, ph, ph]
+
+        for i, stage in enumerate(self.stages):
+            x = stage(x)                                             # [B, C, H', W']
+
+            if (self.skip_fuse is not None
+                    and i in self._skip_stage_ids
+                    and skip_features is not None):
+                spatial = x.shape[-1]
+                skip = skip_features.get(spatial)
+                if skip is not None:
+                    skip = skip.to(x.dtype)                          # match bf16/fp32
+                    x = self.skip_fuse[str(i)](
+                        torch.cat([x, skip], dim=1)
+                    )                                                # [B, C, H', W']
+
+            if self.refine_blocks is not None and i in self._refine_stage_ids:
+                x = self.refine_blocks[str(i)](x)
+
+        return self.out_conv(x)   # raw residual — no sigmoid
 
 
 # ---------------------------------------------------------------------------
@@ -452,7 +647,14 @@ class ActionConditionedFocusedResidualWM(nn.Module):
     pred_future_image       : [B, 3, H, W] ∈ [0, 1]
     focus_map               : [B, N_patches] ∈ [0, 1]
     current_dino_features   : [B, N, D_dino]  — raw DINO features of current frame
-    predicted_future_tokens : [B, N, hidden_dim] — tokens from ResidualFuturePredictor
+    predicted_future_tokens : [B, N, hidden_dim] — current + focus * delta  (strict masked residual)
+    predicted_delta_tokens  : [B, N, hidden_dim] — raw delta from ResidualFuturePredictor
+    delta_norm              : scalar — mean patch-token L2 norm of delta
+    fg_delta_norm           : scalar — focus-weighted mean delta norm (foreground)
+    bg_delta_norm           : scalar — (1-focus)-weighted mean delta norm (background)
+    predicted_residual_image: [B, 3, H, W] — raw decoder output (added to current_image)
+    residual_l1_mean        : scalar — mean absolute residual pixel value
+    residual_abs_max        : scalar — max absolute residual pixel value
     dino_change_target      : [B, N] ∈ [0,1] or None  — DINO-based change supervision target
     loss_components         : dict of individual (weighted) scalar losses
     """
@@ -474,6 +676,13 @@ class ActionConditionedFocusedResidualWM(nn.Module):
         self.predictor      = ResidualFuturePredictor(cfg)
         self.decoder        = FutureImageDecoder(cfg)
 
+        # Shallow skip encoder for current_image → decoder skip features.
+        # Kept in float32 so it directly accepts current_f [float32, 0-1].
+        # The decoder casts skip features to its own dtype at fusion time.
+        self.image_skip_encoder: Optional[nn.Module] = (
+            CurrentImageSkipEncoder(cfg) if cfg.use_decoder_skip_connection else None
+        )
+
         # LPIPS (optional — lazy-loaded on first use)
         self._lpips_fn: Optional[nn.Module] = None
 
@@ -483,6 +692,7 @@ class ActionConditionedFocusedResidualWM(nn.Module):
                 trainable.append(self.focus_head)
             # Only project layer in DINO is trainable
             trainable.append(self.dino.proj)
+            # image_skip_encoder intentionally excluded — stays float32
             for mod in trainable:
                 mod.to(dtype=torch_dtype)
 
@@ -573,6 +783,22 @@ class ActionConditionedFocusedResidualWM(nn.Module):
             return -(p * p.log() + (1 - p) * (1 - p).log()).mean()
         return focus_map.mean()  # L1 (mean ≈ L1 for sigmoid outputs)
 
+    def _fg_grad_loss(
+        self,
+        pred: torch.Tensor,    # [B, 3, H, W]
+        target: torch.Tensor,  # [B, 3, H, W]
+        fg_mask: torch.Tensor, # [B, 1, H, W]  image-space weight
+    ) -> torch.Tensor:
+        """Foreground gradient consistency — match spatial gradients inside write_mask."""
+        def _fd(x):
+            return x[:, :, :, 1:] - x[:, :, :, :-1], x[:, :, 1:, :] - x[:, :, :-1, :]
+        p_f = pred.to(target.dtype)
+        pgx, pgy = _fd(p_f)
+        tgx, tgy = _fd(target.to(pred.dtype))
+        mfx = fg_mask[:, :, :, 1:].to(pred.dtype)
+        mfy = fg_mask[:, :, 1:, :].to(pred.dtype)
+        return (mfx * (pgx - tgx).abs()).mean() + (mfy * (pgy - tgy).abs()).mean()
+
     # ------------------------------------------------------------------ Forward
 
     def forward(
@@ -603,22 +829,116 @@ class ActionConditionedFocusedResidualWM(nn.Module):
         H_act = min(actions_n.shape[1], self.cfg.action_horizon)
         action_emb = self.action_encoder(actions_n[:, :H_act, :])  # [B, Da]
 
-        # ----- Focus map -------------------------------------------------
+        # ----- Focus masks (Phase 4: dual context / write mask) ----------
         focus_logits = None
         if self.focus_head is not None:
             focus_logits = self.focus_head(current_tokens, action_emb)   # [B, N] logits
-            focus_map = torch.sigmoid(focus_logits)                      # [B, N] probability
+            context_mask = torch.sigmoid(focus_logits)                   # [B, N] broad — predictor input
+            if self.cfg.use_dual_focus_mask:
+                write_mask = torch.sigmoid(
+                    focus_logits / self.cfg.write_mask_temperature
+                )                                                         # [B, N] sharp — update gate
+            else:
+                write_mask = context_mask
         else:
-            focus_map = torch.ones(
+            ones = torch.ones(
                 current_tokens.shape[0], current_tokens.shape[1],
                 device=current_tokens.device, dtype=current_tokens.dtype,
             )
+            context_mask = ones
+            write_mask   = ones
 
-        # ----- Residual future prediction --------------------------------
-        future_tokens = self.predictor(current_tokens, action_emb, focus_map)
+        focus_map = context_mask   # legacy alias used for losses / diagnostics
 
-        # ----- Decode to image -------------------------------------------
-        pred_future_image = self.decoder(future_tokens)
+        # ----- Strict masked residual prediction -------------------------
+        delta_tokens  = self.predictor(current_tokens, action_emb, context_mask)
+        future_tokens = current_tokens + write_mask.unsqueeze(-1) * delta_tokens
+
+        # delta / token-shift statistics (diagnostic, no gradient flow)
+        with torch.no_grad():
+            _d      = delta_tokens.detach().float().norm(dim=-1)  # [B, N]
+            _ctx    = context_mask.detach().float()               # [B, N] context (broad)
+            _wrt    = write_mask.detach().float()                 # [B, N] write   (sharp)
+            _bg_ctx = 1.0 - _ctx
+            _bg_wrt = 1.0 - _wrt
+            # context-mask weighted (predictor input side)
+            delta_norm            = _d.mean()
+            fg_delta_norm         = (_ctx * _d).sum() / (_ctx.sum() + 1e-8)
+            bg_delta_norm         = (_bg_ctx * _d).sum() / (_bg_ctx.sum() + 1e-8)
+            bg_fg_delta_ratio     = bg_delta_norm / (fg_delta_norm + 1e-6)
+            # write-mask weighted (actual update side)
+            fg_delta_norm_write     = (_wrt * _d).sum() / (_wrt.sum() + 1e-8)
+            bg_delta_norm_write     = (_bg_wrt * _d).sum() / (_bg_wrt.sum() + 1e-8)
+            bg_fg_delta_ratio_write = bg_delta_norm_write / (fg_delta_norm_write + 1e-6)
+            # token shift = write * delta  (future - current = write * delta)
+            _shift = (_wrt.unsqueeze(-1) * delta_tokens.detach().float()).norm(dim=-1)  # [B,N]
+            future_token_shift_l2    = _shift.mean()
+            fg_future_token_shift_l2 = (_wrt * _shift).sum() / (_wrt.sum() + 1e-8)
+            bg_future_token_shift_l2 = (_bg_wrt * _shift).sum() / (_bg_wrt.sum() + 1e-8)
+            # mask statistics
+            write_mask_mean       = _wrt.mean()
+            context_mask_mean     = _ctx.mean()
+            write_context_gap     = (_wrt - _ctx).abs().mean()
+            context_write_overlap = (_ctx.clamp(0, 1) * _wrt.clamp(0, 1)).mean()
+            write_context_ratio   = write_mask_mean / (context_mask_mean + 1e-6)
+
+        # ----- Decode residual image and compose final prediction ----------
+        skip_features = (
+            self.image_skip_encoder(current_f)
+            if self.image_skip_encoder is not None else None
+        )
+        pred_residual_image = self.decoder(future_tokens, skip_features=skip_features)
+
+        # Upsample write_mask to image space — used for Phase 4 composition and stats
+        B_f, _, H_f, W_f = current_f.shape
+        _ph = self.cfg.patch_hw
+        write_mask_img = F.interpolate(
+            write_mask.reshape(B_f, 1, _ph, _ph).to(current_f.dtype),
+            size=(H_f, W_f), mode="bilinear", align_corners=False,
+        )  # [B, 1, H, W]
+
+        if self.cfg.use_dual_focus_mask:
+            # Phase 4: gate residual with write_mask_img (sharp mask)
+            pred_future_image = torch.clamp(
+                current_f + write_mask_img * pred_residual_image.to(current_f.dtype), 0.0, 1.0,
+            )
+        elif self.cfg.use_focus_gated_image_residual:
+            # Legacy: gate with context_mask upsampled to image space
+            ctx_img = F.interpolate(
+                context_mask.reshape(B_f, 1, _ph, _ph).to(current_f.dtype),
+                size=(H_f, W_f), mode="bilinear", align_corners=False,
+            )
+            pred_future_image = torch.clamp(
+                current_f + ctx_img * pred_residual_image.to(current_f.dtype), 0.0, 1.0,
+            )
+        else:
+            pred_future_image = torch.clamp(
+                current_f + pred_residual_image.to(current_f.dtype), 0.0, 1.0,
+            )
+
+        # residual statistics (diagnostic, no gradient flow)
+        with torch.no_grad():
+            _r  = pred_residual_image.detach().float()  # [B,3,H,W]
+            _rabs = _r.abs()
+            residual_l1_mean     = _rabs.mean()
+            residual_l2_mean     = _r.pow(2).mean().sqrt()
+            residual_abs_max     = _rabs.amax()
+            residual_signed_mean = _r.mean()
+            # Context-mask fg/bg residual decomposition
+            _ctx_img = F.interpolate(
+                context_mask.detach().float().reshape(B_f, 1, _ph, _ph),
+                size=(H_f, W_f), mode="bilinear", align_corners=False,
+            )  # [B,1,H,W]
+            fg_residual_l1       = (_ctx_img * _rabs).sum() / (_ctx_img.sum() * 3 + 1e-8)
+            bg_residual_l1       = ((1 - _ctx_img) * _rabs).sum() / (
+                (1 - _ctx_img).sum() * 3 + 1e-8)
+            bg_fg_residual_ratio = bg_residual_l1 / (fg_residual_l1 + 1e-6)
+            # Write-mask fg/bg residual decomposition
+            _wrt_img = write_mask_img.detach().float()
+            fg_residual_l1_write       = (_wrt_img * _rabs).sum() / (_wrt_img.sum() * 3 + 1e-8)
+            bg_residual_l1_write       = ((1 - _wrt_img) * _rabs).sum() / (
+                (1 - _wrt_img).sum() * 3 + 1e-8)
+            bg_fg_residual_ratio_write = bg_residual_l1_write / (fg_residual_l1_write + 1e-6)
 
         # ----- Losses (only when GT future is provided) ------------------
         lc: Dict[str, torch.Tensor] = {}
@@ -626,6 +946,7 @@ class ActionConditionedFocusedResidualWM(nn.Module):
         dino_change_target  = None
         gt_raw_dino         = None
         gt_projected_dino   = None
+        future_f: Optional[torch.Tensor] = None   # set when future_pixels is not None
 
         if future_pixels is not None:
             future_f = self._prep_image(future_pixels)
@@ -678,16 +999,91 @@ class ActionConditionedFocusedResidualWM(nn.Module):
                 lc["focus_sparsity"] = focus_sp
                 total = total + self.cfg.focus_sparsity_weight * focus_sp
 
+            # 6. Foreground reconstruction loss (gated by write_mask or change target)
+            if self.cfg.use_fg_recon_loss:
+                _fg_src = (
+                    dino_change_target if dino_change_target is not None else write_mask
+                )
+                _fg_mask = F.interpolate(
+                    _fg_src.detach().float().reshape(
+                        future_f.shape[0], 1, self.cfg.patch_hw, self.cfg.patch_hw
+                    ),
+                    size=(future_f.shape[-2], future_f.shape[-1]),
+                    mode="bilinear", align_corners=False,
+                ).to(pred_future_image.dtype)
+                fg_recon = (
+                    _fg_mask * F.smooth_l1_loss(pred_future_image, future_f.to(pred_future_image.dtype), reduction="none")
+                ).mean()
+                lc["fg_recon"] = fg_recon
+                total = total + self.cfg.fg_recon_weight * fg_recon
+
+            # 7. Background residual penalty (suppress residual outside write_mask)
+            if self.cfg.use_bg_residual_penalty:
+                bg_mask_img = (1.0 - write_mask_img).detach()
+                bg_pen = (
+                    bg_mask_img * pred_residual_image.to(bg_mask_img.dtype).abs()
+                ).mean()
+                lc["bg_residual_penalty"] = bg_pen
+                total = total + self.cfg.bg_residual_weight * bg_pen
+
+            # 8. Foreground gradient consistency
+            if self.cfg.use_fg_grad_loss:
+                grad_loss = self._fg_grad_loss(pred_future_image, future_f, write_mask_img)
+                lc["fg_grad"] = grad_loss
+                total = total + self.cfg.fg_grad_weight * grad_loss
+
         lc["total"] = total
 
         return {
+            # ---- Core outputs ------------------------------------------------
             "loss": total,
-            "pred_future_image": pred_future_image,
-            "focus_map": focus_map,
-            "current_dino_features": current_raw,         # [B, N, D_dino]
-            "predicted_future_tokens": future_tokens,      # [B, N, hidden_dim]
-            "gt_projected_dino": gt_projected_dino,        # [B, N, hidden_dim] or None
-            "dino_change_target": dino_change_target,      # [B, N] or None
+            "pred_future_image": pred_future_image,                # [B,3,H,W] ∈ [0,1]
+            "predicted_residual_image": pred_residual_image,       # [B,3,H,W] raw residual
+            # ---- Auxiliary pixel tensors (for trainer-side diagnostics) ------
+            "current_pixels_float": current_f,                     # [B,3,H,W] float32 [0,1]
+            "future_pixels_float": future_f,                       # [B,3,H,W] or None
+            # ---- Focus masks (Phase 4) ----------------------------------------
+            "context_mask": context_mask,                          # [B, N] broad (predictor)
+            "write_mask": write_mask,                              # [B, N] sharp (update gate)
+            "write_mask_img": write_mask_img,                      # [B, 1, H, W]
+            "focus_map": focus_map,                                # [B, N] alias = context_mask
+            # ---- Mask statistics ---------------------------------------------
+            "write_mask_mean": write_mask_mean,
+            "context_mask_mean": context_mask_mean,
+            "write_context_gap": write_context_gap,
+            "context_write_overlap": context_write_overlap,
+            "write_context_ratio": write_context_ratio,
+            # ---- Other tokens ------------------------------------------------
+            "current_dino_features": current_raw,                  # [B, N, D_dino]
+            "predicted_future_tokens": future_tokens,               # [B, N, hidden_dim]
+            "predicted_delta_tokens": delta_tokens,                 # [B, N, hidden_dim]
+            "gt_projected_dino": gt_projected_dino,                 # [B, N, hidden_dim] or None
+            "dino_change_target": dino_change_target,               # [B, N] or None
+            # ---- Token-update statistics — context-mask side (A) -------------
+            "delta_norm": delta_norm,
+            "fg_delta_norm": fg_delta_norm,
+            "bg_delta_norm": bg_delta_norm,
+            "bg_fg_delta_ratio": bg_fg_delta_ratio,
+            # ---- Token-update statistics — write-mask side (A) ---------------
+            "fg_delta_norm_write": fg_delta_norm_write,
+            "bg_delta_norm_write": bg_delta_norm_write,
+            "bg_fg_delta_ratio_write": bg_fg_delta_ratio_write,
+            "future_token_shift_l2": future_token_shift_l2,
+            "fg_future_token_shift_l2": fg_future_token_shift_l2,
+            "bg_future_token_shift_l2": bg_future_token_shift_l2,
+            # ---- Image-residual statistics — context-mask side (B) -----------
+            "residual_l1_mean": residual_l1_mean,
+            "residual_l2_mean": residual_l2_mean,
+            "residual_abs_max": residual_abs_max,
+            "residual_signed_mean": residual_signed_mean,
+            "fg_residual_l1": fg_residual_l1,
+            "bg_residual_l1": bg_residual_l1,
+            "bg_fg_residual_ratio": bg_fg_residual_ratio,
+            # ---- Image-residual statistics — write-mask side (B) -------------
+            "fg_residual_l1_write": fg_residual_l1_write,
+            "bg_residual_l1_write": bg_residual_l1_write,
+            "bg_fg_residual_ratio_write": bg_fg_residual_ratio_write,
+            # ---- Loss breakdown ----------------------------------------------
             "loss_components": lc,
         }
 

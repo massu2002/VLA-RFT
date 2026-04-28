@@ -2,6 +2,8 @@
 
 # cd ~/VLA-RFT && bash scripts/worldmodel/train_libero_worldmodel.sh
 
+# LIBERO_TASKS="object" && bash scripts/worldmodel/train_libero_worldmodel.sh
+
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -19,13 +21,13 @@ NPROC_PER_NODE="${NPROC_PER_NODE:-${DETECTED_GPU_COUNT}}"
 WORLD_MODEL_BATCH_SIZE="${WORLD_MODEL_BATCH_SIZE:-16}"
 BATCH_SIZE_PER_DEVICE="${BATCH_SIZE_PER_DEVICE:-1}"
 TOKENIZER_MICRO_BATCH_SIZE="${TOKENIZER_MICRO_BATCH_SIZE:-4}"
-MAX_STEPS="${MAX_STEPS:-15000}"
+MAX_STEPS="${MAX_STEPS:-150000}"
 PRECISION="${PRECISION:-bf16}"
 
 if [ -n "${LIBERO_TASKS:-}" ]; then
   read -r -a TASKS <<< "${LIBERO_TASKS}"
 else
-  TASKS=(spatial object goal 10)
+  TASKS=(10)
 fi
 
 mkdir -p "${REPO_ROOT}/logs/libero/WorldModel/${DATE}"

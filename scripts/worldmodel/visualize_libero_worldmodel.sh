@@ -32,6 +32,12 @@ COMPARE_BASE="${COMPARE_BASE:-1}"
 RUN_ACTION_SENSITIVITY="${RUN_ACTION_SENSITIVITY:-0}"
 RUN_DIAGNOSTIC_CHUNK="${RUN_DIAGNOSTIC_CHUNK:-0}"
 
+# Evaluation protocol extensions (safe defaults: disabled)
+ENABLE_ROI_METRICS="${ENABLE_ROI_METRICS:-0}"
+ENABLE_RANK_LOGGING="${ENABLE_RANK_LOGGING:-0}"
+ENABLE_FAILURE_TEMPLATE_EXPORT="${ENABLE_FAILURE_TEMPLATE_EXPORT:-0}"
+EVAL_PROTOCOL="${EVAL_PROTOCOL:-configs/libero/eval_protocol_v1.yaml}"
+
 # ---------------------------------------------------------
 # Usage
 # ---------------------------------------------------------
@@ -136,6 +142,16 @@ for task_suite in "${TASKS[@]}"; do
     extra_args+=(--run-diagnostic-chunk)
   fi
 
+  if is_true "${ENABLE_ROI_METRICS}"; then
+    extra_args+=(--enable-roi-metrics)
+  fi
+
+  if is_true "${ENABLE_RANK_LOGGING}"; then
+    extra_args+=(--enable-rank-logging)
+    # rank logging requires action sensitivity to be on
+    extra_args+=(--run-action-sensitivity)
+  fi
+
   python -m worldmodel.libero.visualize \
     --task-suite "${task_suite}" \
     --data-root "${REPO_ROOT}/data/modified_libero_rlds" \
@@ -159,6 +175,13 @@ for task_suite in "${TASKS[@]}"; do
     "${extra_args[@]}"
 
   echo "===== Finished LIBERO suite: ${task_suite} ====="
+
+  # Failure taxonomy template export (Task D)
+  if is_true "${ENABLE_FAILURE_TEMPLATE_EXPORT}"; then
+    python -m worldmodel.libero.export_failure_taxonomy_template \
+      --sweep-dir "${suite_out_dir}" \
+      --output    "${suite_out_dir}/taxonomy_template__${task_suite}.csv" || true
+  fi
 done
 
 echo "All evaluations completed."
