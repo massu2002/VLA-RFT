@@ -8,10 +8,12 @@ set -x
 # 外側から渡されなければデフォルト値を使う
 N_GPUS_PER_NODE="${N_GPUS_PER_NODE:-8}"
 WORLD_MODEL_PATH="${WORLD_MODEL_PATH:-checkpoints/libero/WorldModel/${LIBERO_TASK_NAME}}"
+BASE_VLA_PATH="${BASE_VLA_PATH:-checkpoints/libero/Base_VLA/${LIBERO_TASK_NAME}}"
 
 echo "LIBERO_TASK_NAME=${LIBERO_TASK_NAME}"
 echo "N_GPUS_PER_NODE=${N_GPUS_PER_NODE}"
 echo "WORLD_MODEL_PATH=${WORLD_MODEL_PATH}"
+echo "BASE_VLA_PATH=${BASE_VLA_PATH}"
 
 python3 -m verl.trainer.main_vla_rft_grpo \
     trainer.total_training_steps=400 \
@@ -28,7 +30,7 @@ python3 -m verl.trainer.main_vla_rft_grpo \
     trainer.save_last_num=2 \
     trainer.val_iters=10 \
     trainer.test_freq=-1 \
-    trainer.default_local_dir="checkpoints/libero/RFT/${LIBERO_TASK_NAME}/${DATE}_${POST_EXP_NAME}" \
+    trainer.default_local_dir="checkpoints/libero/VLA-RFT/${LIBERO_TASK_NAME}/${DATE}_${POST_EXP_NAME}" \
     trainer.msp_reward_aggregate=mean \
     trainer.msp_reward_discount=0.95 \
     trainer.loss_weight.mse=0 \
@@ -59,8 +61,8 @@ python3 -m verl.trainer.main_vla_rft_grpo \
     actor_rollout_ref.rollout.n=16 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
-    actor_rollout_ref.model.ckpt_path="checkpoints/libero/Base/${LIBERO_TASK_NAME}" \
-    actor_rollout_ref.model.cfg_path="checkpoints/libero/Base/${LIBERO_TASK_NAME}/config.json" \
+    actor_rollout_ref.model.ckpt_path="${BASE_VLA_PATH}" \
+    actor_rollout_ref.model.cfg_path="${BASE_VLA_PATH}" \
     algorithm.use_kl_in_reward=False \
     world_model_rollout.model.base_path="checkpoints/libero/WorldModel/${LIBERO_TASK_NAME}" \
     world_model_rollout.model.path="${WORLD_MODEL_PATH}" \

@@ -269,6 +269,7 @@ def compute_roi_metrics_np(
 RANKING_METRIC_KEYS: List[str] = [
     "strict_order_acc",
     "pairwise_acc",
+    "aggregate_pairwise_acc",
     "top1_acc",
     "mean_margin",
     "pos_score_mean",

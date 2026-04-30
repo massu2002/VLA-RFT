@@ -1,6 +1,6 @@
 {
   "_comment": "Task subset for fast WorldModel evaluation (v1). Indices match LIBERO suite task ordering.",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "purpose": "Representative subset for quantifying why baseline WM did not improve RFT.",
   "suites": {
     "spatial": {
@@ -18,6 +18,27 @@
     "long": {
       "task_indices": [0, 2],
       "rationale": "Two long-horizon tasks; more are expensive to evaluate."
+    }
+  },
+  "phase0_all": {
+    "_comment": "Full-suite Phase 0: all tasks for comprehensive per-task analysis. Used with TASK_SCOPE=all.",
+    "suites": {
+      "spatial": {
+        "task_indices": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+        "rationale": "All 10 LIBERO-Spatial tasks for complete Phase 0 coverage."
+      },
+      "object": {
+        "task_indices": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+        "rationale": "All LIBERO-Object tasks."
+      },
+      "goal": {
+        "task_indices": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+        "rationale": "All LIBERO-Goal tasks."
+      },
+      "long": {
+        "task_indices": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+        "rationale": "All LIBERO-Long tasks."
+      }
     }
   },
   "small_run": {

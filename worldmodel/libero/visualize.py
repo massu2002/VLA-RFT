@@ -1140,14 +1140,31 @@ def evaluate_action_sensitivity(
     lpips_gap = [r["shuffled_avg_lpips"] - r["correct_avg_lpips"] for r in records]
     mse_gap = [r["shuffled_avg_mse"] - r["correct_avg_mse"] for r in records]
 
+    wins = [1 if r["correct_avg_lpips"] < r["shuffled_avg_lpips"] else 0 for r in records]
+    num_wins = int(sum(wins))
+    num_windows = int(len(records))
+
     return {
-        "num_windows": int(len(records)),
+        "num_windows": num_windows,
+        "per_window_pairwise_acc": float(num_wins) / num_windows,
+        "num_wins": num_wins,
+        "num_losses": num_windows - num_wins,
         "correct_lpips": _summarize_values([r["correct_avg_lpips"] for r in records]),
         "shuffled_lpips": _summarize_values([r["shuffled_avg_lpips"] for r in records]),
         "lpips_gap": _summarize_values(lpips_gap),
         "correct_mse": _summarize_values([r["correct_avg_mse"] for r in records]),
         "shuffled_mse": _summarize_values([r["shuffled_avg_mse"] for r in records]),
         "mse_gap": _summarize_values(mse_gap),
+        "per_window_records": [
+            {
+                "case_id": r["case_id"],
+                "correct_lpips": r["correct_avg_lpips"],
+                "shuffled_lpips": r["shuffled_avg_lpips"],
+                "lpips_gap": r["shuffled_avg_lpips"] - r["correct_avg_lpips"],
+                "win": 1 if r["correct_avg_lpips"] < r["shuffled_avg_lpips"] else 0,
+            }
+            for r in records
+        ],
     }
 
 
@@ -1683,23 +1700,43 @@ def _emit_baseline_ranking_jsonl(
     correct_mse = action_sensitivity.get("correct_mse", {}).get("mean", None)
     shuffled_mse = action_sensitivity.get("shuffled_mse", {}).get("mean", None)
 
+    pw_pairwise = action_sensitivity.get("per_window_pairwise_acc")
+    num_wins    = action_sensitivity.get("num_wins")
+    num_losses  = action_sensitivity.get("num_losses")
+    aggregate_pairwise = (
+        1.0 if (correct_lpips is not None and shuffled_lpips is not None
+                and correct_lpips < shuffled_lpips) else 0.0
+    )
+
     metrics = {
-        # pairwise_acc: fraction where GT scores better than shuffled
-        # (here measured as: correct_lpips < shuffled_lpips, i.e. lower = better)
-        "pairwise_acc": (
-            1.0 if (correct_lpips is not None and shuffled_lpips is not None
-                    and correct_lpips < shuffled_lpips) else 0.0
-        ),
+        # True per-window fraction: how often GT scores better than shuffled per window
+        "pairwise_acc": pw_pairwise if pw_pairwise is not None else aggregate_pairwise,
+        # Single binary comparison of aggregate means (kept for backward compatibility)
+        "aggregate_pairwise_acc": aggregate_pairwise,
         "mean_margin": -lpips_gap if lpips_gap is not None else None,
         "pos_score_mean": (-correct_lpips  if correct_lpips  is not None else None),
         "neg_score_mean": (-shuffled_lpips if shuffled_lpips is not None else None),
     }
-    per_item = [
-        {"item_id": 0, "scores": [
-            -float(correct_lpips  or 0.0),
-            -float(shuffled_lpips or 0.0),
-        ]},
-    ]
+    # Expand per_item to one entry per window so downstream consumers can inspect
+    # per-window win/loss without re-running the eval.
+    pw_records = action_sensitivity.get("per_window_records", [])
+    if pw_records:
+        per_item = [
+            {
+                "item_id": r["case_id"],
+                "scores": [-r["correct_lpips"], -r["shuffled_lpips"]],
+                "win": r["win"],
+                "lpips_gap": r["lpips_gap"],
+            }
+            for r in pw_records
+        ]
+    else:
+        per_item = [
+            {"item_id": 0, "scores": [
+                -float(correct_lpips  or 0.0),
+                -float(shuffled_lpips or 0.0),
+            ]},
+        ]
     jsonl_dir = output_root / "ranking_eval"
     jsonl_path = jsonl_dir / f"{model_label}__{exp_label}__{args.task_suite}.jsonl"
     append_ranking_jsonl(

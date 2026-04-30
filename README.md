@@ -1,24 +1,5 @@
 # VLA-RFT: Vision-Language-Action Models with Reinforcement Fine-Tuning
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/release/python-310/)
-[![arXiv 2510.00406](https://img.shields.io/badge/arXiv-2510.00406-b31b1b?logo=arXiv&logoColor=white)](https://arxiv.org/abs/2510.00406)
-[![Project Page](https://img.shields.io/badge/Project%20Page-vla--rft.github.io-6f42c1?logo=github&logoColor=white)](https://vla-rft.github.io/)
-
-<div id="top" align="center">
-<p align="center">
-<img src=image/Figure1.png width=90% />
-</p>
-</div>
-
-<div id="top" align="center">
-<p align="center">
-<img src=image/Figure2.png width=90% />
-</p>
-</div>
-
-Vision-Language-Action (VLA) models enable embodied decision-making but rely heavily on imitation learning, leading to compounding errors and poor robustness under distribution shift. Reinforcement learning (RL) can mitigate these issues yet typically demands costly real-world interactions or suffers from sim-to-real gaps. We introduce VLA-RFT, a reinforcement fine-tuning framework that leverages a data-driven world model as a controllable simulator. Trained from real interaction data, the simulator predicts future visual observations conditioned on actions, allowing policy rollouts with dense, trajectory-level rewards derived from goal-achieving references. This design delivers an efficient and action-aligned learning signal, drastically lowering sample requirements. **With fewer than 400 fine-tuning steps, VLA-RFT surpasses strong supervised baselines and achieves greater efficiency than simulator-based RL.** Moreover, it exhibits strong robustness under perturbed conditions, sustaining stable task execution. Our results establish world-model-based RFT as a practical post-training paradigm to enhance the generalization and robustness of VLA models. 
-
 ## 🚀 Quick Start
 
 ### Prerequisites
@@ -157,29 +138,9 @@ bash post_train_rlvr.sh
 - **LIBERO-Goal**: Goal-conditioned tasks
 - **LIBERO-10**: 10-task suite
 
-<div id="top" align="center">
-<p align="center">
-<img src=image/Figure3.png width=90% />
-</p>
-</div>
-
 ## 📈 Performance
 
 With fewer than 400 fine-tuning steps, VLA-RFT surpasses strong supervised baselines and achieves greater efficiency than simulator-based RL.
-
-<div id="top" align="center">
-<p align="center">
-<img src=image/Table1.png width=90% />
-</p>
-</div>
-
-<div id="top" align="center">
-<p align="center">
-<img src=image/Table2.png width=90% />
-</p>
-</div>
-
-*Please refer to our paper for detailed benchmark results.*
 
 ## 📝 TODO
 
@@ -196,22 +157,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 If you use VLA-RFT in your research, please cite:
 
-```bibtex
-@article{wang2025vlaadapter,
-  author={Wang, Yihao and Ding, Pengxiang and Li, Lingxiao and Cui, Can and Ge, Zirui and Tong, Xinyang and Song, Wenxuan and Zhao, Han and Zhao, Wei and Hou, Pengxu and Huang, Siteng and Tang, Yifan and Wang, Wenhui and Zhang, Ru and Liu, Jianyi and Wang, Donglin},
-  title={VLA-Adapter: An Effective Paradigm for Tiny-Scale Vision-Language-Action Model},
-  journal={arXiv preprint arXiv:2509.09372},
-  year={2025}
-}
-```
-```bibtex
-@article{li2025vla,
-  title={VLA-RFT: Vision-Language-Action Reinforcement Fine-tuning with Verified Rewards in World Simulators},
-  author={Li, Hengtao and Ding, Pengxiang and Suo, Runze and Wang, Yihao and Ge, Zirui and Zang, Dongyuan and Yu, Kexian and Sun, Mingyang and Zhang, Hongyin and Wang, Donglin and others},
-  journal={arXiv preprint arXiv:2510.00406},
-  year={2025}
-}
-```
 
 
 ## 🙏 Acknowledgments

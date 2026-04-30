@@ -139,10 +139,22 @@ class RldsIterableDataset(IterableDataset):
 
     def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
         rank, world_size = _dist_info()
-        rng = random.Random(self.seed + rank)
+
+        # DataLoader worker sharding (within each DDP rank).
+        # Combines DDP rank and worker ID into a single shard index so that
+        # num_workers > 0 does not produce duplicate samples across workers.
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is not None:
+            effective_rank  = rank * worker_info.num_workers + worker_info.id
+            effective_world = world_size * worker_info.num_workers
+        else:
+            effective_rank  = rank
+            effective_world = world_size
+
+        rng = random.Random(self.seed + effective_rank)
 
         for episode_index, episode in enumerate(self._episode_stream()):
-            if episode_index % world_size != rank:
+            if episode_index % effective_world != effective_rank:
                 continue
 
             steps = list(episode["steps"])
