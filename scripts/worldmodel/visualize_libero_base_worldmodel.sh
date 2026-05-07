@@ -62,7 +62,7 @@ for task_suite in "${TASKS[@]}"; do
     python -m worldmodel.libero.visualize_base \
       --task-suite "${task_suite}" \
       --task-index "${task_index}" \
-      --data-root "${REPO_ROOT}/data/modified_libero_rlds" \
+      --data-root "${DATA_ROOT:-${LIBERO_DATA_ROOT:-${LOCALDATA_ROOT:-/localdata}/modified_libero_rlds}}" \
       --base-model-root "${REPO_ROOT}/checkpoints/libero/WorldModel" \
       --visual-tokenizer "${REPO_ROOT}/checkpoints/libero/WorldModel/Tokenizer" \
       --output-dir "${suite_out_dir}" \

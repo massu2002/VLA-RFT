@@ -40,6 +40,7 @@ SMOKE="${SMOKE:-0}"
 ALL_CONDITIONS="${ALL_CONDITIONS:-pixel pixel_residual pixel_residual_roi_dynamic}"
 NUM_EVAL_WINDOWS="${NUM_EVAL_WINDOWS:-200}"
 NUM_RANKING_WINDOWS="${NUM_RANKING_WINDOWS:-100}"
+EXP_NAME="${EXP_NAME:-v1}"
 
 DATE_TAG=$(timestamp)
 RESULTS_ROOT="${REPO_ROOT}/results/phase1"
@@ -61,6 +62,7 @@ data = {
     "seed":                 ${SEED},
     "smoke":                "${SMOKE}",
     "all_conditions":       "${ALL_CONDITIONS}".split(),
+    "exp_name":             "${EXP_NAME}",
     "num_eval_windows":     ${NUM_EVAL_WINDOWS},
     "num_ranking_windows":  ${NUM_RANKING_WINDOWS},
     "initialized_by":       "init_phase1_run.sh",
@@ -86,7 +88,7 @@ log ""
 idx=1
 for COND in ${ALL_CONDITIONS}; do
   log "  # PC${idx} — condition: ${COND}"
-  log "  TRAIN_CONDITIONS=${COND} OUT_ROOT=\${OUT_ROOT} \\"
+  log "  TRAIN_CONDITIONS=${COND} EXP_NAME=${EXP_NAME} OUT_ROOT=\${OUT_ROOT} \\"
   log "    bash scripts/libero/phase1/run_residual_wm_eval.sh ${TASK_SUITE}"
   log ""
   idx=$(( idx + 1 ))
@@ -97,7 +99,7 @@ log "  bash scripts/libero/phase1/summarize_residual_wm_eval.sh \${OUT_ROOT}"
 log ""
 log "Checkpoint locations:"
 for COND in ${ALL_CONDITIONS}; do
-  log "  ${COND}: checkpoints/libero/PixelResidualWM/${TASK_SUITE}/${COND}/v1/s${SEED}/"
+  log "  ${COND}: checkpoints/libero/PixelResidualWM/${TASK_SUITE}/${COND}/${EXP_NAME}/s${SEED}/"
 done
 
 # Also export for callers that source this script

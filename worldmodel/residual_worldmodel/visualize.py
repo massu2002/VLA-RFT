@@ -73,7 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["spatial", "object", "goal", "10"],
         required=True,
     )
-    parser.add_argument("--data-root", type=str, default="data/modified_libero_rlds")
+    parser.add_argument("--data-root", type=str, default="/localdata/modified_libero_rlds")
 
     # --- Model ---
     parser.add_argument(

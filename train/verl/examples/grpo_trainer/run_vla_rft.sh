@@ -9,14 +9,18 @@ set -x
 N_GPUS_PER_NODE="${N_GPUS_PER_NODE:-8}"
 WORLD_MODEL_PATH="${WORLD_MODEL_PATH:-checkpoints/libero/WorldModel/${LIBERO_TASK_NAME}}"
 BASE_VLA_PATH="${BASE_VLA_PATH:-checkpoints/libero/Base_VLA/${LIBERO_TASK_NAME}}"
+RFT_STEPS="${RFT_STEPS:-400}"
+EXTRA_RFT_ARGS="${EXTRA_RFT_ARGS:-}"
+export VLA_RFT_ATTN_IMPLEMENTATION="${VLA_RFT_ATTN_IMPLEMENTATION:-eager}"
 
 echo "LIBERO_TASK_NAME=${LIBERO_TASK_NAME}"
 echo "N_GPUS_PER_NODE=${N_GPUS_PER_NODE}"
 echo "WORLD_MODEL_PATH=${WORLD_MODEL_PATH}"
 echo "BASE_VLA_PATH=${BASE_VLA_PATH}"
+echo "VLA_RFT_ATTN_IMPLEMENTATION=${VLA_RFT_ATTN_IMPLEMENTATION}"
 
 python3 -m verl.trainer.main_vla_rft_grpo \
-    trainer.total_training_steps=400 \
+    trainer.total_training_steps="${RFT_STEPS}" \
     trainer.save_freq=50 \
     trainer.nnodes=1 \
     trainer.n_gpus_per_node="${N_GPUS_PER_NODE}" \
@@ -92,4 +96,5 @@ python3 -m verl.trainer.main_vla_rft_grpo \
     processor.tokens_per_frame=64 \
     processor.processor_type=ctx_msp \
     processor.max_length=1663 \
-    processor.use_img_gt_ac=True
+    processor.use_img_gt_ac=True \
+    ${EXTRA_RFT_ARGS}

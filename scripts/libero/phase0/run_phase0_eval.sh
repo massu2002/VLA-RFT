@@ -110,7 +110,7 @@ BASE_VLA_DIR="${REPO_ROOT}/checkpoints/libero/Base_VLA/${TASK_SUITE}"
 RFT_ACTOR_DIR="${REPO_ROOT}/checkpoints/libero/VLA-RFT/${TASK_SUITE}/${RFT_EXP_NAME}/global_step_${RFT_STEP}/actor"
 WM_BASE_ROOT="${REPO_ROOT}/checkpoints/libero/WorldModel"
 WM_TOKENIZER="${REPO_ROOT}/checkpoints/libero/WorldModel/Tokenizer"
-DATA_ROOT="${REPO_ROOT}/data/modified_libero_rlds"
+DATA_ROOT="${DATA_ROOT:-${LIBERO_DATA_ROOT:-${LOCALDATA_ROOT:-/localdata}/modified_libero_rlds}}"
 
 # Resolve trained WorldModel directory: prefer experiment subdirs over suite root
 _resolve_wm_trained_dir() {

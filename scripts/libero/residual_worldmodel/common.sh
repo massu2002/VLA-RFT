@@ -31,6 +31,7 @@ fi
 # ---------------------------------------------------------------------------
 _VENV_NAME="${VENV_NAME:-".venv"}"
 _DEFAULT_LIBERO_DATASET_SUBDIR="modified_libero_rlds"
+_DEFAULT_LOCALDATA_ROOT="/localdata"
 
 setup_env() {
   # Activate venv and set PYTHONPATH.
@@ -56,7 +57,7 @@ default_libero_data_root() {
   elif [ -n "${LOCALDATA_ROOT:-}" ]; then
     echo "${LOCALDATA_ROOT%/}/${_DEFAULT_LIBERO_DATASET_SUBDIR}"
   else
-    echo "${REPO_ROOT}/data/${_DEFAULT_LIBERO_DATASET_SUBDIR}"
+    echo "${_DEFAULT_LOCALDATA_ROOT}/${_DEFAULT_LIBERO_DATASET_SUBDIR}"
   fi
 }
 

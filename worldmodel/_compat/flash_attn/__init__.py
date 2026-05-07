@@ -14,7 +14,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn.functional as F
 
-from .bert_padding import index_first_axis, pad_input, unpad_input
+from .bert_padding import index_first_axis, pad_input, rearrange, unpad_input
 
 __version__ = "2.1.0"
 

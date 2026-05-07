@@ -275,12 +275,16 @@ def aggregate_phase1_metrics(
         "goal_mse", "goal_lpips",
         "dynamic_mse", "dynamic_lpips",
         "static_consistency_mse",
+        "copy_current_mse", "copy_current_lpips",
+        "residual_abs_mean", "residual_abs_max",
+        "write_mask_mean", "write_mask_max",
         "correct_lpips", "shuffled_lpips", "lpips_gap",
     ]
 
     agg: Dict[str, List[float]] = {k: [] for k in scalar_keys}
     pairwise_wins = 0
     num_windows = 0
+    num_ranking_windows = 0
 
     for row in per_window_rows:
         num_windows += 1
@@ -288,16 +292,20 @@ def aggregate_phase1_metrics(
             v = row.get(k)
             if v is not None and not (isinstance(v, float) and np.isnan(v)):
                 agg[k].append(float(v))
-        if row.get("pairwise_win"):
-            pairwise_wins += 1
+        is_ranked = row.get("shuffled_lpips") is not None
+        if is_ranked and not (isinstance(row.get("shuffled_lpips"), float) and np.isnan(row.get("shuffled_lpips"))):
+            num_ranking_windows += 1
+            if row.get("pairwise_win"):
+                pairwise_wins += 1
 
     def _mean(lst):
         return float(np.mean(lst)) if lst else float("nan")
 
     agg_metrics = {k: _mean(agg[k]) for k in scalar_keys}
-    agg_metrics["pairwise_acc"] = pairwise_wins / max(num_windows, 1)
-    agg_metrics["reverse_windows"] = num_windows - pairwise_wins
+    agg_metrics["pairwise_acc"] = pairwise_wins / max(num_ranking_windows, 1)
+    agg_metrics["reverse_windows"] = num_ranking_windows - pairwise_wins
     agg_metrics["num_windows"] = num_windows
+    agg_metrics["num_ranking_windows"] = num_ranking_windows
 
     # lpips_gap_min
     gaps = agg.get("lpips_gap", [])
@@ -334,9 +342,18 @@ def aggregate_phase1_metrics(
             w.writerows(task_rows)
 
     # ---- per-window ranking ----
-    ranking_keys = ["task_name", "window_id", "correct_lpips", "shuffled_lpips",
-                    "lpips_gap", "pairwise_win"]
-    ranking_rows = [{k: row.get(k) for k in ranking_keys} for row in per_window_rows]
+    ranking_keys = [
+        "task_name", "task_index", "window_id", "window_phase",
+        "episode_length", "episode_file",
+        "frame_indices", "action_indices",
+        "correct_lpips", "shuffled_lpips", "lpips_gap", "pairwise_win",
+    ]
+    ranking_rows = []
+    for row in per_window_rows:
+        v = row.get("shuffled_lpips")
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            continue
+        ranking_rows.append({k: row.get(k) for k in ranking_keys})
     if ranking_rows:
         with open(os.path.join(output_dir, "ranking_by_window.csv"), "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=ranking_keys)

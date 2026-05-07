@@ -3,7 +3,7 @@
 Usage (from repo root):
     python -m worldmodel.residual_worldmodel.train_pixel_residual_libero \\
         --task-suite spatial \\
-        --data-root data/modified_libero_rlds \\
+        --data-root /localdata/modified_libero_rlds \\
         --output-dir checkpoints/libero/PixelResidualWM/spatial/pixel_residual_v1 \\
         --target-mode pixel_residual \\
         --max-steps 50000
@@ -49,7 +49,7 @@ def build_parser() -> argparse.ArgumentParser:
     dataset_group.add_argument("--task-suite", type=str,
                                choices=["spatial", "object", "goal", "10"])
     dataset_group.add_argument("--dataset-name", type=str)
-    parser.add_argument("--data-root", type=str, default="data/modified_libero_rlds")
+    parser.add_argument("--data-root", type=str, default="/localdata/modified_libero_rlds")
 
     parser.add_argument("--output-dir", type=str, required=True)
 
@@ -90,6 +90,7 @@ def build_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 
 _LOSS_KEYS = ["loss_residual", "loss_image", "loss_dynamic", "loss_gripper", "loss_static"]
+_LOSS_KEYS.append("loss_write_mask")
 
 
 class PixelResidualTrainer(Trainer):
@@ -196,15 +197,38 @@ def main() -> None:
         ("TARGET_MODE",       "--target-mode"),
         ("DYNAMIC_THRESHOLD", "--dynamic-threshold"),
         ("ROI_CROP_SIZE",     "--roi-crop-size"),
+        ("PIXEL_OUTPUT_ACTIVATION", "--pixel-output-activation"),
+        ("RESIDUAL_OUTPUT_ACTIVATION", "--residual-output-activation"),
+        ("RESIDUAL_OUTPUT_SCALE", "--residual-output-scale"),
+        ("WRITE_MASK_TEMPERATURE", "--write-mask-temperature"),
+        ("ACTION_CONDITIONING_MODE", "--action-conditioning-mode"),
+        ("CONTEXT_ANCHOR_MODE", "--context-anchor-mode"),
         ("LAMBDA_RESIDUAL",   "--lambda-residual"),
         ("LAMBDA_IMAGE",      "--lambda-image"),
         ("LAMBDA_DYNAMIC",    "--lambda-dynamic"),
         ("LAMBDA_GRIPPER",    "--lambda-gripper"),
         ("LAMBDA_STATIC",     "--lambda-static"),
+        ("LAMBDA_WRITE_MASK", "--lambda-write-mask"),
     ]:
         val = os.environ.get(env_key)
         if val and arg_name not in __import__("sys").argv:
             __import__("sys").argv.extend([arg_name, val])
+
+    for env_key, yes_arg, no_arg in [
+        ("USE_SPATIAL_ACTION_CONDITIONING",
+         "--use-spatial-action-conditioning",
+         "--no-spatial-action-conditioning"),
+        ("USE_RESIDUAL_WRITE_MASK",
+         "--use-residual-write-mask",
+         "--no-residual-write-mask"),
+    ]:
+        val = os.environ.get(env_key)
+        argv = __import__("sys").argv
+        if val and yes_arg not in argv and no_arg not in argv:
+            if val in ("0", "false", "FALSE", "False", "no", "NO"):
+                argv.append(no_arg)
+            else:
+                argv.append(yes_arg)
 
     # Dry-run shortcut: tiny defaults
     if os.environ.get("DRY_RUN", "0") in ("1", "true"):
@@ -249,20 +273,32 @@ def main() -> None:
         target_mode        = args.target_mode,
         action_ranges_path = args.action_ranges_path,
         action_dim         = args.action_dim,
+        action_bins        = args.action_bins,
         action_horizon     = raw_chunk_length - 2,
         encoder_channels   = args.encoder_channels,
         hidden_dim         = args.hidden_dim,
         n_heads            = args.n_heads,
         n_pred_layers      = args.n_pred_layers,
+        n_spatial_action_layers = args.n_spatial_action_layers,
         ffn_dim            = args.ffn_dim,
         dropout            = args.dropout,
         action_emb_dim     = args.action_emb_dim,
+        action_conditioning_mode = args.action_conditioning_mode,
+        context_anchor_mode = args.context_anchor_mode,
         autocast_dtype     = autocast_dtype,
+        pixel_output_activation = args.pixel_output_activation,
+        residual_output_activation = args.residual_output_activation,
+        residual_output_scale = args.residual_output_scale,
+        use_spatial_action_conditioning = args.use_spatial_action_conditioning,
+        use_residual_write_mask = args.use_residual_write_mask,
+        write_mask_temperature = args.write_mask_temperature,
+        write_mask_bias_init = args.write_mask_bias_init,
         lambda_residual    = args.lambda_residual,
         lambda_image       = args.lambda_image,
         lambda_dynamic     = args.lambda_dynamic,
         lambda_gripper     = args.lambda_gripper,
         lambda_static      = args.lambda_static,
+        lambda_write_mask  = args.lambda_write_mask,
         dynamic_threshold  = args.dynamic_threshold,
         dynamic_dilate_kernel = args.dynamic_dilate_kernel,
         roi_crop_size      = args.roi_crop_size,
@@ -320,7 +356,9 @@ def main() -> None:
         local_rank                  = int(os.environ.get("LOCAL_RANK", "-1")),
     )
     if world_size > 1:
-        training_kwargs["ddp_find_unused_parameters"] = False
+        # Phase 1 supports multiple target modes. Some heads can be auxiliary
+        # or disabled for a given mode, so DDP must tolerate unused parameters.
+        training_kwargs["ddp_find_unused_parameters"] = True
 
     trainer = PixelResidualTrainer(
         model         = model,
@@ -354,9 +392,16 @@ def main() -> None:
             "dataset_name":          dataset_name,
             "max_steps":             args.max_steps,
             "segment_length":        args.segment_length,
+            "effective_action_horizon": cfg.action_horizon,
             "world_size":            world_size,
             "batch_size_per_device": args.batch_size_per_device,
             "grad_accum":            args.grad_accum,
+            "global_batch_size":      args.batch_size_per_device * args.grad_accum * world_size,
+            "learning_rate":          args.learning_rate,
+            "warmup_ratio":           args.warmup_ratio,
+            "lr_scheduler_type":      args.lr_scheduler_type,
+            "weight_decay":           args.weight_decay,
+            "max_grad_norm":          args.max_grad_norm,
             "precision":             args.precision,
             "config":                dataclasses.asdict(cfg),
             "timestamp":             datetime.now().isoformat(),

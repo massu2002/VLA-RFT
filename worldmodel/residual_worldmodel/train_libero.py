@@ -3,7 +3,7 @@
 Usage:
     python -m worldmodel.residual_worldmodel.train_libero \\
         --task-suite spatial \\
-        --data-root data/modified_libero_rlds \\
+        --data-root /localdata/modified_libero_rlds \\
         --visual-tokenizer checkpoints/libero/WorldModel/Tokenizer \\
         --output-dir checkpoints/libero/ResidualWorldModel/spatial/run01
 
@@ -51,7 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="RLDS dataset name (TFDS) used directly.",
     )
 
-    parser.add_argument("--data-root", type=str, default="data/modified_libero_rlds")
+    parser.add_argument("--data-root", type=str, default="/localdata/modified_libero_rlds")
     parser.add_argument("--visual-tokenizer", type=str, required=True)
     parser.add_argument("--output-dir", type=str, required=True)
 

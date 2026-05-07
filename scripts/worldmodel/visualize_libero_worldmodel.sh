@@ -154,7 +154,7 @@ for task_suite in "${TASKS[@]}"; do
 
   python -m worldmodel.libero.visualize \
     --task-suite "${task_suite}" \
-    --data-root "${REPO_ROOT}/data/modified_libero_rlds" \
+    --data-root "${DATA_ROOT:-${LIBERO_DATA_ROOT:-${LOCALDATA_ROOT:-/localdata}/modified_libero_rlds}}" \
     --base-model-root "${REPO_ROOT}/checkpoints/libero/WorldModel" \
     --trained-model-root "${REPO_ROOT}/checkpoints/libero/WorldModel" \
     --trained-exp-name "${EXP_NAME}" \

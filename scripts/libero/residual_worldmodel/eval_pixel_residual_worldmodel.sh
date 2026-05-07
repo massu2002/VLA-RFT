@@ -21,6 +21,10 @@
 #   SEED, DEVICE
 #   DRY_RUN_WINDOWS         — >0 limits windows per task for quick sanity check
 #   SAVE_DEBUG_IMAGES       — 1 to save debug PNGs
+#   PHASE0_COMPATIBLE       — 1 to use Phase 0-compatible ranking/window protocol
+#   TASK_INDICES            — comma-separated task ids (empty = all tasks)
+#   WINDOW_POSITION_MODE    — random | episode_phases
+#   NUM_EVAL_EPISODES_PER_TASK — episode count per task for episode_phases
 
 set -euo pipefail
 
@@ -44,6 +48,10 @@ for _kv in "$@"; do
     DEVICE=*)          DEVICE="${_kv#DEVICE=}"             ;;
     DRY_RUN_WINDOWS=*) DRY_RUN_WINDOWS="${_kv#DRY_RUN_WINDOWS=}" ;;
     SAVE_DEBUG_IMAGES=*) SAVE_DEBUG_IMAGES="${_kv#SAVE_DEBUG_IMAGES=}" ;;
+    PHASE0_COMPATIBLE=*) PHASE0_COMPATIBLE="${_kv#PHASE0_COMPATIBLE=}" ;;
+    TASK_INDICES=*)     TASK_INDICES="${_kv#TASK_INDICES=}" ;;
+    WINDOW_POSITION_MODE=*) WINDOW_POSITION_MODE="${_kv#WINDOW_POSITION_MODE=}" ;;
+    NUM_EVAL_EPISODES_PER_TASK=*) NUM_EVAL_EPISODES_PER_TASK="${_kv#NUM_EVAL_EPISODES_PER_TASK=}" ;;
   esac
 done
 
@@ -67,6 +75,10 @@ SEED="${SEED:-42}"
 DEVICE="${DEVICE:-auto}"
 DRY_RUN_WINDOWS="${DRY_RUN_WINDOWS:-0}"
 SAVE_DEBUG_IMAGES="${SAVE_DEBUG_IMAGES:-0}"
+PHASE0_COMPATIBLE="${PHASE0_COMPATIBLE:-0}"
+TASK_INDICES="${TASK_INDICES:-}"
+WINDOW_POSITION_MODE="${WINDOW_POSITION_MODE:-random}"
+NUM_EVAL_EPISODES_PER_TASK="${NUM_EVAL_EPISODES_PER_TASK:-0}"
 
 OUTPUT_BASE="${OUTPUT_BASE:-${REPO_ROOT}/results/phase1/residual_worldmodel}"
 OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_BASE}/${CONDITION_NAME}}"
@@ -105,6 +117,10 @@ print_run_summary \
   "NUM_RANKING_WIN"    "${NUM_RANKING_WINDOWS}" \
   "EVAL_HORIZON"       "${EVAL_HORIZON}" \
   "DRY_RUN_WINDOWS"    "${DRY_RUN_WINDOWS}" \
+  "PHASE0_COMPAT"      "${PHASE0_COMPATIBLE}" \
+  "WINDOW_POS_MODE"    "${WINDOW_POSITION_MODE}" \
+  "EVAL_EPISODES_TASK" "${NUM_EVAL_EPISODES_PER_TASK}" \
+  "TASK_INDICES"       "${TASK_INDICES:-<all>}" \
   "SEED"               "${SEED}" \
   "DEVICE"             "${DEVICE}" \
   "DATA_ROOT"          "${DATA_ROOT}" \
@@ -129,7 +145,20 @@ EVAL_ARGS=(
   --lpips-batch-size    "${LPIPS_BATCH_SIZE}"
   --seed                "${SEED}"
   --device              "${DEVICE}"
+  --window-position-mode "${WINDOW_POSITION_MODE}"
 )
+
+if [ "${NUM_EVAL_EPISODES_PER_TASK}" -gt 0 ] 2>/dev/null; then
+  EVAL_ARGS+=(--num-eval-episodes-per-task "${NUM_EVAL_EPISODES_PER_TASK}")
+fi
+
+if [ -n "${TASK_INDICES}" ]; then
+  EVAL_ARGS+=(--task-indices "${TASK_INDICES}")
+fi
+
+if [ "${PHASE0_COMPATIBLE}" = "1" ]; then
+  EVAL_ARGS+=(--phase0-compatible)
+fi
 
 if [ "${DRY_RUN_WINDOWS}" -gt 0 ] 2>/dev/null; then
   EVAL_ARGS+=(--dry-run-windows "${DRY_RUN_WINDOWS}")

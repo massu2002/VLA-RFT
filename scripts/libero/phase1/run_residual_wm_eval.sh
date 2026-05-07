@@ -29,6 +29,7 @@
 #   NUM_RANKING_WINDOWS   — ranking eval windows (default: 100)
 #   CKPT_ROOT             — checkpoint root (default: checkpoints/libero/PixelResidualWM)
 #   OUT_ROOT              — output root (default: results/phase1/TIMESTAMP_suite)
+#   EXP_NAME              — checkpoint experiment name (default: v1)
 #
 # Outputs under results/phase1/<TIMESTAMP>_<suite>/:
 #   <condition>/aggregate_metrics.json
@@ -37,7 +38,7 @@
 #   <condition>/ranking_by_task.csv
 #   run_config.json
 #
-# Checkpoints under checkpoints/libero/PixelResidualWM/<suite>/<condition>/v1/s<seed>/
+# Checkpoints under checkpoints/libero/PixelResidualWM/<suite>/<condition>/<exp_name>/s<seed>/
 
 set -euo pipefail
 
@@ -67,6 +68,7 @@ SKIP_EVAL="${SKIP_EVAL:-0}"
 TRAIN_CONDITIONS="${TRAIN_CONDITIONS:-pixel pixel_residual pixel_residual_roi_dynamic}"
 NUM_EVAL_WINDOWS="${NUM_EVAL_WINDOWS:-200}"
 NUM_RANKING_WINDOWS="${NUM_RANKING_WINDOWS:-100}"
+EXP_NAME="${EXP_NAME:-v1}"
 
 DATE_TAG=$(timestamp)
 CKPT_ROOT="${CKPT_ROOT:-${REPO_ROOT}/checkpoints/libero/PixelResidualWM}"
@@ -119,6 +121,7 @@ fi
 log "=== Phase 1: Pixel-Residual World Model ==="
 log "task_suite  : ${TASK_SUITE}"
 log "conditions  : ${TRAIN_CONDITIONS}"
+log "exp_name    : ${EXP_NAME}"
 log "ckpt_root   : ${CKPT_ROOT}"
 log "output      : ${OUT_ROOT}"
 log "skip_train  : ${SKIP_TRAIN} / skip_eval: ${SKIP_EVAL}"
@@ -138,12 +141,12 @@ export DATA_ROOT="${DATA_ROOT:-$(default_libero_data_root)}"
 if ! is_true "${SKIP_TRAIN}"; then
   log "--- Training phase ---"
   for COND in ${TRAIN_CONDITIONS}; do
-    COND_CKPT="${CKPT_ROOT}/${TASK_SUITE}/${COND}/v1/s${SEED}"
+    COND_CKPT="${CKPT_ROOT}/${TASK_SUITE}/${COND}/${EXP_NAME}/s${SEED}"
     log "=== TRAIN: ${COND} → ${COND_CKPT} ==="
 
     TARGET_MODE="${COND}" \
     OUTPUT_ROOT="${CKPT_ROOT}" \
-    EXP_NAME="v1" \
+    EXP_NAME="${EXP_NAME}" \
     bash "${WM_SCRIPTS}/train_pixel_residual_worldmodel.sh" "${TASK_SUITE}" \
       && log "  TRAIN ${COND} done" \
       || log "  WARNING: TRAIN ${COND} failed — continuing"
@@ -159,7 +162,7 @@ fi
 if ! is_true "${SKIP_EVAL}"; then
   log "--- Evaluation phase ---"
   for COND in ${TRAIN_CONDITIONS}; do
-    COND_CKPT="${CKPT_ROOT}/${TASK_SUITE}/${COND}/v1/s${SEED}"
+    COND_CKPT="${CKPT_ROOT}/${TASK_SUITE}/${COND}/${EXP_NAME}/s${SEED}"
     COND_OUT="${OUT_ROOT}/${COND}"
 
     if [ ! -d "${COND_CKPT}" ]; then
@@ -179,6 +182,8 @@ if ! is_true "${SKIP_EVAL}"; then
     NUM_EVAL_WINDOWS="${NUM_EVAL_WINDOWS}" \
     NUM_RANKING_WINDOWS="${NUM_RANKING_WINDOWS}" \
     DRY_RUN_WINDOWS="${DRY_RUN_WINDOWS}" \
+    PHASE0_COMPATIBLE="${PHASE0_COMPATIBLE:-0}" \
+    TASK_INDICES="${TASK_INDICES:-}" \
     bash "${WM_SCRIPTS}/eval_pixel_residual_worldmodel.sh" \
       && log "  EVAL ${COND} done" \
       || log "  WARNING: EVAL ${COND} failed (check ${COND_OUT}/eval.log)"

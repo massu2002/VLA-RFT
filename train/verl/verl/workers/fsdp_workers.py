@@ -482,8 +482,9 @@ class ActorRolloutRefWorker(Worker):
             torch_dtype = PrecisionType.to_dtype(torch_dtype)
 
         # override model kwargs
+        attn_impl = os.environ.get('VLA_RFT_ATTN_IMPLEMENTATION', 'eager')
         actor_model_config = AutoConfig.from_pretrained(cfg_path, trust_remote_code=trust_remote_code)
-        actor_model_config.attn_implementation='flash_attention_2'
+        actor_model_config.attn_implementation = attn_impl
 
         if self.rank == 0:
             print(f'Model config after override: {actor_model_config}')
@@ -502,7 +503,7 @@ class ActorRolloutRefWorker(Worker):
 
             actor_module = actor_module_class.from_pretrained(pretrained_model_name_or_path=ckpt_path,
                                                               torch_dtype=torch_dtype,
-                                                              attn_implementation='flash_attention_2',
+                                                              attn_implementation=attn_impl,
                                                               low_cpu_mem_usage=False,
                                                               trust_remote_code=trust_remote_code)
             
@@ -1469,11 +1470,12 @@ class WorldModelRolloutWorker(Worker):
                 world_module_class = AutoModelForCausalLM
 
             # ベース構造は base(HF) 側から作る
+            attn_impl = os.environ.get('VLA_RFT_ATTN_IMPLEMENTATION', 'eager')
             world_module = world_module_class.from_pretrained(
                 pretrained_model_name_or_path=hf_assets_path,
                 torch_dtype=torch_dtype,
                 config=world_model_config,
-                attn_implementation='flash_attention_2',
+                attn_implementation=attn_impl,
                 trust_remote_code=trust_remote_code
             )
 
@@ -2233,6 +2235,27 @@ class TokenizerWorker(Worker):
         self.lpips = LPIPS().to(device).eval()
         self.psnr = piqa.PSNR(epsilon=1e-08, value_range=1.0, reduction='none').to(device)
         self.ssim = piqa.SSIM(window_size=11, sigma=1.5, n_channels=3, reduction='none').to(device)
+        self.phase1_residual_wm = None
+        phase1_cfg = self.config.get("phase1_residual", {})
+        if phase1_cfg.get("enabled", False):
+            ckpt = phase1_cfg.get("checkpoint", None)
+            if ckpt is None:
+                raise ValueError("processor.phase1_residual.enabled=True but checkpoint is not set")
+            if not os.path.isdir(ckpt):
+                raise FileNotFoundError(f"Phase1 residual world model checkpoint not found: {ckpt}")
+            dtype_name = str(phase1_cfg.get("dtype", "bfloat16"))
+            dtype = torch.bfloat16 if dtype_name in ("bf16", "bfloat16") else torch.float32
+            from worldmodel.residual_worldmodel.pixel_residual_model import PixelResidualWorldModel
+            self.phase1_residual_wm = PixelResidualWorldModel.load_pretrained(
+                ckpt,
+                torch_dtype=dtype,
+            ).to(device).eval()
+            expected_mode = phase1_cfg.get("target_mode", None)
+            if expected_mode and self.phase1_residual_wm.cfg.target_mode != expected_mode:
+                raise ValueError(
+                    f"Phase1 WM target_mode mismatch: config={expected_mode} "
+                    f"checkpoint={self.phase1_residual_wm.cfg.target_mode}"
+                )
         
     @torch.no_grad()
     def _perceptual_loss(self, real, pred):
@@ -2294,6 +2317,66 @@ class TokenizerWorker(Worker):
             loss += loss_weight['mae'] * mae
         output['loss'] = loss
         return output
+
+    def _align_phase1_actions(self, actions, action_dim):
+        actions = actions.float()
+        if actions.shape[-1] == action_dim:
+            return actions
+        if actions.shape[-1] > action_dim:
+            return actions[..., :action_dim]
+        pad = torch.zeros(*actions.shape[:-1], action_dim - actions.shape[-1],
+                          device=actions.device, dtype=actions.dtype)
+        return torch.cat([actions, pad], dim=-1)
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    @torch.no_grad()
+    def phase1_residual_reward(self, data: DataProto):
+        if self.phase1_residual_wm is None:
+            raise RuntimeError("Phase1 residual world model is not initialized")
+
+        device = torch.cuda.current_device()
+        raw_pixels = data.batch["pixels"].to(device)                 # [B, T, H, W, C] uint8
+        raw_actions = data.batch["predicted_actions"].to(device)     # [B, T or T-1, A]
+
+        pixels_f = raw_pixels.permute(0, 1, 4, 2, 3).float() / 255.0
+        first_frame = pixels_f[:, 0:1]
+        pixels_w_ctx = torch.cat([first_frame, pixels_f], dim=1)     # [B, T+1, C, H, W]
+        pixels_w_ctx_u8 = (pixels_w_ctx.clamp(0, 1) * 255.0).round().to(torch.uint8)
+        pixels_w_ctx_u8 = pixels_w_ctx_u8.permute(0, 1, 3, 4, 2).contiguous()
+
+        action_dim = int(self.phase1_residual_wm.cfg.action_dim)
+        raw_actions = self._align_phase1_actions(raw_actions, action_dim)
+        first_action = raw_actions[:, 0:1]
+        end_action = raw_actions[:, -1:]
+        actions_w_ctx = torch.cat([first_action, raw_actions, end_action], dim=1)
+
+        rollout = self.phase1_residual_wm.rollout(
+            pixels_w_ctx_u8,
+            actions_w_ctx,
+            horizon=min(raw_pixels.shape[1] - 1, raw_actions.shape[1]),
+        )
+        pred = rollout["pred_future"].clamp(0.0, 1.0)                # [B, H, 3, H, W]
+        real = pixels_w_ctx[:, 2:2 + pred.shape[1]].to(pred.device)  # [B, H, 3, H, W]
+
+        flat_real = real.reshape(-1, *real.shape[-3:])
+        flat_pred = pred.reshape(-1, *pred.shape[-3:])
+        loss_weight = data.meta_info.get("loss_weight", {
+            "lpips": 1, "mae": 1, "mse": 0, "ssim": 0, "psnr": 0,
+        })
+        losses_flat = self._compute_loss(flat_real, flat_pred, loss_weight)
+        out = {}
+        for key, value in losses_flat.items():
+            out[key] = value.reshape(real.shape[0], real.shape[1]).mean(dim=1)
+
+        write_mask = rollout.get("write_mask", None)
+        if write_mask is not None:
+            out["write_mask_mean"] = write_mask.float().mean(dim=(1, 2, 3, 4))
+            out["write_mask_max"] = write_mask.float().amax(dim=(1, 2, 3, 4))
+
+        out["pred_min"] = pred.amin(dim=(1, 2, 3, 4))
+        out["pred_max"] = pred.amax(dim=(1, 2, 3, 4))
+        out["pred_mean"] = pred.mean(dim=(1, 2, 3, 4))
+        return DataProto.from_dict(tensors=out).to("cpu")
         
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)

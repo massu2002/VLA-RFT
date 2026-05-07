@@ -23,7 +23,7 @@ Usage:
     python -m worldmodel.residual_worldmodel.eval_pixel_residual_libero \\
         --task-suite spatial \\
         --model-dir checkpoints/libero/PixelResidualWM/spatial/pixel_residual_v1 \\
-        --data-root data/modified_libero_rlds \\
+        --data-root /localdata/modified_libero_rlds \\
         --output-dir results/phase1/residual_worldmodel/pixel_residual \\
         --num-eval-windows 200 \\
         --condition-name pixel_residual
@@ -41,9 +41,10 @@ import json
 import logging
 import os
 import random
+import re
 import traceback
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import tensorflow_datasets as tfds
@@ -72,6 +73,22 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
 
+_FALLBACK_TASK_NAMES = {
+    "spatial": [
+        "pick up the black bowl between the plate and the ramekin and place it on the plate",
+        "pick up the black bowl next to the ramekin and place it on the plate",
+        "pick up the black bowl from table center and place it on the plate",
+        "pick up the black bowl on the cookie box and place it on the plate",
+        "pick up the black bowl in the top drawer of the wooden cabinet and place it on the plate",
+        "pick up the black bowl on the ramekin and place it on the plate",
+        "pick up the black bowl next to the cookie box and place it on the plate",
+        "pick up the black bowl on the stove and place it on the plate",
+        "pick up the black bowl next to the plate and place it on the plate",
+        "pick up the black bowl on the wooden cabinet and place it on the plate",
+    ],
+}
+
+
 # ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
@@ -84,7 +101,7 @@ def build_parser() -> argparse.ArgumentParser:
                         choices=["spatial", "object", "goal", "10"])
     parser.add_argument("--model-dir", type=str, required=True,
                         help="Directory containing pixel_residual_config.json + *.pt files.")
-    parser.add_argument("--data-root", type=str, default="data/modified_libero_rlds")
+    parser.add_argument("--data-root", type=str, default="/localdata/modified_libero_rlds")
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--condition-name", type=str, default="",
                         help="Label for this condition (e.g. 'pixel_residual').")
@@ -112,6 +129,22 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Number of windows to use for ranking evaluation.")
     parser.add_argument("--num-shuffle-reps",    type=int, default=3,
                         help="How many shuffled-action rollouts per window for ranking.")
+    parser.add_argument("--phase0-compatible", action="store_true",
+                        default=os.environ.get("PHASE0_COMPATIBLE", "0") == "1",
+                        help="Use Phase 0-compatible window/action/ranking protocol.")
+    parser.add_argument("--window-position-mode", type=str,
+                        default=os.environ.get("WINDOW_POSITION_MODE", "random"),
+                        choices=["random", "episode_phases"],
+                        help=(
+                            "Window sampling protocol. 'random' preserves the existing behavior. "
+                            "'episode_phases' samples early/middle/late windows from each episode."
+                        ))
+    parser.add_argument("--num-eval-episodes-per-task", type=int,
+                        default=int(os.environ.get("NUM_EVAL_EPISODES_PER_TASK", "0")),
+                        help=(
+                            "When --window-position-mode=episode_phases, number of episodes per task. "
+                            "0 derives it from --num-eval-windows."
+                        ))
 
     return parser
 
@@ -136,6 +169,161 @@ def _to_uint8_np(t: torch.Tensor) -> np.ndarray:
 
 def _mse(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.mean((a.astype(np.float32) / 255.0 - b.astype(np.float32) / 255.0) ** 2))
+
+
+def _decode_bytes(x) -> str:
+    if isinstance(x, bytes):
+        return x.decode("utf-8", errors="ignore")
+    if hasattr(x, "decode"):
+        return x.decode("utf-8", errors="ignore")
+    return str(x)
+
+
+def _normalize_name(text: str) -> str:
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9]+", "_", text)
+    return re.sub(r"_+", "_", text).strip("_")
+
+
+def _episode_file_path(ep: Dict) -> str:
+    meta = ep.get("episode_metadata", {})
+    return _decode_bytes(meta.get("file_path", ""))
+
+
+def _episode_matches_task(ep: Dict, task_name: str) -> bool:
+    file_name = _normalize_name(os.path.basename(_episode_file_path(ep)))
+    task_key = _normalize_name(task_name)
+    return task_key in file_name
+
+
+def _collect_task_windows(
+    ds,
+    task_name: str,
+    cfg: PixelResidualConfig,
+    windows_per_task: int,
+    window_position_mode: str,
+    episodes_per_task: int,
+    phase0_compatible: bool,
+    rng: random.Random,
+    seed: int,
+    eval_horizon: int,
+) -> List[Tuple[np.ndarray, np.ndarray, Dict]]:
+    """Collect windows for one task.
+
+    Non-compatible mode preserves the original Phase 1 sliding-window protocol.
+    Phase0-compatible mode mirrors Phase 0 more closely: filter episodes by
+    task name, sample one random horizon window per episode, and prepend one
+    previous frame/action so PixelResidualWorldModel's internal frame_1/action_1
+    alignment corresponds to Phase 0's current frame/action_0.
+    """
+    windows: List[Tuple[np.ndarray, np.ndarray, Dict]] = []
+    episodes_iter = tfds.as_numpy(ds) if phase0_compatible else tfds.as_numpy(ds.take(50))
+    episodes = list(episodes_iter)
+    rng.shuffle(episodes)
+    phase_episodes_added = 0
+
+    for ep in episodes:
+        if len(windows) >= windows_per_task and window_position_mode != "episode_phases":
+            break
+        if (
+            window_position_mode == "episode_phases"
+            and episodes_per_task > 0
+            and phase_episodes_added >= episodes_per_task
+        ):
+            break
+        if phase0_compatible and not _episode_matches_task(ep, task_name):
+            continue
+
+        steps = list(ep["steps"])
+        imgs = np.stack([s["observation"]["image"] for s in steps], axis=0)
+        acts = np.stack([s["action"] for s in steps], axis=0)
+        T_ep = imgs.shape[0]
+
+        if phase0_compatible:
+            H = min(eval_horizon, cfg.action_horizon)
+            # Need one prepended frame/action because model.rollout consumes
+            # pixels[:, 1] as current and actions[:, 1] as action_0.
+            if T_ep < H + 2:
+                continue
+            max_phase0_start = T_ep - H - 1
+
+            if window_position_mode == "episode_phases":
+                phase_starts = [
+                    ("early", 1),
+                    ("middle", 1 + (max_phase0_start - 1) // 2),
+                    ("late", max_phase0_start),
+                ]
+            else:
+                phase_starts = [("random", rng.randint(1, max_phase0_start))]
+
+            used_starts = set()
+            added_this_episode = 0
+            for window_phase, phase0_start in phase_starts:
+                if phase0_start in used_starts:
+                    continue
+                used_starts.add(phase0_start)
+                pix_win = imgs[phase0_start - 1: phase0_start + H + 1]
+                act_win = acts[phase0_start - 1: phase0_start + H]
+                if pix_win.shape[0] == H + 2 and act_win.shape[0] == H + 1:
+                    windows.append((
+                        pix_win,
+                        act_win,
+                        {
+                            "episode_file": _episode_file_path(ep),
+                            "window_phase": window_phase,
+                            "phase0_start": int(phase0_start),
+                            "episode_length": int(T_ep),
+                            "frame_indices": list(range(phase0_start, phase0_start + H + 1)),
+                            "action_indices": list(range(phase0_start, phase0_start + H)),
+                        },
+                    ))
+                    added_this_episode += 1
+            if added_this_episode:
+                phase_episodes_added += 1
+            continue
+
+        seg = cfg.action_horizon + 2
+        max_start = T_ep - seg
+        if max_start < 0:
+            continue
+        if window_position_mode == "episode_phases":
+            phase_starts = [
+                ("early", 0),
+                ("middle", max_start // 2),
+                ("late", max_start),
+            ]
+        else:
+            phase_starts = [("random", start) for start in range(0, T_ep - seg, max(1, seg // 2))]
+
+        used_starts = set()
+        added_this_episode = 0
+        for window_phase, start in phase_starts:
+            if len(windows) >= windows_per_task and window_position_mode != "episode_phases":
+                break
+            if start in used_starts:
+                continue
+            used_starts.add(start)
+            pix_win = imgs[start: start + seg]
+            act_win = acts[start: start + seg - 1]
+            if pix_win.shape[0] < seg:
+                continue
+            windows.append((
+                pix_win,
+                act_win,
+                {
+                    "episode_file": _episode_file_path(ep),
+                    "window_phase": window_phase,
+                    "phase1_start": int(start),
+                    "episode_length": int(T_ep),
+                    "frame_indices": list(range(start + 1, start + cfg.action_horizon + 2)),
+                    "action_indices": list(range(start + 1, start + cfg.action_horizon + 1)),
+                },
+            ))
+            added_this_episode += 1
+        if window_position_mode == "episode_phases" and added_this_episode:
+            phase_episodes_added += 1
+
+    return windows
 
 
 # ---------------------------------------------------------------------------
@@ -176,16 +364,21 @@ def _eval_window(
         future_gt_t   = out["future_gt"][0]      # [H, 3, H_img, W_img]
         residual_pred = out["residual_pred"][0]  # [H, 3, H_img, W_img]
         dyn_mask      = out["dynamic_mask"][0]   # [H, 1, H_img, W_img]
+        write_mask    = out.get("write_mask")
+        write_mask_h  = write_mask[0] if write_mask is not None else None
 
         current_np = _to_uint8_np(current_img)  # [H, W, 3]
 
         # Use LAST future step as representative
         pred_last = _to_uint8_np(pred_future[-1])
         gt_last   = _to_uint8_np(future_gt_t[-1])
+        current_last = _to_uint8_np(current_img)
 
         # ---- Full-image metrics (last step) -----
         full_mse   = _mse(pred_last, gt_last)
         full_lpips = float(lpips_fn(pred_last, gt_last))
+        copy_current_mse = _mse(current_last, gt_last)
+        copy_current_lpips = float(lpips_fn(current_last, gt_last))
 
         # ---- Gripper ROI (motion CoM of current→last_future) -----
         cy_t, cx_t = motion_center_of_mass(
@@ -257,6 +450,12 @@ def _eval_window(
             "dynamic_mse":         dynamic_mse,
             "dynamic_lpips":       dynamic_lpips,
             "static_consistency_mse": static_mse,
+            "copy_current_mse":     copy_current_mse,
+            "copy_current_lpips":   copy_current_lpips,
+            "residual_abs_mean":    float(residual_pred[-1].detach().cpu().float().abs().mean()),
+            "residual_abs_max":     float(residual_pred[-1].detach().cpu().float().abs().amax()),
+            "write_mask_mean":      float(write_mask_h[-1].detach().cpu().float().mean()) if write_mask_h is not None else float("nan"),
+            "write_mask_max":       float(write_mask_h[-1].detach().cpu().float().amax()) if write_mask_h is not None else float("nan"),
             # Ranking fields filled in separately
             "correct_lpips":       full_lpips,
             "shuffled_lpips":      float("nan"),
@@ -312,12 +511,79 @@ def _compute_rollout_lpips(
     horizon: int,
     lpips_fn,
     device: torch.device,
+    terminal_only: bool = True,
 ) -> float:
-    """Return full-image LPIPS of predicted last future frame vs GT."""
+    """Return full-image LPIPS for rollout.
+
+    Phase 1's original ranking used only the terminal frame. Phase 0 action
+    sensitivity uses the rollout average over all predicted future frames.
+    """
     out = model.rollout(pixels_t, actions_t, horizon=horizon)
-    pred_last = _to_uint8_np(out["pred_future"][0, -1])
-    gt_last   = _to_uint8_np(out["future_gt"][0, -1])
-    return float(lpips_fn(pred_last, gt_last))
+    if terminal_only:
+        pred_last = _to_uint8_np(out["pred_future"][0, -1])
+        gt_last   = _to_uint8_np(out["future_gt"][0, -1])
+        return float(lpips_fn(pred_last, gt_last))
+
+    vals = []
+    for h in range(out["pred_future"].shape[1]):
+        pred_h = _to_uint8_np(out["pred_future"][0, h])
+        gt_h   = _to_uint8_np(out["future_gt"][0, h])
+        vals.append(float(lpips_fn(pred_h, gt_h)))
+    return float(np.mean(vals)) if vals else float("nan")
+
+
+def _save_eval_protocol_config(
+    args: argparse.Namespace,
+    output_dir: Path,
+    condition_name: str,
+    cfg: PixelResidualConfig,
+    task_indices: List[int],
+    horizon: int,
+    checkpoint_path: str,
+) -> Dict:
+    protocol = {
+        "task_suite": args.task_suite,
+        "selected_task_indices": task_indices,
+        "num_eval_windows": args.num_eval_windows,
+        "eval_horizon": args.eval_horizon,
+        "effective_eval_horizon": horizon,
+        "segment_length": horizon + 2 if args.phase0_compatible else cfg.action_horizon + 2,
+        "action_start_offset": 0 if args.phase0_compatible else 1,
+        "frame_index_alignment": (
+            "phase0 current=sampled frame, target=future frames 1..H"
+            if args.phase0_compatible
+            else "phase1/model native current=pixels[1], target=pixels[2:]"
+        ),
+        "negative_type": (
+            "same_task_other_window" if args.phase0_compatible else "same_window_temporal_permutation"
+        ),
+        "same_task_shuffle": bool(args.phase0_compatible),
+        "shuffle_seed": args.seed,
+        "window_seed": args.seed,
+        "lpips_input_range": "[-1,1]",
+        "image_range_before_lpips": "uint8 [0,255] converted to [0,1]",
+        "use_terminal_frame_only": not bool(args.phase0_compatible),
+        "ranking_gap_definition": "lpips_gap = shuffled_lpips - correct_lpips",
+        "pairwise_unit": "window",
+        "roi_crop_size": int(getattr(cfg, "roi_crop_size", 80)),
+        "gripper_roi_method": "motion_center_of_mass(current, final_future)",
+        "goal_roi_method": "configs/libero/roi_coords_v1.json with default center",
+        "rollout_mode": "single_pass PixelResidualWorldModel.rollout",
+        "checkpoint_path": checkpoint_path,
+        "tokenizer_path": None,
+        "target_mode": cfg.target_mode,
+        "model_generation": getattr(cfg, "model_generation", ""),
+        "condition_name": condition_name,
+        "phase0_compatible": bool(args.phase0_compatible),
+        "window_position_mode": args.window_position_mode,
+        "num_eval_episodes_per_task": args.num_eval_episodes_per_task,
+        "num_ranking_windows": args.num_ranking_windows,
+        "num_shuffle_reps": args.num_shuffle_reps,
+        "heldout_ratio": args.heldout_ratio,
+        "split_mode": "all/train stream; phase0-compatible filters by task filename",
+    }
+    (output_dir / "eval_protocol_config.json").write_text(json.dumps(protocol, indent=2))
+    return protocol
 
 
 # ---------------------------------------------------------------------------
@@ -347,6 +613,7 @@ def run_evaluation(args: argparse.Namespace) -> None:
     with open(output_dir / "config_used.json", "w") as f:
         json.dump({"condition": condition_name,
                    "model_dir": args.model_dir,
+                   "phase0_compatible": bool(args.phase0_compatible),
                    "cfg": dataclasses.asdict(cfg)}, f, indent=2)
 
     # LPIPS
@@ -359,8 +626,13 @@ def run_evaluation(args: argparse.Namespace) -> None:
     try:
         from libero.libero import benchmark as libero_bench
         bench = libero_bench.get_benchmark_dict()
+        bench_key = f"libero_{args.task_suite}"
+        task_names_all = bench[bench_key]().get_task_names() if bench_key in bench else []
     except Exception:
         bench = {}
+        task_names_all = []
+    if not task_names_all:
+        task_names_all = _FALLBACK_TASK_NAMES.get(args.task_suite, [])
 
     # Resolve task indices
     dataset_name = resolve_dataset_name(args.task_suite)
@@ -375,21 +647,48 @@ def run_evaluation(args: argparse.Namespace) -> None:
     windows_per_task = max(1, args.num_eval_windows // max(len(task_indices), 1))
     if args.dry_run_windows > 0:
         windows_per_task = min(windows_per_task, args.dry_run_windows)
+    episodes_per_task = 0
+    if args.window_position_mode == "episode_phases":
+        episodes_per_task = args.num_eval_episodes_per_task
+        if episodes_per_task <= 0:
+            # Each selected episode contributes early/middle/late windows.
+            episodes_per_task = max(1, int(np.ceil(windows_per_task / 3.0)))
+        args.num_eval_episodes_per_task = episodes_per_task
 
     horizon = min(args.eval_horizon, cfg.action_horizon)
+    protocol = _save_eval_protocol_config(
+        args=args,
+        output_dir=output_dir,
+        condition_name=condition_name,
+        cfg=cfg,
+        task_indices=task_indices,
+        horizon=horizon,
+        checkpoint_path=args.model_dir,
+    )
 
-    logger.info("Evaluating %d tasks × %d windows = ~%d total",
-                len(task_indices), windows_per_task, len(task_indices) * windows_per_task)
+    if args.window_position_mode == "episode_phases":
+        logger.info("Evaluating %d tasks × %d episodes × 3 phase windows = ~%d total",
+                    len(task_indices), episodes_per_task, len(task_indices) * episodes_per_task * 3)
+    else:
+        logger.info("Evaluating %d tasks × %d windows = ~%d total",
+                    len(task_indices), windows_per_task, len(task_indices) * windows_per_task)
+    logger.info("phase0_compatible=%s negative_type=%s terminal_frame_only=%s window_position_mode=%s",
+                args.phase0_compatible,
+                protocol["negative_type"],
+                protocol["use_terminal_frame_only"],
+                args.window_position_mode)
+
+    ds = tfds.load(dataset_name, data_dir=args.data_root, split="train",
+                   shuffle_files=False)
+    rng = random.Random(args.seed)
+    ranked_windows = 0
 
     for task_idx in task_indices:
         try:
             task_name = f"task{task_idx}"
             try:
-                bench_key = f"libero_{args.task_suite}"
-                if bench_key in bench:
-                    task_names_list = bench[bench_key].get_task_names()
-                    if task_idx < len(task_names_list):
-                        task_name = task_names_list[task_idx]
+                if task_idx < len(task_names_all):
+                    task_name = task_names_all[task_idx]
             except Exception:
                 pass
 
@@ -398,70 +697,93 @@ def run_evaluation(args: argparse.Namespace) -> None:
 
             logger.info("Task %d (%s): loading %d windows ...", task_idx, task_name, windows_per_task)
 
-            ds = tfds.load(dataset_name, data_dir=args.data_root, split="train",
-                           shuffle_files=False)
-            ds_list = list(ds.take(50))  # cap episode count for speed
-            random.shuffle(ds_list)
+            task_windows = _collect_task_windows(
+                ds=ds,
+                task_name=task_name,
+                cfg=cfg,
+                windows_per_task=windows_per_task,
+                window_position_mode=args.window_position_mode,
+                episodes_per_task=episodes_per_task,
+                phase0_compatible=args.phase0_compatible,
+                rng=rng,
+                seed=args.seed,
+                eval_horizon=args.eval_horizon,
+            )
+            if args.phase0_compatible and len(task_windows) < 2:
+                logger.warning(
+                    "Task %d has only %d phase0-compatible windows; ranking negatives may be unavailable.",
+                    task_idx, len(task_windows)
+                )
 
             window_count = 0
-            for ep in ds_list:
-                if window_count >= windows_per_task:
-                    break
-                steps = ep["steps"]
-                imgs    = steps["observation"]["image"].numpy()     # [T_ep, H, W, C]
-                acts    = steps["action"].numpy()                   # [T_ep, action_dim]
-                T_ep = imgs.shape[0]
-                seg = cfg.action_horizon + 2  # = T+1
+            for local_idx, (pix_win, act_win, win_meta) in enumerate(task_windows):
 
-                for start in range(0, T_ep - seg, max(1, seg // 2)):
-                    if window_count >= windows_per_task:
-                        break
-                    pix_win = imgs[start: start + seg]              # [seg, H, W, C]
-                    act_win = acts[start: start + seg - 1]          # [seg-1, action_dim]
-                    if pix_win.shape[0] < seg:
-                        continue
+                row = _eval_window(
+                    model=model,
+                    pixels_np=pix_win,
+                    actions_np=act_win,
+                    horizon=horizon,
+                    device=device,
+                    lpips_fn=lpips_fn,
+                    goal_center=goal_center,
+                    roi_half=roi_half,
+                    cfg=cfg,
+                    save_debug=args.save_debug_images,
+                    debug_dir=debug_dir,
+                    window_id=window_count,
+                    task_name=task_name,
+                )
+                if row is None:
+                    continue
+                row.update({
+                    "task_index": task_idx,
+                    "window_phase": win_meta.get("window_phase", "random"),
+                    "episode_length": win_meta.get("episode_length", ""),
+                    "episode_file": win_meta.get("episode_file", ""),
+                    "frame_indices": json.dumps(win_meta.get("frame_indices", [])),
+                    "action_indices": json.dumps(win_meta.get("action_indices", [])),
+                })
 
-                    row = _eval_window(
-                        model=model,
-                        pixels_np=pix_win,
-                        actions_np=act_win,
-                        horizon=horizon,
-                        device=device,
-                        lpips_fn=lpips_fn,
-                        goal_center=goal_center,
-                        roi_half=roi_half,
-                        cfg=cfg,
-                        save_debug=args.save_debug_images,
-                        debug_dir=debug_dir,
-                        window_id=window_count,
-                        task_name=task_name,
+                # ---- Ranking: compare GT vs shuffled action -----
+                if ranked_windows < args.num_ranking_windows:
+                    pix_t = torch.from_numpy(pix_win).unsqueeze(0).to(device)
+                    act_t = torch.from_numpy(act_win).unsqueeze(0).to(device)
+                    terminal_only = not bool(args.phase0_compatible)
+                    correct_lpips = (
+                        row["full_lpips"] if terminal_only
+                        else _compute_rollout_lpips(
+                            model, pix_t, act_t, horizon, lpips_fn, device,
+                            terminal_only=False,
+                        )
                     )
-                    if row is None:
-                        continue
 
-                    # ---- Ranking: compare GT vs shuffled action -----
-                    if window_count < args.num_ranking_windows:
-                        pix_t = torch.from_numpy(pix_win).unsqueeze(0).to(device)
-                        act_t = torch.from_numpy(act_win).unsqueeze(0).to(device)
-                        correct_lpips = row["full_lpips"]
-
-                        shuf_lpips_list = []
-                        for _ in range(args.num_shuffle_reps):
+                    shuf_lpips_list = []
+                    for rep in range(args.num_shuffle_reps):
+                        if args.phase0_compatible and len(task_windows) > 1:
+                            neg_idx = rng.randrange(len(task_windows) - 1)
+                            if neg_idx >= local_idx:
+                                neg_idx += 1
+                            neg_act_win = task_windows[neg_idx][1]
+                            act_shuf = torch.from_numpy(neg_act_win).unsqueeze(0).to(device)
+                        else:
                             perm = np.random.permutation(act_win.shape[0])
                             act_shuf = torch.from_numpy(act_win[perm]).unsqueeze(0).to(device)
-                            lv = _compute_rollout_lpips(model, pix_t, act_shuf, horizon,
-                                                        lpips_fn, device)
-                            shuf_lpips_list.append(lv)
+                        lv = _compute_rollout_lpips(
+                            model, pix_t, act_shuf, horizon, lpips_fn, device,
+                            terminal_only=terminal_only,
+                        )
+                        shuf_lpips_list.append(lv)
 
-                        shuffled_lpips = float(np.mean(shuf_lpips_list))
-                        lpips_gap = shuffled_lpips - correct_lpips
-                        row["correct_lpips"]  = correct_lpips
-                        row["shuffled_lpips"] = shuffled_lpips
-                        row["lpips_gap"]      = lpips_gap
-                        row["pairwise_win"]   = lpips_gap > 0
+                    shuffled_lpips = float(np.mean(shuf_lpips_list))
+                    lpips_gap = shuffled_lpips - correct_lpips
+                    row["correct_lpips"]  = correct_lpips
+                    row["shuffled_lpips"] = shuffled_lpips
+                    row["lpips_gap"]      = lpips_gap
+                    row["pairwise_win"]   = lpips_gap > 0
+                    ranked_windows += 1
 
-                    all_rows.append(row)
-                    window_count += 1
+                all_rows.append(row)
+                window_count += 1
 
             logger.info("  Task %d: %d windows evaluated.", task_idx, window_count)
 
@@ -474,6 +796,25 @@ def run_evaluation(args: argparse.Namespace) -> None:
 
     # Also save ranking_by_task.csv
     _save_ranking_by_task(all_rows, output_dir)
+    _save_phase_breakdowns(all_rows, output_dir)
+
+    # Re-save full configs after aggregation because older utility versions
+    # wrote a minimal config_used.json.
+    with open(output_dir / "config_used.json", "w") as f:
+        json.dump({"condition": condition_name,
+                   "model_dir": args.model_dir,
+                   "phase0_compatible": bool(args.phase0_compatible),
+                   "eval_protocol": protocol,
+                   "cfg": dataclasses.asdict(cfg)}, f, indent=2)
+    _save_eval_protocol_config(
+        args=args,
+        output_dir=output_dir,
+        condition_name=condition_name,
+        cfg=cfg,
+        task_indices=task_indices,
+        horizon=horizon,
+        checkpoint_path=args.model_dir,
+    )
 
     logger.info("=== Phase 1 eval complete: %s ===", condition_name)
     logger.info("  full_mse=%.6f  gripper_mse=%.6f  pairwise_acc=%.4f  n_windows=%d",
@@ -516,6 +857,78 @@ def _save_ranking_by_task(rows: List[Dict], output_dir: Path) -> None:
             w = csv.DictWriter(f, fieldnames=list(task_rows[0].keys()))
             w.writeheader()
             w.writerows(task_rows)
+
+
+def _save_phase_breakdowns(rows: List[Dict], output_dir: Path) -> None:
+    """Save metrics/ranking grouped by episode phase.
+
+    Phase labels are "early", "middle", "late" when
+    --window-position-mode=episode_phases, and "random" for the legacy sampler.
+    """
+    scalar_keys = [
+        "full_mse", "full_lpips",
+        "gripper_mse", "gripper_lpips",
+        "goal_mse", "goal_lpips",
+        "dynamic_mse", "dynamic_lpips",
+        "static_consistency_mse",
+        "copy_current_mse", "copy_current_lpips",
+        "residual_abs_mean", "residual_abs_max",
+        "write_mask_mean", "write_mask_max",
+    ]
+
+    def _is_valid(v) -> bool:
+        return v is not None and not (isinstance(v, float) and np.isnan(v))
+
+    def _mean(xs: List[float]) -> float:
+        return float(np.mean(xs)) if xs else float("nan")
+
+    def _collect(keys: Tuple[str, ...]) -> Dict[Tuple[str, ...], Dict[str, List[float]]]:
+        grouped: Dict[Tuple[str, ...], Dict[str, List[float]]] = {}
+        for row in rows:
+            group_key = tuple(str(row.get(k, "unknown")) for k in keys)
+            if group_key not in grouped:
+                grouped[group_key] = {k: [] for k in scalar_keys + ["correct_lpips", "shuffled_lpips", "lpips_gap", "pairwise_win"]}
+                grouped[group_key]["num_windows"] = []
+            grouped[group_key]["num_windows"].append(1.0)
+            for k in scalar_keys + ["correct_lpips", "shuffled_lpips", "lpips_gap"]:
+                v = row.get(k)
+                if _is_valid(v):
+                    grouped[group_key][k].append(float(v))
+            v = row.get("shuffled_lpips")
+            if _is_valid(v):
+                grouped[group_key]["pairwise_win"].append(float(row.get("pairwise_win", 0)))
+        return grouped
+
+    def _rows_for(grouped: Dict[Tuple[str, ...], Dict[str, List[float]]], keys: Tuple[str, ...]) -> List[Dict]:
+        out = []
+        for group_key, vals in sorted(grouped.items()):
+            row = {k: v for k, v in zip(keys, group_key)}
+            for k in scalar_keys:
+                row[k] = _mean(vals[k])
+            row["correct_lpips_mean"] = _mean(vals["correct_lpips"])
+            row["shuffled_lpips_mean"] = _mean(vals["shuffled_lpips"])
+            row["lpips_gap_mean"] = _mean(vals["lpips_gap"])
+            row["lpips_gap_min"] = float(np.min(vals["lpips_gap"])) if vals["lpips_gap"] else float("nan")
+            row["pairwise_acc"] = _mean(vals["pairwise_win"])
+            row["reverse_windows"] = int(sum(1 for v in vals["pairwise_win"] if v == 0))
+            row["num_windows"] = int(sum(vals["num_windows"]))
+            row["num_ranking_windows"] = len(vals["pairwise_win"])
+            out.append(row)
+        return out
+
+    phase_rows = _rows_for(_collect(("window_phase",)), ("window_phase",))
+    if phase_rows:
+        with open(output_dir / "metrics_by_phase.csv", "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(phase_rows[0].keys()))
+            w.writeheader()
+            w.writerows(phase_rows)
+
+    task_phase_rows = _rows_for(_collect(("task_name", "window_phase")), ("task_name", "window_phase"))
+    if task_phase_rows:
+        with open(output_dir / "metrics_by_task_phase.csv", "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(task_phase_rows[0].keys()))
+            w.writeheader()
+            w.writerows(task_phase_rows)
 
 
 # ---------------------------------------------------------------------------

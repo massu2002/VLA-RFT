@@ -90,6 +90,18 @@ def _load_csv_by_window(d: Path):
     with open(p) as f:
         return list(csv.DictReader(f))
 
+def _load_protocol(d: Path):
+    for name in ("eval_protocol_config.json", "config_used.json"):
+        p = d / name
+        if not p.exists():
+            continue
+        try:
+            raw = json.loads(p.read_text())
+            return raw.get("eval_protocol", raw)
+        except Exception:
+            pass
+    return {}
+
 # ---- Scan conditions (all subdirs with aggregate_metrics.json) --------------
 CONDITIONS: OrderedDict = OrderedDict()
 for d in sorted(PHASE1.iterdir()):
@@ -104,6 +116,7 @@ for d in sorted(PHASE1.iterdir()):
             "metrics":   metrics,
             "by_task":   _load_csv_by_task(d),
             "by_window": _load_csv_by_window(d),
+            "protocol":  _load_protocol(d),
         }
     except Exception as e:
         print(f"[warn] could not read {p}: {e}")
@@ -124,8 +137,14 @@ SCALAR_METRICS = [
     ("dynamic_mse",           "Dynamic MSE",            "lower"),
     ("dynamic_lpips",         "Dynamic LPIPS",          "lower"),
     ("static_consistency_mse","Static Consistency MSE", "lower"),
+    ("copy_current_mse",      "Copy-Current MSE",       "lower"),
+    ("copy_current_lpips",    "Copy-Current LPIPS",     "lower"),
+    ("residual_abs_mean",     "|Residual| Mean",        "lower"),
+    ("residual_abs_max",      "|Residual| Max",         "lower"),
+    ("write_mask_mean",       "Write Mask Mean",        "lower"),
+    ("write_mask_max",        "Write Mask Max",         "higher"),
     ("pairwise_acc",          "Pairwise Acc",           "higher"),
-    ("lpips_gap",             "LPIPS Gap (GT−shuffled)","lower"),
+    ("lpips_gap",             "LPIPS Gap (shuffled−GT)","higher"),
     ("correct_lpips",         "Correct LPIPS",          "lower"),
     ("shuffled_lpips",        "Shuffled LPIPS",         "lower"),
 ]
@@ -159,6 +178,7 @@ summary = {
         name: {
             "metrics":     {k: c["metrics"].get(k) for k, *_ in SCALAR_METRICS},
             "num_windows": c["metrics"].get("num_windows"),
+            "protocol":    c.get("protocol", {}),
         }
         for name, c in CONDITIONS.items()
     },
@@ -218,7 +238,7 @@ for key, label, better in [
     ("pairwise_acc", "Pairwise Acc",  "higher"),
     ("gripper_mse",  "Gripper MSE",   "lower"),
     ("dynamic_mse",  "Dynamic MSE",   "lower"),
-    ("lpips_gap",    "LPIPS Gap",     "lower"),
+    ("lpips_gap",    "LPIPS Gap",     "higher"),
     ("full_mse",     "Full MSE",      "lower"),
 ]:
     best = _best_val(key, better)
@@ -251,6 +271,45 @@ if pa_pixel is not None:
                 pass
 
 analysis_str = "\n".join(analysis) if analysis else "_No conditions found or metrics missing._"
+
+def _protocol_warnings():
+    lines = []
+    phase0_ok = [n for n, c in CONDITIONS.items() if c.get("protocol", {}).get("phase0_compatible")]
+    if phase0_ok:
+        lines.append(f"- Phase0-compatible mode: **ON** for {', '.join('`'+n+'`' for n in phase0_ok)}")
+    else:
+        lines.append("- Phase0-compatible mode: **OFF / not recorded** for all conditions.")
+
+    for name, c in CONDITIONS.items():
+        p = c.get("protocol", {})
+        neg = p.get("negative_type")
+        term = p.get("use_terminal_frame_only")
+        nr = c["metrics"].get("num_ranking_windows", c["metrics"].get("num_windows"))
+        if neg and neg != "same_task_other_window":
+            lines.append(f"- WARNING `{name}`: negative_type=`{neg}`; Phase0 uses `same_task_other_window`.")
+        if term is True:
+            lines.append(f"- WARNING `{name}`: ranking LPIPS uses terminal frame only; Phase0 uses horizon average.")
+        if nr is not None and float(nr) != 50:
+            lines.append(f"- NOTE `{name}`: num_ranking_windows=`{nr}`; Phase0 spatial_all summary used 50 ranking windows.")
+    if "pixel_baseline" in CONDITIONS:
+        pa = CONDITIONS["pixel_baseline"]["metrics"].get("pairwise_acc")
+        if pa is not None:
+            try:
+                delta = float(pa) - 0.72
+                if abs(delta) > 0.05:
+                    lines.append(f"- WARNING `pixel_baseline`: pairwise_acc={float(pa):.3f}, Phase0 reference≈0.720 (Δ={delta:+.3f}).")
+            except Exception:
+                pass
+    elif "pixel" in CONDITIONS:
+        pa = CONDITIONS["pixel"]["metrics"].get("pairwise_acc")
+        if pa is not None:
+            try:
+                delta = float(pa) - 0.72
+                if abs(delta) > 0.05:
+                    lines.append(f"- WARNING `pixel`: pairwise_acc={float(pa):.3f}, Phase0 reference≈0.720 (Δ={delta:+.3f}).")
+            except Exception:
+                pass
+    return "\n".join(lines)
 
 # Per-task table
 def _per_task_table():
@@ -323,6 +382,12 @@ md = f"""# Phase 1: Pixel-Residual World Model — Results
 
 ---
 
+## 2-B. Evaluation Protocol Warnings
+
+{_protocol_warnings()}
+
+---
+
 {per_task_section}## 4. Go / No-Go for Phase 2 (RFT Training)
 
 {_go_nogo()}
@@ -337,8 +402,11 @@ md = f"""# Phase 1: Pixel-Residual World Model — Results
 | `gripper_mse` | MSE in motion center-of-mass crop (↓ better) |
 | `dynamic_mse` | MSE within pixel-diff dynamic mask (↓ better) |
 | `static_consistency_mse` | Residual leakage outside dynamic region (↓ better) |
+| `copy_current_mse` | MSE of the no-change baseline: pred_future = current image |
+| `residual_abs_mean` | Mean absolute predicted residual magnitude; useful for detecting over-writing |
+| `write_mask_mean` | Mean learned update-gate probability; lower means more localized updates |
 | `pairwise_acc` | Fraction of windows: GT action gives lower LPIPS than shuffled (↑ better; >0.60 = proceed) |
-| `lpips_gap` | GT LPIPS − shuffled LPIPS (↓ / more negative = clearer ranking signal) |
+| `lpips_gap` | shuffled LPIPS − GT LPIPS (↑ / more positive = clearer ranking signal) |
 
 ---
 
@@ -354,6 +422,7 @@ for key, label, _ in [
     ("full_mse",    "Full MSE    ", None),
     ("gripper_mse", "Gripper MSE ", None),
     ("dynamic_mse", "Dynamic MSE ", None),
+    ("copy_current_mse", "Copy MSE    ", None),
     ("pairwise_acc","Pairwise Acc", None),
     ("lpips_gap",   "LPIPS Gap   ", None),
 ]:

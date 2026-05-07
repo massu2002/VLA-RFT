@@ -1,12 +1,61 @@
-WorldModel/0410 → 実装版世界モデル
-WorldModel/0416 → 15000ステップでAR-Pixelで学習した世界モデル
-ResidualWorldModel/sweep_baseline → 15000ステップで隣接差分予測で学習した世界モデル
+Base_VLA → ベースのVLAモデル
+VLA-RFT  → 既存のVLA-RFTを使ったモデル
 
-RFT/0404 → Huggingface版世界モデルを使用して元コードで学習した場合
-RFT/0414 → WorldModel/0410を使用して元コードで学習した場合
-RFT/0416 → WorldModel/0410を使用して世界モデル可視化方法に合わせて世界モデルの学習時の挙動を修正して学習した場合
-RFT/0420 → WorldModel/0416で学習した場合
+WorldModel → ベースの世界モデル
+PixelResidualWM/v1 → グローバルで残差を取得したモデル
 
-rollouts/0414 → RFT/0414の結果
-rollouts/0417 → RFT/0416の結果
-rollouts/0420 → RFT/0420の結果
+# フェーズ1の学習用のメモ
+
+# PC 0 → WorldModel
+SWEEP=1 \
+NUM_NODES=3 \
+NODE_INDEX=0 \
+SWEEP_PRESET=core \
+RUN_NAME=phase1_residual_spatial \
+bash scripts/libero/phase1/run_residual_wm_train_only.sh spatial
+
+NUM_NODES=3 \
+NODE_INDEX=0 \
+SWEEP_PRESET=core \
+RUN_NAME=phase1_residual_spatial \
+RFT_RUN_NAME=phase1_residual_spatial_rft \
+RFT_CKPT_ROOT=checkpoints/libero/PixelResidualWM-RFT \
+RFT_STEPS=400 \
+bash scripts/libero/phase1/run_residual_wm_rft_only.sh spatial
+
+# PC 1
+SWEEP=1 \
+NUM_NODES=3 \
+NODE_INDEX=1 \
+SWEEP_PRESET=core \
+RUN_NAME=phase1_residual_spatial \
+bash scripts/libero/phase1/run_residual_wm_train_only.sh spatial
+
+NUM_NODES=3 \
+NODE_INDEX=1 \
+SWEEP_PRESET=core \
+RUN_NAME=phase1_residual_spatial \
+RFT_RUN_NAME=phase1_residual_spatial_rft \
+RFT_CKPT_ROOT=checkpoints/libero/PixelResidualWM-RFT \
+RFT_STEPS=400 \
+bash scripts/libero/phase1/run_residual_wm_rft_only.sh spatial
+
+# PC 2
+SWEEP=1 \
+NUM_NODES=3 \
+NODE_INDEX=2 \
+SWEEP_PRESET=core \
+RUN_NAME=phase1_residual_spatial \
+bash scripts/libero/phase1/run_residual_wm_train_only.sh spatial
+
+NUM_NODES=3 \
+NODE_INDEX=2 \
+SWEEP_PRESET=core \
+RUN_NAME=phase1_residual_spatial \
+RFT_RUN_NAME=phase1_residual_spatial_rft \
+RFT_CKPT_ROOT=checkpoints/libero/PixelResidualWM-RFT \
+RFT_STEPS=400 \
+bash scripts/libero/phase1/run_residual_wm_rft_only.sh spatial
+
+
+

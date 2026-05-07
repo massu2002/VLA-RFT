@@ -135,17 +135,43 @@ class PixelDecoder(nn.Module):
 # ===========================================================================
 
 class ActionEncoder(nn.Module):
-    """MLP: [B, H, action_dim] → [B, H, action_emb_dim]."""
+    """Action encoder.
+
+    continuous_mlp:
+        [B, H, action_dim] normalized floats → [B, H, action_emb_dim].
+    discrete_tokens:
+        Mirrors AR-Pixel's 256-bin action tokenization more closely. Each
+        action dimension is quantized to a bin and embedded before projection.
+    """
 
     def __init__(self, cfg: PixelResidualConfig) -> None:
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(cfg.action_dim, cfg.action_emb_dim),
-            nn.GELU(),
-            nn.Linear(cfg.action_emb_dim, cfg.action_emb_dim),
-        )
+        self.mode = getattr(cfg, "action_conditioning_mode", "continuous_mlp")
+        self.action_dim = cfg.action_dim
+        self.action_bins = int(getattr(cfg, "action_bins", 256))
+        self.action_emb_dim = cfg.action_emb_dim
+        if self.mode == "discrete_tokens":
+            self.emb = nn.Embedding(self.action_bins, cfg.action_emb_dim)
+            self.net = nn.Sequential(
+                nn.Linear(cfg.action_dim * cfg.action_emb_dim, cfg.action_emb_dim),
+                nn.GELU(),
+                nn.Linear(cfg.action_emb_dim, cfg.action_emb_dim),
+            )
+        elif self.mode == "continuous_mlp":
+            self.net = nn.Sequential(
+                nn.Linear(cfg.action_dim, cfg.action_emb_dim),
+                nn.GELU(),
+                nn.Linear(cfg.action_emb_dim, cfg.action_emb_dim),
+            )
+        else:
+            raise ValueError(f"Unknown action_conditioning_mode: {self.mode!r}")
 
     def forward(self, actions: torch.Tensor) -> torch.Tensor:
+        if self.mode == "discrete_tokens":
+            ids = torch.floor(actions.clamp(0.0, 1.0) * self.action_bins).long()
+            ids = ids.clamp(0, self.action_bins - 1)          # [B, H, action_dim]
+            emb = self.emb(ids).reshape(*ids.shape[:2], -1)   # [B, H, action_dim*E]
+            return self.net(emb)
         return self.net(actions)
 
 
@@ -154,15 +180,17 @@ class ActionEncoder(nn.Module):
 # ===========================================================================
 
 class PixelResidualPredictor(nn.Module):
-    """Causal transformer: curr_tokens + actions → per-step global delta.
+    """Causal transformer: curr_tokens + actions → per-step token deltas.
 
     Sequence layout (length = H+1):
         token_0    = anchor(pool(curr_tokens))   ← static context
         token_h    = act_proj(action_{h-1})      ← future action  h=1..H
 
     Output:
-        pred_global [B, H, D] — per-step global latent delta.
-        Broadcast to spatial: pred_tokens[h] = curr_tokens + pred_global[h].
+        If cfg.use_spatial_action_conditioning:
+            delta_tokens [B, H, N, C] and write_logits [B, H, N]
+        Else:
+            pred_global [B, H, C] and write_logits=None.
     """
 
     def __init__(self, cfg: PixelResidualConfig) -> None:
@@ -171,6 +199,11 @@ class PixelResidualPredictor(nn.Module):
 
         # Project pooled encoder output → hidden_dim anchor token
         self.curr_proj = nn.Linear(cfg.encoder_channels, D)
+        self.context_anchor_mode = getattr(cfg, "context_anchor_mode", "mean_pool")
+        if self.context_anchor_mode == "spatial_tokens":
+            self.context_pos = nn.Parameter(torch.zeros(1, cfg.n_spatial_tokens, D))
+        elif self.context_anchor_mode != "mean_pool":
+            raise ValueError(f"Unknown context_anchor_mode: {self.context_anchor_mode!r}")
 
         # Project per-step action embedding → hidden_dim
         self.act_proj = nn.Linear(cfg.action_emb_dim, D)
@@ -189,33 +222,73 @@ class PixelResidualPredictor(nn.Module):
         # Output projection back to encoder_channels (spatial token delta)
         self.out_proj = nn.Linear(D, cfg.encoder_channels)
 
+        self.use_spatial_action_conditioning = cfg.use_spatial_action_conditioning
+        if self.use_spatial_action_conditioning:
+            self.spatial_proj = nn.Linear(cfg.encoder_channels, D)
+            self.spatial_pos = nn.Parameter(torch.zeros(1, cfg.n_spatial_tokens, D))
+            spatial_layer = nn.TransformerEncoderLayer(
+                d_model=D,
+                nhead=cfg.n_heads,
+                dim_feedforward=cfg.ffn_dim,
+                dropout=cfg.dropout,
+                batch_first=True,
+                norm_first=True,
+            )
+            self.spatial_transformer = nn.TransformerEncoder(
+                spatial_layer,
+                num_layers=max(int(cfg.n_spatial_action_layers), 1),
+            )
+            self.spatial_out_proj = nn.Linear(D, cfg.encoder_channels)
+            self.write_head = nn.Linear(D, 1)
+            nn.init.constant_(self.write_head.bias, cfg.write_mask_bias_init)
+
     def forward(
         self,
         curr_tokens: torch.Tensor,   # [B, N, C_enc]  N=64 spatial tokens
         act_emb: torch.Tensor,       # [B, H, action_emb_dim]
-    ) -> torch.Tensor:
-        """Returns pred_global: [B, H, C_enc]."""
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Return token deltas and optional write logits."""
         B, N, C_enc = curr_tokens.shape
         H = act_emb.shape[1]
 
-        # Anchor: pool spatial tokens → [B, C_enc] → project → [B, 1, D]
-        anchor = self.curr_proj(curr_tokens.mean(dim=1)).unsqueeze(1)   # [B, 1, D]
+        # AR-Pixel uses all visual context tokens as a prefix. The
+        # spatial_tokens mode keeps the same spirit while still predicting
+        # image-space residuals.
+        if self.context_anchor_mode == "spatial_tokens":
+            anchor = self.curr_proj(curr_tokens) + self.context_pos[:, :N, :]  # [B, N, D]
+            anchor_len = N
+        else:
+            anchor = self.curr_proj(curr_tokens.mean(dim=1)).unsqueeze(1)      # [B, 1, D]
+            anchor_len = 1
 
         # Action tokens: [B, H, action_emb_dim] → [B, H, D]
         act_toks = self.act_proj(act_emb)   # [B, H, D]
 
-        # Concat: [B, H+1, D]
+        # Concat: context prefix + per-step action tokens.
         seq = torch.cat([anchor, act_toks], dim=1)
 
         # Causal attention mask
         causal_mask = nn.Transformer.generate_square_subsequent_mask(
-            H + 1, device=seq.device, dtype=seq.dtype
+            anchor_len + H, device=seq.device, dtype=seq.dtype
         )
-        out = self.transformer(seq, mask=causal_mask, is_causal=True)  # [B, H+1, D]
+        out = self.transformer(seq, mask=causal_mask, is_causal=True)  # [B, anchor+H, D]
 
-        # Predictions from positions 1..H (skip anchor)
-        pred_delta = self.out_proj(out[:, 1:, :])  # [B, H, C_enc]
-        return pred_delta
+        # Predictions from action positions (skip context prefix)
+        action_ctx = out[:, anchor_len:anchor_len + H, :]  # [B, H, D]
+
+        if not self.use_spatial_action_conditioning:
+            pred_delta = self.out_proj(action_ctx)  # [B, H, C_enc]
+            return pred_delta, None
+
+        # Local action conditioning: each spatial token receives the causal
+        # action context, then spatial self-attention decides where/how to move.
+        spatial = self.spatial_proj(curr_tokens) + self.spatial_pos[:, :N, :]  # [B, N, D]
+        x = spatial.unsqueeze(1) + action_ctx.unsqueeze(2)                     # [B, H, N, D]
+        x_flat = x.reshape(B * H, N, -1)                                       # [B*H, N, D]
+        x_flat = self.spatial_transformer(x_flat)                              # [B*H, N, D]
+        delta = self.spatial_out_proj(x_flat).reshape(B, H, N, C_enc)          # [B, H, N, C]
+        write_logits = self.write_head(x_flat).reshape(B, H, N)                # [B, H, N]
+        return delta, write_logits
 
 
 # ===========================================================================
@@ -257,6 +330,12 @@ class PixelResidualWorldModel(nn.Module):
             for m in [self.encoder, self.act_encoder, self.predictor, self.decoder]:
                 m = m.to(dtype=torch_dtype)
 
+        # Residual modes should start close to "copy current image" rather
+        # than an arbitrary residual field. The first useful baseline for a
+        # residual predictor is zero residual.
+        if cfg.target_mode.startswith("pixel_residual"):
+            self._zero_init_decoder_output()
+
         # Action normalization ranges (loaded once onto CPU)
         try:
             ranges = torch.load(cfg.action_ranges_path, map_location="cpu")
@@ -268,6 +347,14 @@ class PixelResidualWorldModel(nn.Module):
                 torch.stack([torch.zeros(cfg.action_dim), torch.ones(cfg.action_dim)], dim=1),
                 persistent=False,
             )
+
+    def _zero_init_decoder_output(self) -> None:
+        """Initialize the final image layer to predict zero residual."""
+        last = self.decoder.net[-1]
+        if isinstance(last, (nn.Conv2d, nn.ConvTranspose2d)):
+            nn.init.zeros_(last.weight)
+            if last.bias is not None:
+                nn.init.zeros_(last.bias)
 
     # ------------------------------------------------------------------
     # HuggingFace Trainer compatibility
@@ -288,6 +375,75 @@ class PixelResidualWorldModel(nn.Module):
         ar = self.action_ranges.to(actions.device)   # [action_dim, 2]
         mn, mx = ar[:, 0], ar[:, 1]
         return torch.clamp((actions - mn) / (mx - mn + 1e-8), 0.0, 1.0)
+
+    def _pixel_image_from_raw(self, raw: torch.Tensor) -> torch.Tensor:
+        """Map raw decoder output to [0, 1] image range for pixel mode."""
+        mode = getattr(self.cfg, "pixel_output_activation", "clamp")
+        if mode == "sigmoid":
+            return torch.sigmoid(raw)
+        if mode == "clamp":
+            return raw.clamp(0.0, 1.0)
+        raise ValueError(f"Unknown pixel_output_activation: {mode!r}")
+
+    def _residual_from_raw(self, raw: torch.Tensor) -> torch.Tensor:
+        """Map raw decoder output to an image-space residual."""
+        mode = getattr(self.cfg, "residual_output_activation", "raw")
+        if mode == "tanh":
+            scale = max(float(getattr(self.cfg, "residual_output_scale", 1.0)), 1e-6)
+            return scale * torch.tanh(raw / scale)
+        if mode == "raw":
+            return raw
+        raise ValueError(f"Unknown residual_output_activation: {mode!r}")
+
+    def _compose_residual_future(
+        self,
+        current: torch.Tensor,
+        residual_pred: torch.Tensor,
+        write_mask_img: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if write_mask_img is not None and self.cfg.use_residual_write_mask:
+            residual_pred = write_mask_img * residual_pred
+        return (current.unsqueeze(1) + residual_pred).clamp(0.0, 1.0)
+
+    def _write_mask_from_logits(
+        self,
+        write_logits: Optional[torch.Tensor],  # [B, H, N] or None
+        image_hw: Tuple[int, int],
+    ) -> Optional[torch.Tensor]:
+        if write_logits is None or not self.cfg.use_residual_write_mask:
+            return None
+        B, H, N = write_logits.shape
+        ph = int(N ** 0.5)
+        if ph * ph != N:
+            raise ValueError(f"Cannot reshape write mask with N={N} tokens into square grid.")
+        temp = max(float(self.cfg.write_mask_temperature), 1e-6)
+        mask = torch.sigmoid(write_logits / temp).reshape(B * H, 1, ph, ph)
+        mask = F.interpolate(mask, size=image_hw, mode="bilinear", align_corners=False)
+        return mask.reshape(B, H, 1, image_hw[0], image_hw[1])
+
+    def _write_mask_loss(
+        self,
+        write_logits: torch.Tensor,  # [B, H, N]
+        current: torch.Tensor,       # [B, 3, H_img, W_img]
+        future_gt: torch.Tensor,     # [B, H, 3, H_img, W_img]
+    ) -> torch.Tensor:
+        """Supervise write mask with the GT dynamic region at token resolution."""
+        B, H_steps, N = write_logits.shape
+        ph = int(N ** 0.5)
+        if ph * ph != N:
+            raise ValueError(f"Cannot reshape write mask with N={N} tokens into square grid.")
+        targets = []
+        for h in range(H_steps):
+            dm = compute_dynamic_mask(
+                current,
+                future_gt[:, h],
+                threshold=self.cfg.dynamic_threshold,
+                dilate_kernel=self.cfg.dynamic_dilate_kernel,
+            )  # [B, 1, H_img, W_img]
+            dm_small = F.interpolate(dm, size=(ph, ph), mode="area")
+            targets.append(dm_small.reshape(B, N))
+        target = torch.stack(targets, dim=1).to(write_logits.dtype)  # [B, H, N]
+        return F.binary_cross_entropy_with_logits(write_logits, target)
 
     def _autocast_ctx(self, device):
         dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}.get(
@@ -357,25 +513,30 @@ class PixelResidualWorldModel(nn.Module):
         B: int,
         H: int,
         device,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Shared encode → predict → decode step.
 
         Returns:
             pred_tokens  [B, H, N, C_enc]   — predicted spatial tokens per step
             pred_decoded [B, H, 3, H_img, W_img] — decoded images (raw, no clamp)
+            write_logits [B, H, N] or None
+            write_mask_img [B, H, 1, H_img, W_img] or None
         """
         dtype = next(self.encoder.parameters()).dtype
 
         with self._autocast_ctx(device):
             curr_tokens = self.encoder(current.to(dtype))       # [B, N, C]
             act_emb     = self.act_encoder(acts.to(dtype))      # [B, H, emb_dim]
-            pred_global = self.predictor(curr_tokens, act_emb)  # [B, H, C]
+            pred_delta, write_logits = self.predictor(curr_tokens, act_emb)
 
-        # Broadcast global delta to all spatial tokens (residual in token space)
-        # curr_tokens: [B, N, C]; pred_global: [B, H, C] → [B, H, 1, C]
-        pred_tokens = (
-            curr_tokens.unsqueeze(1) + pred_global.unsqueeze(2)
-        )  # [B, H, N, C]
+        if pred_delta.dim() == 3:
+            # Legacy/global mode: broadcast one action-conditioned delta to all tokens.
+            pred_tokens = curr_tokens.unsqueeze(1) + pred_delta.unsqueeze(2)  # [B, H, N, C]
+        elif pred_delta.dim() == 4:
+            # Local mode: action-conditioned delta is already per spatial token.
+            pred_tokens = curr_tokens.unsqueeze(1) + pred_delta              # [B, H, N, C]
+        else:
+            raise ValueError(f"Unexpected pred_delta shape: {tuple(pred_delta.shape)}")
 
         # Decode each future-step token map to an image
         N, C_enc = pred_tokens.shape[2], pred_tokens.shape[3]
@@ -385,8 +546,9 @@ class PixelResidualWorldModel(nn.Module):
 
         H_img, W_img = decoded_flat.shape[-2:]
         pred_decoded = decoded_flat.reshape(B, H, 3, H_img, W_img).float()
+        write_mask_img = self._write_mask_from_logits(write_logits, (H_img, W_img))
 
-        return pred_tokens, pred_decoded
+        return pred_tokens, pred_decoded, write_logits, write_mask_img
 
     def _forward_pixel(
         self,
@@ -397,9 +559,14 @@ class PixelResidualWorldModel(nn.Module):
         H: int,
         device,
     ) -> Dict:
-        _, pred_decoded = self._encode_decode(current, acts, B, H, device)
-        pred_future = pred_decoded.clamp(0.0, 1.0)
+        _, pred_decoded, write_logits, _ = self._encode_decode(current, acts, B, H, device)
+        pred_future = self._pixel_image_from_raw(pred_decoded)
         loss = F.mse_loss(pred_future, future_gt.detach().float())
+        if write_logits is not None:
+            # Pixel baseline does not use the write mask semantically, but the
+            # local-action predictor still computes write_head outputs. Keep
+            # those parameters in the DDP graph with a zero-weight dependency.
+            loss = loss + write_logits.sum() * 0.0
         return {"loss": loss}
 
     # ------------------------------------------------------------------
@@ -415,22 +582,26 @@ class PixelResidualWorldModel(nn.Module):
         H: int,
         device,
     ) -> Dict:
-        _, pred_decoded = self._encode_decode(current, acts, B, H, device)
+        _, pred_decoded, write_logits, write_mask_img = self._encode_decode(current, acts, B, H, device)
 
-        # pred_decoded treated as residual estimate
-        residual_pred   = pred_decoded                                   # [B, H, 3, H, W]
+        # pred_decoded is mapped to a bounded residual estimate.
+        residual_pred   = self._residual_from_raw(pred_decoded)          # [B, H, 3, H, W]
         residual_target = (future_gt - current.unsqueeze(1)).float()     # [B, H, 3, H, W]
-        pred_future     = (current.unsqueeze(1) + residual_pred).clamp(0.0, 1.0)
+        effective_residual = residual_pred if write_mask_img is None else write_mask_img * residual_pred
+        pred_future     = self._compose_residual_future(current, residual_pred, write_mask_img)
 
-        L_residual = F.mse_loss(residual_pred, residual_target.detach())
+        L_residual = F.mse_loss(effective_residual, residual_target.detach())
         L_image    = F.mse_loss(pred_future,   future_gt.detach().float())
+        L_write = self._write_mask_loss(write_logits, current, future_gt) if write_logits is not None else torch.tensor(0.0, device=device)
 
         loss = (self.cfg.lambda_residual * L_residual
-                + self.cfg.lambda_image * L_image)
+                + self.cfg.lambda_image * L_image
+                + self.cfg.lambda_write_mask * L_write)
         return {
             "loss": loss,
             "loss_residual": L_residual.detach(),
             "loss_image":    L_image.detach(),
+            "loss_write_mask": L_write.detach(),
         }
 
     # ------------------------------------------------------------------
@@ -446,16 +617,18 @@ class PixelResidualWorldModel(nn.Module):
         H: int,
         device,
     ) -> Dict:
-        _, pred_decoded = self._encode_decode(current, acts, B, H, device)
+        _, pred_decoded, write_logits, write_mask_img = self._encode_decode(current, acts, B, H, device)
 
-        residual_pred   = pred_decoded
+        residual_pred   = self._residual_from_raw(pred_decoded)
         residual_target = (future_gt - current.unsqueeze(1)).float()
-        pred_future     = (current.unsqueeze(1) + residual_pred).clamp(0.0, 1.0)
+        effective_residual = residual_pred if write_mask_img is None else write_mask_img * residual_pred
+        pred_future     = self._compose_residual_future(current, residual_pred, write_mask_img)
         future_gt_f     = future_gt.float()
 
         # ---- Base residual + image losses --------------------------------
-        L_residual = F.mse_loss(residual_pred, residual_target.detach())
+        L_residual = F.mse_loss(effective_residual, residual_target.detach())
         L_image    = F.mse_loss(pred_future,   future_gt_f.detach())
+        L_write = self._write_mask_loss(write_logits, current, future_gt_f) if write_logits is not None else torch.tensor(0.0, device=device)
 
         # ---- Dynamic mask (from GT; per future step) --------------------
         # Compute mask for each future step independently, then stack.
@@ -511,7 +684,8 @@ class PixelResidualWorldModel(nn.Module):
                 + self.cfg.lambda_image   * L_image
                 + self.cfg.lambda_dynamic * L_dynamic
                 + self.cfg.lambda_gripper * L_gripper
-                + self.cfg.lambda_static  * L_static)
+                + self.cfg.lambda_static  * L_static
+                + self.cfg.lambda_write_mask * L_write)
 
         return {
             "loss":           loss,
@@ -520,6 +694,7 @@ class PixelResidualWorldModel(nn.Module):
             "loss_dynamic":   L_dynamic.detach(),
             "loss_gripper":   L_gripper.detach(),
             "loss_static":    L_static.detach(),
+            "loss_write_mask": L_write.detach(),
         }
 
     # ------------------------------------------------------------------
@@ -557,14 +732,14 @@ class PixelResidualWorldModel(nn.Module):
             actions.to(device)[:, 1:1 + H, :]
         )  # [B, H, action_dim]
 
-        _, pred_decoded = self._encode_decode(current, acts, B, H, device)
+        _, pred_decoded, write_logits, write_mask_img = self._encode_decode(current, acts, B, H, device)
 
         if self.cfg.target_mode == "pixel":
-            pred_future   = pred_decoded.clamp(0.0, 1.0)
+            pred_future   = self._pixel_image_from_raw(pred_decoded)
             residual_pred = pred_decoded - current.unsqueeze(1)
         else:
-            residual_pred = pred_decoded
-            pred_future   = (current.unsqueeze(1) + residual_pred).clamp(0.0, 1.0)
+            residual_pred = self._residual_from_raw(pred_decoded)
+            pred_future   = self._compose_residual_future(current, residual_pred, write_mask_img)
 
         # Dynamic masks (optional, for visualization)
         dyn_masks = []
@@ -583,6 +758,8 @@ class PixelResidualWorldModel(nn.Module):
             "future_gt":     future_gt,
             "residual_pred": residual_pred,
             "dynamic_mask":  dynamic_mask,
+            "write_mask":    write_mask_img,
+            "write_logits":  write_logits,
         }
 
     # ------------------------------------------------------------------
@@ -620,6 +797,18 @@ class PixelResidualWorldModel(nn.Module):
         with open(os.path.join(save_directory, "pixel_residual_config.json"),
                   encoding="utf-8") as f:
             cfg_dict = json.load(f)
+        cfg_dict.setdefault("pixel_output_activation", "clamp")
+        cfg_dict.setdefault("residual_output_activation", "raw")
+        cfg_dict.setdefault("residual_output_scale", 1.0)
+        cfg_dict.setdefault("n_spatial_action_layers", 2)
+        cfg_dict.setdefault("use_spatial_action_conditioning", False)
+        cfg_dict.setdefault("use_residual_write_mask", False)
+        cfg_dict.setdefault("write_mask_temperature", 1.0)
+        cfg_dict.setdefault("write_mask_bias_init", -2.0)
+        cfg_dict.setdefault("lambda_write_mask", 0.0)
+        cfg_dict.setdefault("action_bins", 256)
+        cfg_dict.setdefault("action_conditioning_mode", "continuous_mlp")
+        cfg_dict.setdefault("context_anchor_mode", "mean_pool")
         cfg = PixelResidualConfig(**cfg_dict)
 
         model = cls(cfg, torch_dtype=torch_dtype)

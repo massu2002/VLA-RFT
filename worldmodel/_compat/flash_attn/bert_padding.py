@@ -6,6 +6,7 @@ from __future__ import annotations
 from typing import Tuple
 
 import torch
+from einops import rearrange
 
 
 def index_first_axis(x: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:

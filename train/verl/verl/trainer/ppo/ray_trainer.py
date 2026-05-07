@@ -1646,100 +1646,148 @@ class RayVLARFTGRPOTrainer(RayPPOTrainer):
                                                     uniform_std=self.config.algorithm.uniform_std)
                             
                     else:            
-                        with _timer('process', timing_raw):
-                            wm_batch = self.tokenizer_wg.process(wm_batch)  # "pixels" "predicted_actions" to ['input_ids', 'attention_mask', 'position_ids', 'action_ids', 'labels']
-                        # breakpoint()
+                        if self.config.processor.get("phase1_residual", {}).get("enabled", False):
+                            from omegaconf import OmegaConf
 
-                        gt_seq = DataProto.from_single_dict({
-                            'gt_seq': wm_batch.batch['input_ids']
-                        })
-                        processed_pixels = wm_batch.pop(batch_keys=['pixels'])
+                            with _timer('phase1_wm_reward', timing_raw):
+                                wm_batch.meta_info["loss_weight"] = OmegaConf.to_container(
+                                    self.config.trainer.loss_weight,
+                                    resolve=True,
+                                )
+                                phase1_output = self.tokenizer_wg.phase1_residual_reward(wm_batch)
+                                phase1_loss = phase1_output.batch["loss"]
 
-                        wm_batch = DataProto.from_single_dict({
-                            k: v[:, :self.config.processor.gen_input_length] for k, v in wm_batch.batch.items()
-                        })
-                        wm_batch = wm_batch.union(gt_seq)
-                        wm_batch.non_tensor_batch['uid'] = actor_batch.non_tensor_batch['uid']
+                            # VLA action rollouts do not produce text `responses`.
+                            # The actor objective is defined over flattened action
+                            # log-probs with shape [B, chunk_len * action_dim], so
+                            # use old_log_probs as the response/action reward canvas.
+                            reward_tensor = torch.zeros_like(
+                                actor_batch.batch["old_log_probs"],
+                                dtype=torch.float32,
+                            )
+                            terminal_reward = -phase1_loss.to(
+                                device=reward_tensor.device,
+                                dtype=reward_tensor.dtype,
+                            )
+                            if terminal_reward.ndim == 0:
+                                terminal_reward = terminal_reward.expand(reward_tensor.shape[0])
+                            reward_tensor[:, -1] = terminal_reward
 
-                        if 'ctx_tokens' in wm_batch.batch.keys():
-                            ctx_tokens = wm_batch.pop(batch_keys=['ctx_tokens'])
+                            losses = {
+                                f"critic/{k}/mean": v.mean().item()
+                                for k, v in phase1_output.batch.items()
+                                if k != "loss" and torch.is_floating_point(v)
+                            }
+                            losses["critic/phase1_loss/mean"] = phase1_loss.mean().item()
+                            metrics.update(losses)
+
+                            wm_batch = actor_batch
+                            wm_batch.non_tensor_batch['uid'] = actor_batch.non_tensor_batch['uid']
+                            wm_batch.batch['token_level_scores'] = reward_tensor
+                            wm_batch.batch['token_level_rewards'] = wm_batch.batch['token_level_scores']
+
+                            wm_batch = compute_advantage(
+                                wm_batch,
+                                adv_estimator=self.config.algorithm.adv_estimator,
+                                gamma=self.config.algorithm.gamma,
+                                lam=self.config.algorithm.lam,
+                                uniform_std=self.config.algorithm.uniform_std,
+                            )
                         else:
-                            ctx_tokens = None
-                        # pop those keys for generation
-                        if self.config.world_model_rollout.rollout.interact:
-                            if self.config.world_model_rollout.rollout.w_gt_ac:
-                                wm_gen_batch = wm_batch.pop(batch_keys=['input_ids', 'action_ids',
-                                                                    'attention_mask', 'position_ids', 'gt_action_ids']
+                            with _timer('process', timing_raw):
+                                wm_batch = self.tokenizer_wg.process(wm_batch)  # "pixels" "predicted_actions" to ['input_ids', 'attention_mask', 'position_ids', 'action_ids', 'labels']
+                            # breakpoint()
+
+                            gt_seq = DataProto.from_single_dict({
+                                'gt_seq': wm_batch.batch['input_ids']
+                            })
+                            processed_pixels = wm_batch.pop(batch_keys=['pixels'])
+
+                            wm_batch = DataProto.from_single_dict({
+                                k: v[:, :self.config.processor.gen_input_length] for k, v in wm_batch.batch.items()
+                            })
+                            wm_batch = wm_batch.union(gt_seq)
+                            wm_batch.non_tensor_batch['uid'] = actor_batch.non_tensor_batch['uid']
+
+                            if 'ctx_tokens' in wm_batch.batch.keys():
+                                ctx_tokens = wm_batch.pop(batch_keys=['ctx_tokens'])
+                            else:
+                                ctx_tokens = None
+                            # pop those keys for generation
+                            if self.config.world_model_rollout.rollout.interact:
+                                if self.config.world_model_rollout.rollout.w_gt_ac:
+                                    wm_gen_batch = wm_batch.pop(batch_keys=['input_ids', 'action_ids',
+                                                                        'attention_mask', 'position_ids', 'gt_action_ids']
+                                                            )
+                                else:
+                                    wm_gen_batch = wm_batch.pop(batch_keys=['input_ids', 'action_ids',
+                                                                        'attention_mask', 'position_ids']
                                                         )
                             else:
-                                wm_gen_batch = wm_batch.pop(batch_keys=['input_ids', 'action_ids',
-                                                                    'attention_mask', 'position_ids']
+                                raise NotImplementedError('Currently, only support interact mode for world model rollout')
+                                gen_batch = wm_batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'],
+                                                    # non_tensor_batch_keys=['raw_prompt_ids'],
                                                     )
-                        else:
-                            raise NotImplementedError('Currently, only support interact mode for world model rollout')
-                            gen_batch = wm_batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'],
-                                                # non_tensor_batch_keys=['raw_prompt_ids'],
-                                                )
-                        # breakpoint()
-                        with _timer('wm_rollout', timing_raw):
-                            wm_gen_batch_output = self.wm_rollout_wg.generate_sequences(wm_gen_batch)  # TODO: add world model function generate_seq 
-                            wm_batch = wm_batch.union(wm_gen_batch_output)
                             # breakpoint()
-                            if ctx_tokens is not None:
-                                wm_batch = wm_batch.union(ctx_tokens)
+                            with _timer('wm_rollout', timing_raw):
+                                wm_gen_batch_output = self.wm_rollout_wg.generate_sequences(wm_gen_batch)  # TODO: add world model function generate_seq 
+                                wm_batch = wm_batch.union(wm_gen_batch_output)
+                                # breakpoint()
+                                if ctx_tokens is not None:
+                                    wm_batch = wm_batch.union(ctx_tokens)
 
-                        # compute values
-                        if self.use_critic:
-                            with _timer('values', timing_raw):
-                                values = self.critic_wg.compute_values(batch)
-                                batch = batch.union(values)
+                            # compute values
+                            if self.use_critic:
+                                with _timer('values', timing_raw):
+                                    values = self.critic_wg.compute_values(batch)
+                                    batch = batch.union(values)
 
-                        with _timer('adv', timing_raw):
-                            if self.use_rm:
-                                # we first compute reward model score
-                                reward_tensor = self.rm_wg.compute_rm_score(batch)
-                                batch = batch.union(reward_tensor)
+                            with _timer('adv', timing_raw):
+                                if self.use_rm:
+                                    # we first compute reward model score
+                                    reward_tensor = self.rm_wg.compute_rm_score(batch)
+                                    batch = batch.union(reward_tensor)
 
-                            reward_fn = self.msp_reward_fn if self.config.processor.processor_type == 'ctx_msp' else self.reward_fn
-                            # breakpoint()
+                                reward_fn = self.msp_reward_fn if self.config.processor.processor_type == 'ctx_msp' else self.reward_fn
+                                # breakpoint()
 
-                            reward_tensor, losses = reward_fn(
-                                wm_batch,
-                                processed_pixels,
-                                return_reward_tensor=True,
-                                save_pred=False,  
-                            )
+                                reward_tensor, losses = reward_fn(
+                                    wm_batch,
+                                    processed_pixels,
+                                    return_reward_tensor=True,
+                                    save_pred=False,  
+                                )
                             
-                            metrics.update(losses)
-                            reward_extra_infos_dict = {}
+                                metrics.update(losses)
+                                reward_extra_infos_dict = {}
 
-                            wm_batch.batch['token_level_scores'] = reward_tensor
+                                wm_batch.batch['token_level_scores'] = reward_tensor
                             
 
 
-                            if reward_extra_infos_dict:
-                                wm_batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+                                if reward_extra_infos_dict:
+                                    wm_batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
 
-                            # compute rewards. apply_kl_penalty if available
-                            if self.config.algorithm.use_kl_in_reward:
-                                wm_batch, kl_metrics = apply_kl_penalty(batch,
-                                                                    kl_ctrl=self.kl_ctrl_in_reward,
-                                                                    kl_penalty=self.config.algorithm.kl_penalty)
-                                metrics.update(kl_metrics)
-                            else:
-                                wm_batch.batch['token_level_rewards'] = wm_batch.batch['token_level_scores']
+                                # compute rewards. apply_kl_penalty if available
+                                if self.config.algorithm.use_kl_in_reward:
+                                    wm_batch, kl_metrics = apply_kl_penalty(batch,
+                                                                        kl_ctrl=self.kl_ctrl_in_reward,
+                                                                        kl_penalty=self.config.algorithm.kl_penalty)
+                                    metrics.update(kl_metrics)
+                                else:
+                                    wm_batch.batch['token_level_rewards'] = wm_batch.batch['token_level_scores']
 
-                            if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
-                                raise NotImplementedError('REMAX is not supported yet')
+                                if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+                                    raise NotImplementedError('REMAX is not supported yet')
                             
-                            # compute advantages, executed on the driver process
-                            wm_batch = compute_advantage(wm_batch,
-                                                    adv_estimator=self.config.algorithm.adv_estimator,
-                                                    gamma=self.config.algorithm.gamma,
-                                                    lam=self.config.algorithm.lam,
-                                                    #   num_repeat=self.config.actor_rollout_ref.rollout.n,
-                                                    uniform_std=self.config.algorithm.uniform_std)
+                                # compute advantages, executed on the driver process
+                                wm_batch = compute_advantage(wm_batch,
+                                                        adv_estimator=self.config.algorithm.adv_estimator,
+                                                        gamma=self.config.algorithm.gamma,
+                                                        lam=self.config.algorithm.lam,
+                                                        #   num_repeat=self.config.actor_rollout_ref.rollout.n,
+                                                        uniform_std=self.config.algorithm.uniform_std)
 
                     actor_batch = actor_batch.union(wm_batch.select(batch_keys=['advantages', 'returns', 'token_level_rewards']))
                     # breakpoint()

@@ -42,6 +42,7 @@ class PixelResidualConfig:
 
     # ---------------------------------------------------------------- Actions
     action_dim: int = 7
+    action_bins: int = 256
     action_horizon: int = 7    # number of future steps = segment_length - 2
 
     # ------------------------------------------------------------ Architecture
@@ -54,11 +55,17 @@ class PixelResidualConfig:
     hidden_dim: int = 256
     n_heads: int = 4
     n_pred_layers: int = 4
+    n_spatial_action_layers: int = 2
     ffn_dim: int = 1024
     dropout: float = 0.0
 
     # Action encoder MLP hidden size
     action_emb_dim: int = 128
+    # Keep residual prediction in pixel space, but make conditioning closer to
+    # AR-Pixel WM: discrete 256-bin action embeddings and all 64 context tokens
+    # as causal prefix rather than a single pooled anchor.
+    action_conditioning_mode: str = "discrete_tokens"  # "continuous_mlp" | "discrete_tokens"
+    context_anchor_mode: str = "spatial_tokens"        # "mean_pool" | "spatial_tokens"
 
     # -------------------------------------------------------------- Image dims
     image_height: int = 256
@@ -68,12 +75,29 @@ class PixelResidualConfig:
     # --------------------------------------------------------------- Precision
     autocast_dtype: str = "bf16"
 
+    # ------------------------------------------------------- Output activation
+    # New training defaults avoid hard-clamp dead gradients and bound residuals.
+    # Old checkpoints are migrated in PixelResidualWorldModel.load_pretrained()
+    # so their original clamp/raw behavior is preserved at evaluation time.
+    pixel_output_activation: str = "sigmoid"   # "sigmoid" | "clamp"
+    residual_output_activation: str = "tanh"  # "tanh" | "raw"
+    residual_output_scale: float = 1.0
+
+    # ------------------------------------------------ Local action dynamics
+    # If enabled, action-conditioned deltas are predicted per spatial token
+    # instead of using a single global delta broadcast to every location.
+    use_spatial_action_conditioning: bool = True
+    use_residual_write_mask: bool = True
+    write_mask_temperature: float = 1.0
+    write_mask_bias_init: float = -2.0
+
     # ------------------------------------------------------------------ Loss λ
     lambda_residual: float = 1.0
     lambda_image: float = 0.25
     lambda_dynamic: float = 2.0
     lambda_gripper: float = 2.0
     lambda_static: float = 0.5
+    lambda_write_mask: float = 0.2
 
     # ---------------------------------------------------------- Dynamic mask
     # Threshold on per-pixel |future - current| mean to define "dynamic" region
@@ -106,6 +130,7 @@ def add_pixel_residual_args(parser: argparse.ArgumentParser) -> None:
     g.add_argument("--action-ranges-path", type=str,
                    default="train/verl/ivideogpt/configs/libero_action_ranges.pth")
     g.add_argument("--action-dim", type=int, default=7)
+    g.add_argument("--action-bins", type=int, default=256)
     g.add_argument("--action-horizon", type=int, default=7,
                    help="Number of future steps to predict (= segment_length - 2).")
 
@@ -114,18 +139,51 @@ def add_pixel_residual_args(parser: argparse.ArgumentParser) -> None:
     g.add_argument("--hidden-dim", type=int, default=256)
     g.add_argument("--n-heads", type=int, default=4)
     g.add_argument("--n-pred-layers", type=int, default=4)
+    g.add_argument("--n-spatial-action-layers", type=int, default=2,
+                   help="Spatial transformer layers for per-token action-conditioned deltas.")
     g.add_argument("--ffn-dim", type=int, default=1024)
     g.add_argument("--dropout", type=float, default=0.0)
     g.add_argument("--action-emb-dim", type=int, default=128)
+    g.add_argument("--action-conditioning-mode", type=str,
+                   choices=["continuous_mlp", "discrete_tokens"],
+                   default="discrete_tokens",
+                   help="Action conditioning. discrete_tokens mirrors AR-Pixel action bin tokens.")
+    g.add_argument("--context-anchor-mode", type=str,
+                   choices=["mean_pool", "spatial_tokens"],
+                   default="spatial_tokens",
+                   help="Context prefix for causal predictor. spatial_tokens mirrors AR-Pixel ctx token prefix.")
 
     g.add_argument("--image-height", type=int, default=256)
     g.add_argument("--image-width", type=int, default=256)
+
+    g.add_argument("--pixel-output-activation", type=str,
+                   choices=["sigmoid", "clamp"], default="sigmoid",
+                   help="Activation for target_mode=pixel image output.")
+    g.add_argument("--residual-output-activation", type=str,
+                   choices=["tanh", "raw"], default="tanh",
+                   help="Activation for residual output before current+residual composition.")
+    g.add_argument("--residual-output-scale", type=float, default=1.0,
+                   help="Scale used by tanh residual output.")
+    g.add_argument("--use-spatial-action-conditioning", action="store_true", default=True,
+                   help="Predict per-spatial-token action-conditioned deltas.")
+    g.add_argument("--no-spatial-action-conditioning",
+                   dest="use_spatial_action_conditioning",
+                   action="store_false")
+    g.add_argument("--use-residual-write-mask", action="store_true", default=True,
+                   help="Gate image residuals with a learned spatial write mask.")
+    g.add_argument("--no-residual-write-mask",
+                   dest="use_residual_write_mask",
+                   action="store_false")
+    g.add_argument("--write-mask-temperature", type=float, default=1.0)
+    g.add_argument("--write-mask-bias-init", type=float, default=-2.0)
 
     g.add_argument("--lambda-residual", type=float, default=1.0)
     g.add_argument("--lambda-image", type=float, default=0.25)
     g.add_argument("--lambda-dynamic", type=float, default=2.0)
     g.add_argument("--lambda-gripper", type=float, default=2.0)
     g.add_argument("--lambda-static", type=float, default=0.5)
+    g.add_argument("--lambda-write-mask", type=float, default=0.2,
+                   help="BCE supervision weight for learned write mask vs dynamic mask.")
 
     g.add_argument("--dynamic-threshold", type=float, default=0.05,
                    help="Pixel-diff threshold for dynamic mask (env: DYNAMIC_THRESHOLD).")

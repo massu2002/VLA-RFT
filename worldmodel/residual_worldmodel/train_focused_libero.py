@@ -13,7 +13,7 @@ Usage (from repo root)
 ----------------------
     python -m worldmodel.residual_worldmodel.train_focused_libero \
         --task-suite spatial \
-        --data-root data/modified_libero_rlds \
+        --data-root /localdata/modified_libero_rlds \
         --output-dir checkpoints/libero/FocusedWM/spatial/run0 \
         --max-steps 15000
 

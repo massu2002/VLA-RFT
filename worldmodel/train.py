@@ -32,7 +32,7 @@ def build_parser():
         help="RLDS dataset name (TFDS) used directly, e.g. 'my_robot_dataset_no_noops'.",
     )
 
-    parser.add_argument("--data-root", type=str, default="data/modified_libero_rlds")
+    parser.add_argument("--data-root", type=str, default="/localdata/modified_libero_rlds")
     parser.add_argument("--model-template", "--base-model", dest="model_template", type=str, required=True)
     parser.add_argument("--visual-tokenizer", type=str, required=True)
     parser.add_argument("--output-dir", type=str, required=True)

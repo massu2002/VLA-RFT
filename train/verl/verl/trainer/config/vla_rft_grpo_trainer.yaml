@@ -30,6 +30,13 @@ data:
 
 processor:
   use_img_gt_ac: False
+  phase1_residual:
+    enabled: False
+    checkpoint: null
+    config: null
+    target_mode: pixel_residual
+    model_generation: v1
+    dtype: bfloat16
 
   interact: False
   tokenizer:
@@ -172,6 +179,8 @@ actor_rollout_ref:
       do_sample: True # default eager for validation
 
 world_model_rollout:
+  phase1_residual:
+    enabled: ${processor.phase1_residual.enabled}
   bos_token_id: ${processor.bos_token_id}
   eos_token_id: ${processor.eos_token_id}
   pad_token_id: ${processor.pad_token_id}

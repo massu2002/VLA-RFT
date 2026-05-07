@@ -32,7 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Visualize the base LIBERO world model against GT.")
     parser.add_argument("--task-suite", type=str, choices=["spatial", "object", "goal", "10"], required=True)
     parser.add_argument("--task-index", type=int, required=True)
-    parser.add_argument("--data-root", type=str, default="data/modified_libero_rlds")
+    parser.add_argument("--data-root", type=str, default="/localdata/modified_libero_rlds")
     parser.add_argument("--base-model-root", type=str, default="checkpoints/libero/WorldModel")
     parser.add_argument("--visual-tokenizer", type=str, required=True)
     parser.add_argument("--output-dir", type=str, required=True)

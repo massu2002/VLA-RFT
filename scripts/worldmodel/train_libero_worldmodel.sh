@@ -14,6 +14,7 @@ export PYTHONPATH="${REPO_ROOT}/worldmodel/_compat:${REPO_ROOT}/train/verl:${PYT
 export HF_ENDPOINT="https://hf-mirror.com"
 export TOKENIZERS_PARALLELISM="false"
 
+DATA_ROOT="${DATA_ROOT:-${LIBERO_DATA_ROOT:-${LOCALDATA_ROOT:-/localdata}/modified_libero_rlds}}"
 DATE="${DATE:-$(date +%Y%m%d)}"
 EXP_NAME="${EXP_NAME:-worldmodel_scratch}"
 DETECTED_GPU_COUNT=$(./.venv/bin/python -c 'import torch; print(max(torch.cuda.device_count(), 1))')
@@ -77,7 +78,7 @@ for task_name in "${TASKS[@]}"; do
   train_cmd=(
     -m worldmodel.train
     --task-suite "${task_name}"
-    --data-root "${REPO_ROOT}/data/modified_libero_rlds"
+    --data-root "${DATA_ROOT}"
     --model-template "${model_template_dir}"
     --visual-tokenizer "${visual_tokenizer_dir}"
     --output-dir "${output_dir}"

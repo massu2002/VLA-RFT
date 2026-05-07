@@ -105,12 +105,15 @@ class TaskRunner:
 
         from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
 
+        use_phase1_residual_wm = bool(config.processor.get("phase1_residual", {}).get("enabled", False))
+
         role_worker_mapping = {
             Role.ActorRollout: ray.remote(ActorRolloutRefWorker),
             Role.Critic: ray.remote(CriticWorker),
             Role.Tokenizer: ray.remote(TokenizerWorker),
-            Role.WorldModelRollout: ray.remote(WorldModelRolloutWorker),  
         }
+        if not use_phase1_residual_wm:
+            role_worker_mapping[Role.WorldModelRollout] = ray.remote(WorldModelRolloutWorker)
 
         global_pool_id = 'global_pool'
         resource_pool_spec = {
@@ -120,8 +123,9 @@ class TaskRunner:
             Role.ActorRollout: global_pool_id,
             Role.Critic: global_pool_id,
             Role.Tokenizer: global_pool_id,
-            Role.WorldModelRollout: global_pool_id,  
         }
+        if not use_phase1_residual_wm:
+            mapping[Role.WorldModelRollout] = global_pool_id
 
         # we should adopt a multi-source reward function here
         # - for rule-based rm, we directly call a reward score
