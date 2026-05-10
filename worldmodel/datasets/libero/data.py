@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import re
 import random
+import zlib
 from dataclasses import dataclass
 from typing import Dict, Iterator, List, Optional, Sequence
 
@@ -8,6 +10,44 @@ import numpy as np
 import tensorflow_datasets as tfds
 import torch
 from torch.utils.data import IterableDataset
+
+
+def _extract_task_id(episode: dict, episode_index: int = 0) -> int:
+    """Derive a stable integer task identifier from episode_metadata.file_path.
+
+    Strategy:
+      - Strip trailing episode numbers ("_demo_42", "_1") from the filename
+      - Combine with parent directory to handle both flat and hierarchical layouts
+      - CRC32 for a stable, collision-resistant hash
+
+    If file_path is unavailable, returns a unique negative sentinel so that no
+    false same-task matches occur in the collator.
+    """
+    meta = episode.get("episode_metadata", {})
+    fp = meta.get("file_path", b"")
+    if isinstance(fp, (bytes, bytearray)):
+        fp = fp.decode("utf-8", errors="ignore")
+    fp = fp.replace("\\", "/").strip()
+    if not fp:
+        # Unique per episode → no false same-task matches
+        return -(episode_index + 1)
+
+    # Split into parent dir + basename
+    if "/" in fp:
+        parent, basename_full = fp.rsplit("/", 1)
+    else:
+        parent, basename_full = "", fp
+
+    # Strip extension
+    basename = basename_full.rsplit(".", 1)[0] if "." in basename_full else basename_full
+    # Strip trailing episode numbers: "task_demo_42" → "task", "task_1" → "task"
+    basename_no_num = re.sub(r"(_demo)?_\d+$", "", basename).rstrip("_")
+
+    # Use parent + stripped basename as task key
+    # For hierarchical: parent="task_dir", basename_no_num="" → "task_dir/"
+    # For flat: parent="suite_dir", basename_no_num="task_name" → "suite_dir/task_name"
+    task_key = parent + "/" + basename_no_num
+    return zlib.crc32(task_key.encode("utf-8")) & 0x7FFFFFFF
 
 
 # Maps LIBERO task-suite short names to TFDS dataset names.
@@ -162,6 +202,9 @@ class RldsIterableDataset(IterableDataset):
             if not starts:
                 continue
 
+            # Stable task identifier (same for all windows of this episode)
+            task_id = _extract_task_id(episode, episode_index)
+
             # Episode-level metadata (computed once per episode)
             ep_init = None
             ep_goal = None
@@ -172,8 +215,9 @@ class RldsIterableDataset(IterableDataset):
             for start in starts:
                 sample = self._build_sample(steps, start, ep_init, ep_goal)
                 out: Dict[str, torch.Tensor] = {
-                    "pixels": sample.pixels,
+                    "pixels":  sample.pixels,
                     "actions": sample.actions,
+                    "task_id": torch.tensor(task_id, dtype=torch.long),
                 }
                 if self.include_episode_metadata:
                     out["episode_init_pixels"] = sample.episode_init_pixels

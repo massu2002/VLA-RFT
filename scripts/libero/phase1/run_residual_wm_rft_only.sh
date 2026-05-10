@@ -102,6 +102,7 @@ build_jobs() {
   case "${SWEEP_PRESET}" in
     compact)
       cat <<'EOF'
+pixel_baseline|pixel|baseline
 v1_residual|pixel_residual|v1
 v1_roi_d2_g2_s05|pixel_residual_roi_dynamic|v1
 v3_roi_d2_g2_s05_w02|pixel_residual_roi_dynamic|v3

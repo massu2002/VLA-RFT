@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Run Priority-A diagnostics without changing model structure/losses.
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd "${SCRIPT_DIR}/../../.." && pwd)
+cd "${REPO_ROOT}"
+
+TASK_SUITE="${TASK_SUITE:-spatial}"
+RUN_NAME="${RUN_NAME:-phase1_residual_spatial}"
+EVAL_ROOT="${EVAL_ROOT:-${REPO_ROOT}/results/phase1/residual_worldmodel}"
+CKPT_ROOT="${CKPT_ROOT:-${REPO_ROOT}/checkpoints/libero/PixelResidualWM/phase1_sweeps/${RUN_NAME}/${TASK_SUITE}}"
+INCLUDE_PHASE0_AR_PIXEL="${INCLUDE_PHASE0_AR_PIXEL:-1}"
+PHASE0_COMPATIBLE="${PHASE0_COMPATIBLE:-1}"
+ACTION_ABLATION="${ACTION_ABLATION:-1}"
+SAVE_DEBUG_VISUALS="${SAVE_DEBUG_VISUALS:-1}"
+DEBUG_NUM_TASKS="${DEBUG_NUM_TASKS:-3}"
+DEBUG_WINDOWS_PER_TASK="${DEBUG_WINDOWS_PER_TASK:-3}"
+NUM_EVAL_WINDOWS="${NUM_EVAL_WINDOWS:-200}"
+NUM_RANKING_WINDOWS="${NUM_RANKING_WINDOWS:-100}"
+WINDOW_POSITION_MODE="${WINDOW_POSITION_MODE:-episode_phases}"
+NUM_EVAL_EPISODES_PER_TASK="${NUM_EVAL_EPISODES_PER_TASK:-0}"
+VENV_NAME="${VENV_NAME:-.venv5090_eval}"
+
+mkdir -p "${EVAL_ROOT}"
+
+if [[ "${INCLUDE_PHASE0_AR_PIXEL}" == "1" ]]; then
+  TASK_SUITE="${TASK_SUITE}" \
+  OUTPUT_DIR="${EVAL_ROOT}/phase0_ar_pixel_converted" \
+  PHASE0_RESULTS="${PHASE0_RESULTS:-}" \
+  PHASE0_AR_PIXEL_CKPT="${PHASE0_AR_PIXEL_CKPT:-}" \
+  PHASE0_AR_PIXEL_CONFIG="${PHASE0_AR_PIXEL_CONFIG:-}" \
+  PHASE0_TOKENIZER_CKPT="${PHASE0_TOKENIZER_CKPT:-}" \
+  VENV_NAME="${VENV_NAME}" \
+    bash "${SCRIPT_DIR}/eval_phase1_with_phase0_ar_pixel.sh"
+fi
+
+if [[ -d "${CKPT_ROOT}" ]]; then
+  TASK_SUITE="${TASK_SUITE}" \
+  RUN_NAME="${RUN_NAME}" \
+  CKPT_ROOT="${CKPT_ROOT}" \
+  EVAL_ROOT="${EVAL_ROOT}" \
+  PHASE0_COMPATIBLE="${PHASE0_COMPATIBLE}" \
+  ACTION_ABLATION="${ACTION_ABLATION}" \
+  SAVE_DEBUG_VISUALS="${SAVE_DEBUG_VISUALS}" \
+  DEBUG_NUM_TASKS="${DEBUG_NUM_TASKS}" \
+  DEBUG_WINDOWS_PER_TASK="${DEBUG_WINDOWS_PER_TASK}" \
+  NUM_EVAL_WINDOWS="${NUM_EVAL_WINDOWS}" \
+  NUM_RANKING_WINDOWS="${NUM_RANKING_WINDOWS}" \
+  WINDOW_POSITION_MODE="${WINDOW_POSITION_MODE}" \
+  NUM_EVAL_EPISODES_PER_TASK="${NUM_EVAL_EPISODES_PER_TASK}" \
+  VENV_NAME="${VENV_NAME}" \
+    bash "${REPO_ROOT}/scripts/libero/phase1/eval_residual_wm_sweep.sh" "${TASK_SUITE}"
+else
+  echo "[priority-a] CKPT_ROOT not found, skipping Phase1 model eval: ${CKPT_ROOT}" >&2
+fi
+
+EVAL_ROOT="${EVAL_ROOT}" bash "${SCRIPT_DIR}/summarize_phase1_priority_a.sh"

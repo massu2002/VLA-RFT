@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -38,6 +39,11 @@ from prismatic.vla.constants import (
     ACTION_PROPRIO_NORMALIZATION_TYPE,
 )
 from prismatic.vla.datasets.rlds.utils.data_utils import NormalizationType
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    fcntl = None
 
 # Initialize important constants
 DATE = time.strftime("%Y_%m_%d")
@@ -77,29 +83,56 @@ def update_auto_map(pretrained_checkpoint: str) -> None:
         print(f"Warning: No config.json found at {config_path}")
         return
 
-    # Create timestamped backup
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_path = os.path.join(pretrained_checkpoint, f"config.json.back.{timestamp}")
-    shutil.copy2(config_path, backup_path)
-    print(f"Created backup of original config at: {os.path.abspath(backup_path)}")
-
-    # Read and update the config
-    with open(config_path, "r") as f:
-        config = json.load(f)
-
-    config["auto_map"] = {
+    desired_auto_map = {
         "AutoConfig": "configuration_prismatic.OpenVLAConfig",
         "AutoModelForVision2Seq": "modeling_prismatic.OpenVLAForActionPrediction",
     }
 
-    # Write back the updated config
-    with open(config_path, "w") as f:
-        json.dump(config, f, indent=2)
+    with _checkpoint_update_lock(pretrained_checkpoint):
+        # Read and update the config while holding a file lock.  LIBERO sweeps often
+        # evaluate several actors against the same Base_VLA checkpoint in parallel;
+        # rewriting config.json in-place can otherwise leave another process reading
+        # a transient empty file.
+        with open(config_path, "r") as f:
+            config = json.load(f)
 
-    print(f"Updated config.json at: {os.path.abspath(config_path)}")
-    print("Changes made:")
-    print('  - Set AutoConfig to "configuration_prismatic.OpenVLAConfig"')
-    print('  - Set AutoModelForVision2Seq to "modeling_prismatic.OpenVLAForActionPrediction"')
+        if config.get("auto_map") == desired_auto_map:
+            return
+
+        # Create timestamped backup.
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        backup_path = os.path.join(pretrained_checkpoint, f"config.json.back.{timestamp}.{os.getpid()}")
+        shutil.copy2(config_path, backup_path)
+        print(f"Created backup of original config at: {os.path.abspath(backup_path)}")
+
+        config["auto_map"] = desired_auto_map
+
+        tmp_path = os.path.join(pretrained_checkpoint, f".config.json.tmp.{os.getpid()}")
+        with open(tmp_path, "w") as f:
+            json.dump(config, f, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, config_path)
+
+        print(f"Updated config.json at: {os.path.abspath(config_path)}")
+        print("Changes made:")
+        print('  - Set AutoConfig to "configuration_prismatic.OpenVLAConfig"')
+        print('  - Set AutoModelForVision2Seq to "modeling_prismatic.OpenVLAForActionPrediction"')
+
+
+@contextmanager
+def _checkpoint_update_lock(pretrained_checkpoint: str):
+    lock_path = os.path.join(pretrained_checkpoint, ".openvla_checkpoint_update.lock")
+    lock_file = open(lock_path, "w")
+    try:
+        if fcntl is not None:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        if fcntl is not None:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_file.close()
 
 
 def check_identical_files(path1: Union[str, Path], path2: Union[str, Path]) -> bool:
@@ -194,14 +227,17 @@ def check_model_logic_mismatch(pretrained_checkpoint: str) -> None:
             if filename in files and curr_files[filename] is None:
                 curr_files[filename] = os.path.join(root, filename)
 
-    # Check and handle each file
-    for filename, curr_filepath in curr_files.items():
-        if curr_filepath is None:
-            print(f"WARNING: `{filename}` is not found anywhere in the current directory.")
-            continue
+    with _checkpoint_update_lock(pretrained_checkpoint):
+        # Check and handle each file.  Keep this under the same checkpoint-level
+        # lock as config.json updates so multi-process eval sweeps do not race
+        # while syncing local OpenVLA modeling files into the shared checkpoint.
+        for filename, curr_filepath in curr_files.items():
+            if curr_filepath is None:
+                print(f"WARNING: `{filename}` is not found anywhere in the current directory.")
+                continue
 
-        checkpoint_filepath = os.path.join(pretrained_checkpoint, filename)
-        _handle_file_sync(curr_filepath, checkpoint_filepath, filename)
+            checkpoint_filepath = os.path.join(pretrained_checkpoint, filename)
+            _handle_file_sync(curr_filepath, checkpoint_filepath, filename)
 
 
 def find_checkpoint_file(pretrained_checkpoint: str, file_pattern: str) -> str:
