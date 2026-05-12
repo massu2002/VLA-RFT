@@ -54,6 +54,16 @@ RANK_MARGIN="${RANK_MARGIN:-0.1}"
 RANK_TEMPERATURE="${RANK_TEMPERATURE:-0.07}"
 NEGATIVE_TYPE="${NEGATIVE_TYPE:-same_task_other_window}"  # metadata; model uses batch fallback
 NEGATIVE_MIX="${NEGATIVE_MIX:-}"                          # metadata only
+ACTION_NOISE_STD="${ACTION_NOISE_STD:-0.15}"
+INIT_FROM_CHECKPOINT="${INIT_FROM_CHECKPOINT:-}"          # warm-start checkpoint path (optional)
+
+# Resolve @exp_name references: "@v4a_q8_k2_motion" →
+# ${CKPT_ROOT}/${TASK_SUITE}/v4a_q8_k2_motion/s${CKPT_SEED}/final
+if [[ "${INIT_FROM_CHECKPOINT}" == @* ]]; then
+  _ref_exp="${INIT_FROM_CHECKPOINT:1}"
+  INIT_FROM_CHECKPOINT="${CKPT_ROOT}/${TASK_SUITE}/${_ref_exp}/s${CKPT_SEED}/final"
+  log "Resolved init_from_checkpoint @${_ref_exp} → ${INIT_FROM_CHECKPOINT}"
+fi
 
 LAMBDA_IMAGE="${LAMBDA_IMAGE:-0.1}"
 LAMBDA_DYNAMIC="${LAMBDA_DYNAMIC:-1.0}"
@@ -63,6 +73,10 @@ LAMBDA_SPARSE="${LAMBDA_SPARSE:-0.01}"
 
 TASK_SUITE="${TASK_SUITE:-spatial}"
 SEED="${SEED:-42}"
+# CKPT_SEED: seed used during training (determines checkpoint path s${CKPT_SEED}).
+# Defaults to SEED so single-seed runs work without change.
+# Set CKPT_SEED=42 when evaluating the same model with multiple eval seeds.
+CKPT_SEED="${CKPT_SEED:-${SEED}}"
 RUN_NAME="${RUN_NAME:?'RUN_NAME required'}"
 EVAL_HORIZON="${EVAL_HORIZON:-7}"
 TRAIN_HORIZON="${TRAIN_HORIZON:-${EVAL_HORIZON}}"
@@ -84,7 +98,7 @@ OVERWRITE="${OVERWRITE:-0}"
 # ---------------------------------------------------------------------------
 # Derived paths
 # ---------------------------------------------------------------------------
-CKPT_DIR="${CKPT_ROOT}/${TASK_SUITE}/${EXP_NAME}/s${SEED}"
+CKPT_DIR="${CKPT_ROOT}/${TASK_SUITE}/${EXP_NAME}/s${CKPT_SEED}"
 CKPT_FINAL="${CKPT_DIR}/final"
 COND_OUT="${OUT_ROOT}/${EXP_NAME}"
 mkdir -p "${COND_OUT}"
@@ -207,6 +221,7 @@ HISTORY_LENGTH=${HISTORY_LENGTH} NUM_DYNAMIC_QUERIES=${NUM_DYNAMIC_QUERIES} \
 USE_MOTION_BIAS=${USE_MOTION_BIAS} USE_ACTION_FUTURE_SCORER=${USE_ACTION_FUTURE_SCORER} \
 LAMBDA_RANK=${LAMBDA_RANK} RANK_MARGIN=${RANK_MARGIN} RANK_TEMPERATURE=${RANK_TEMPERATURE} \
 NEGATIVE_TYPE=${NEGATIVE_TYPE} NEGATIVE_MIX=${NEGATIVE_MIX} \
+ACTION_NOISE_STD=${ACTION_NOISE_STD} INIT_FROM_CHECKPOINT=${INIT_FROM_CHECKPOINT} \
 LAMBDA_IMAGE=${LAMBDA_IMAGE} LAMBDA_DYNAMIC=${LAMBDA_DYNAMIC} LAMBDA_STATIC=${LAMBDA_STATIC} \
 LAMBDA_QUERY=${LAMBDA_QUERY} LAMBDA_SPARSE=${LAMBDA_SPARSE} \
 SEGMENT_LENGTH=${SEGMENT_LENGTH} TRAIN_HORIZON=${TRAIN_HORIZON} \
@@ -231,6 +246,8 @@ bash ${SCRIPT_DIR}/train_v4_temporal_query_worldmodel.sh ${TASK_SUITE}"
       RANK_TEMPERATURE="${RANK_TEMPERATURE}" \
       NEGATIVE_TYPE="${NEGATIVE_TYPE}" \
       NEGATIVE_MIX="${NEGATIVE_MIX}" \
+      ACTION_NOISE_STD="${ACTION_NOISE_STD}" \
+      INIT_FROM_CHECKPOINT="${INIT_FROM_CHECKPOINT}" \
       LAMBDA_IMAGE="${LAMBDA_IMAGE}" \
       LAMBDA_DYNAMIC="${LAMBDA_DYNAMIC}" \
       LAMBDA_STATIC="${LAMBDA_STATIC}" \
@@ -264,7 +281,10 @@ if [ "${RUN_EVAL}" = "1" ]; then
         "EVAL_HORIZON=${EVAL_HORIZON}"
         "NUM_EVAL_WINDOWS=${NUM_EVAL_WINDOWS:-200}"
         "NUM_RANKING_WINDOWS=${NUM_RANKING_WINDOWS:-100}"
-        "WINDOW_POSITION_MODE=${WINDOW_POSITION_MODE:-random}"
+        "WINDOW_POSITION_MODE=${WINDOW_POSITION_MODE:-episode_phases}"
+        "NEGATIVE_EVAL_TYPES=${NEGATIVE_EVAL_TYPES:-same_phase,temporal_shift,action_noise,mixed}"
+        "TEMPORAL_SHIFT_MAX=${TEMPORAL_SHIFT_MAX:-3}"
+        "ACTION_NOISE_STD=${ACTION_NOISE_STD:-0.15}"
         "ACTION_ABLATION=${ACTION_ABLATION:-0}"
         "SAVE_DEBUG_VISUALS=${SAVE_DEBUG_VISUALS:-0}"
       )
@@ -276,6 +296,8 @@ if [ "${RUN_EVAL}" = "1" ]; then
         log "DRY_RUN: ${EVAL_CMD}"
       else
         log "Starting eval..."
+        USE_WINDOW_MANIFEST="${USE_WINDOW_MANIFEST:-0}" \
+        WINDOW_MANIFEST="${WINDOW_MANIFEST:-}" \
         PHASE0_COMPATIBLE="${PHASE0_COMPATIBLE}" \
           bash "${SCRIPT_DIR}/eval_v4_temporal_query_worldmodel.sh" "${EVAL_ARGS[@]}"
 
@@ -301,6 +323,11 @@ if [ "${RUN_RFT}" = "1" ]; then
     log "SKIP rft: final checkpoint not found at ${CKPT_FINAL}"
   else
     WM_REWARD_TYPE="${WORLD_REWARD_TYPE:-hybrid}"
+    # v4a models have no ActionFutureScorer; force lpips_mae instead of hybrid/rank_score
+    if [[ "${USE_ACTION_FUTURE_SCORER:-0}" == "0" && "${WM_REWARD_TYPE}" =~ ^(hybrid|rank_score)$ ]]; then
+      log "WARN: USE_ACTION_FUTURE_SCORER=0 (v4a); forcing WORLD_REWARD_TYPE from '${WM_REWARD_TYPE}' to 'lpips_mae'"
+      WM_REWARD_TYPE="lpips_mae"
+    fi
     RFT_EXP="${EXP_NAME}_rft_${WM_REWARD_TYPE}"
     RFT_OUT="${COND_OUT}/rft_${WM_REWARD_TYPE}"
     RFT_CMD="WORLD_MODEL_CKPT=${CKPT_FINAL} WORLD_REWARD_TYPE=${WM_REWARD_TYPE} EXP_NAME=${RFT_EXP} OUTPUT_DIR=${RFT_OUT} bash post_train_phase1_residual_rft.sh"

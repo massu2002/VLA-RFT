@@ -1,33 +1,47 @@
 """Evaluation script for TemporalDynamicQueryResidualWM (v4) on LIBERO.
 
 Outputs (per condition directory):
-    aggregate_metrics.json          — aggregated metrics including v4-specific fields
+    aggregate_metrics.json    — aggregated metrics
     metrics_by_task.csv
-    ranking_by_window.csv           — LPIPS-based ranking
-    ranking_score_by_window.csv     — score-based ranking (v4b)
-    action_ablation/                — ablation results
-    debug_visuals/task_N/window_M/  — v4 visualizations
-    window_manifest.json            — reusable eval manifest with history_frame_indices
-    eval_protocol_config.json
+    metrics_by_phase.csv
+    metrics_by_task_by_phase.csv
+    ranking_by_window.csv     — per-window ranking (RFT reward + score)
+    action_ablation/
+    debug_visuals/task_N/window_M/
+    window_manifest.json      — reusable eval manifest with history_frame_indices
 
-v4-specific metrics:
-    pairwise_acc_lpips       — fraction(correct_lpips < shuffled_lpips)
-    pairwise_acc_score       — fraction(score_correct > score_neg)  [v4b]
-    score_gap_mean           — mean(score_correct - score_neg)
-    score_gap_min
-    reverse_windows_score    — windows where score_correct <= score_neg
-    fuser_mask_mean
-    dynamic_mask_mean
-    future_dynamic_query_norm
-    skipped_history_windows  — windows with insufficient history frames
+Metrics in aggregate_metrics.json:
+    Reconstruction quality (horizon-averaged, RFT-aligned):
+        horizon_avg_lpips        — mean LPIPS over H steps (component of RFT reward)
+        horizon_avg_mae          — mean MAE  over H steps (component of RFT reward)
+        horizon_avg_mse          — mean MSE  over H steps
+        rft_reward_proxy         — -(horizon_avg_lpips + horizon_avg_mae)
+        copy_current_horizon_avg_mse — trivial baseline MSE
+        horizon_mse_over_copy    — ratio; >1 means model worse than copy-current
+
+    Ranking accuracy:
+        pairwise_acc_rft         — fraction(rft_reward_correct > rft_reward_shuffled)
+        pairwise_acc_score       — fraction(score_correct > score_shuffled)
+                                   v4b only; NaN for v4a (no ActionFutureScorer)
+
+    Ranking gaps:
+        rft_reward_gap_mean/min  — correct − shuffled RFT reward
+        score_gap_mean/min       — correct − shuffled scorer output
+
+    Model internals:
+        fuser_mask_entropy/overlap
+        dynamic_mask_entropy/overlap
+        future_dynamic_query_norm
+
+    Operational:
+        skipped_history_windows  — windows dropped due to insufficient history
 
 Usage:
     python -m worldmodel.residual_worldmodel.eval_v4_temporal_query_libero \\
         --task-suite spatial \\
         --model-dir checkpoints/libero/PixelResidualWM/spatial/temporal_query_residual/v4b/s42/final \\
         --data-root /localdata/modified_libero_rlds \\
-        --output-dir results/phase1/residual_worldmodel/v4b_spatial \\
-        --num-eval-windows 200
+        --output-dir results/phase1/residual_worldmodel/v4b_spatial
 """
 
 from __future__ import annotations
@@ -98,6 +112,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-eval-windows",     type=int, default=200)
     parser.add_argument("--num-ranking-windows",  type=int, default=100)
     parser.add_argument("--num-shuffle-reps",     type=int, default=3)
+    parser.add_argument("--negative-eval-types",  type=str,
+                        default=os.environ.get("NEGATIVE_EVAL_TYPES", "same_phase,temporal_shift,action_noise,mixed"),
+                        help="Comma-separated negatives: same_phase, temporal_shift, action_noise, mixed")
+    parser.add_argument("--temporal-shift-max",   type=int,
+                        default=int(os.environ.get("TEMPORAL_SHIFT_MAX", "3")))
+    parser.add_argument("--action-noise-std",     type=float,
+                        default=float(os.environ.get("ACTION_NOISE_STD", "0.15")))
     parser.add_argument("--eval-horizon",         type=int, default=7)
     parser.add_argument("--eval-batch-size",      type=int, default=4)
     parser.add_argument("--seed",                 type=int, default=42)
@@ -149,6 +170,10 @@ def _mse(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.mean((a.astype(np.float32) / 255.0 - b.astype(np.float32) / 255.0) ** 2))
 
 
+def _mae(a: np.ndarray, b: np.ndarray) -> float:
+    return float(np.mean(np.abs(a.astype(np.float32) / 255.0 - b.astype(np.float32) / 255.0)))
+
+
 def _mask_entropy_np(mask: torch.Tensor) -> float:
     """Mean per-query entropy of a [..., Q, N] softmax mask (higher = more uniform)."""
     p = mask.float().clamp(min=1e-9)
@@ -194,7 +219,7 @@ def _ep_id(path: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _collect_task_windows_v4(
-    ds,
+    episodes: List[Tuple[int, Dict]],
     task_name: str,
     K: int,
     H: int,
@@ -214,20 +239,33 @@ def _collect_task_windows_v4(
     Action layout [total = K+1+H]:
         acts[s:s+K+1]       → history+context (skipped by model)
         acts[s+K+1:s+K+1+H] → prediction horizon
+
+    Args:
+        episodes: Pre-filtered list of (global_idx, ep_dict) for this task only.
     """
     seg = K + 2 + H     # total frames per window
     act_seg = K + 1 + H  # total actions per window
 
     windows: List[Tuple[np.ndarray, np.ndarray, Dict]] = []
-    episodes = list(enumerate(tfds.as_numpy(ds.take(50))))
+    episodes = list(episodes)
     rng.shuffle(episodes)
 
-    phase_eps_added = 0
+    phase_names = ("early", "middle", "later")
+    phase_targets: Optional[Dict[str, int]] = None
+    phase_counts: Dict[str, int] = {p: 0 for p in phase_names}
+    if window_position_mode == "episode_phases":
+        base = windows_per_task // len(phase_names)
+        rem = windows_per_task % len(phase_names)
+        phase_targets = {
+            phase: base + (1 if i < rem else 0)
+            for i, phase in enumerate(phase_names)
+        }
+
     for ep_idx, ep in episodes:
         if len(windows) >= windows_per_task and window_position_mode != "episode_phases":
             break
-        if window_position_mode == "episode_phases" and episodes_per_task > 0:
-            if phase_eps_added >= episodes_per_task:
+        if window_position_mode == "episode_phases":
+            if phase_targets and all(phase_counts[p] >= phase_targets[p] for p in phase_names):
                 break
 
         steps = list(ep["steps"])
@@ -240,10 +278,14 @@ def _collect_task_windows_v4(
 
         max_start = T_ep - seg
         if window_position_mode == "episode_phases":
+            # Pick one random start from each third of the episode start range.
+            e0, e1 = 0,              max(0, max_start // 3)
+            m0, m1 = max_start // 3, max(max_start // 3, 2 * max_start // 3)
+            l0, l1 = 2 * max_start // 3, max_start
             phase_starts = [
-                ("early",  0),
-                ("middle", max_start // 2),
-                ("late",   max_start),
+                ("early",  rng.randint(e0, max(e0, e1))),
+                ("middle", rng.randint(m0, max(m0, m1))),
+                ("later",  rng.randint(l0, max(l0, l1))),
             ]
         else:
             stride = max(1, seg // 2)
@@ -254,6 +296,8 @@ def _collect_task_windows_v4(
         for phase, start in phase_starts:
             if len(windows) >= windows_per_task and window_position_mode != "episode_phases":
                 break
+            if phase_targets and phase_counts.get(phase, 0) >= phase_targets.get(phase, 0):
+                continue
             if start in used:
                 continue
             used.add(start)
@@ -280,9 +324,8 @@ def _collect_task_windows_v4(
                 },
             ))
             added += 1
-
-        if added:
-            phase_eps_added += 1
+            if phase in phase_counts:
+                phase_counts[phase] += 1
 
     return windows
 
@@ -310,125 +353,69 @@ def _eval_window_v4(
 
         out = model.rollout(pixels_t, actions_t, horizon=horizon)
 
-        pred_future   = out["pred_future"][0]     # [H, 3, H_img, W_img]
-        current_img   = out["current_image"][0]   # [3, H_img, W_img]
-        future_gt_t   = out["future_gt"][0]       # [H, 3, H_img, W_img]
-        residual_pred = out["residual_pred"][0]
-        dyn_mask      = out["dynamic_mask"][0]    # [H, 1, H_img, W_img]
-        fuser_masks   = out["fuser_masks"][0]     # [H, Q, N]
-        future_dq     = out["future_dynamic_queries"][0]  # [H, Q, D]
-        ranking_score = out.get("ranking_score")
+        pred_future     = out["pred_future"][0]           # [H, 3, H_img, W_img]
+        current_img     = out["current_image"][0]         # [3, H_img, W_img]
+        future_gt_t     = out["future_gt"][0]             # [H, 3, H_img, W_img]
+        fuser_masks     = out["fuser_masks"][0]           # [H, Q, N]
+        future_dq       = out["future_dynamic_queries"][0]  # [H, Q, D]
+        dynamic_masks_t = out["dynamic_masks"][0]         # [K+1, Q, N]
+        ranking_score   = out.get("ranking_score")
         if ranking_score is not None:
             ranking_score = ranking_score[0].item()
 
-        pred_last = _to_uint8_np(pred_future[-1])
-        gt_last   = _to_uint8_np(future_gt_t[-1])
-        curr_np   = _to_uint8_np(current_img)
+        curr_np = _to_uint8_np(current_img)
 
-        full_mse   = _mse(pred_last, gt_last)
-        full_lpips = _lpips_safe(lpips_fn, pred_last, gt_last)
-        copy_mse   = _mse(curr_np, gt_last)
-        copy_lpips = _lpips_safe(lpips_fn, curr_np, gt_last)
+        # Horizon-averaged metrics over all H steps — directly matches
+        # phase1_residual_reward = -(LPIPS + MAE) averaged across the horizon.
+        _h_lpips, _h_mae, _h_mse, _copy_mse = [], [], [], []
+        for _t in range(horizon):
+            _pt = _to_uint8_np(pred_future[_t])
+            _gt = _to_uint8_np(future_gt_t[_t])
+            _h_lpips.append(_lpips_safe(lpips_fn, _pt, _gt))
+            _h_mae.append(_mae(_pt, _gt))
+            _h_mse.append(_mse(_pt, _gt))
+            _copy_mse.append(_mse(curr_np, _gt))
 
-        cy_t, cx_t = motion_center_of_mass(
-            current_img.unsqueeze(0), future_gt_t[-1:],
-        )
-        cy_v, cx_v = cy_t[0].item(), cx_t[0].item()
-        g_pred = roi_crop_np(pred_last, cy_v, cx_v, roi_half)
-        g_gt   = roi_crop_np(gt_last,   cy_v, cx_v, roi_half)
-        gripper_mse   = _mse(g_pred, g_gt)
-        gripper_lpips = _lpips_safe(lpips_fn, g_pred, g_gt)
+        horizon_avg_lpips            = float(np.nanmean(_h_lpips)) if _h_lpips else float("nan")
+        horizon_avg_mae              = float(np.nanmean(_h_mae))   if _h_mae   else float("nan")
+        horizon_avg_mse              = float(np.nanmean(_h_mse))   if _h_mse   else float("nan")
+        rft_reward_proxy             = -(horizon_avg_lpips + horizon_avg_mae)
+        copy_current_horizon_avg_mse = float(np.nanmean(_copy_mse)) if _copy_mse else float("nan")
+        horizon_mse_over_copy        = horizon_avg_mse / max(copy_current_horizon_avg_mse, 1e-12)
 
-        l_pred = roi_crop_np(pred_last, goal_center[0], goal_center[1], roi_half)
-        l_gt   = roi_crop_np(gt_last,   goal_center[0], goal_center[1], roi_half)
-        goal_mse   = _mse(l_pred, l_gt)
-        goal_lpips = _lpips_safe(lpips_fn, l_pred, l_gt)
-
-        dm_last = dyn_mask[-1][0].cpu().numpy()
-        dynamic_mse = float("nan")
-        if dm_last.sum() > 0:
-            dyn_diff = ((pred_future[-1].cpu().float() - future_gt_t[-1].cpu().float()) ** 2)
-            dyn_diff_np = dyn_diff.mean(0).numpy()
-            dynamic_mse = float((dyn_diff_np * dm_last).sum() / dm_last.sum().clip(1))
-
-        dynamic_lpips = float("nan")
-        if dm_last.sum() > 64:
-            rows_bool = np.any(dm_last > 0.5, axis=1)
-            cols_bool = np.any(dm_last > 0.5, axis=0)
-            if rows_bool.any() and cols_bool.any():
-                r0, r1 = np.where(rows_bool)[0][[0, -1]]
-                c0, c1 = np.where(cols_bool)[0][[0, -1]]
-                dynamic_lpips = _lpips_safe(
-                    lpips_fn,
-                    pred_last[r0:r1+1, c0:c1+1],
-                    gt_last[r0:r1+1,   c0:c1+1],
-                )
-
-        static_diff = ((pred_future[-1].cpu().float() - current_img.cpu().float()) ** 2)
-        static_mask = torch.from_numpy(1.0 - dm_last).float()
-        static_mse  = float((static_diff.mean(0).numpy() * (1 - dm_last)).sum() / (1 - dm_last).sum().clip(1))
-
-        # v4-specific stats
-        fuser_mask_mean    = float(fuser_masks.float().mean().item())
-        fuser_mask_max     = float(fuser_masks.float().max().item())
-        dynamic_masks_t    = out["dynamic_masks"][0]   # [K+1, Q, N]
-        dyn_mask_mean      = float(dynamic_masks_t.float().mean().item())
-        future_dq_norm     = float(future_dq.float().norm(dim=-1).mean().item())
-
+        # Model internal structure metrics
         fuser_mask_entropy   = _mask_entropy_np(fuser_masks)
         fuser_mask_overlap   = _mask_overlap_np(fuser_masks)
         dynamic_mask_entropy = _mask_entropy_np(dynamic_masks_t)
         dynamic_mask_overlap = _mask_overlap_np(dynamic_masks_t)
-        dynamic_mask_max     = float(dynamic_masks_t.float().max().item())
+        future_dq_norm       = float(future_dq.float().norm(dim=-1).mean().item())
+
+        # score_correct: ActionFutureScorer output (v4b only); NaN for v4a (no scorer)
+        score_correct_init = float(ranking_score) if ranking_score is not None else float("nan")
 
         row: Dict = {
-            "task_name":                 task_name,
-            "window_id":                 window_id,
-            "full_mse":                  full_mse,
-            "full_lpips":                full_lpips,
-            "gripper_mse":               gripper_mse,
-            "gripper_lpips":             gripper_lpips,
-            "goal_mse":                  goal_mse,
-            "goal_lpips":                goal_lpips,
-            "dynamic_mse":               dynamic_mse,
-            "dynamic_lpips":             dynamic_lpips,
-            "static_consistency_mse":    static_mse,
-            "copy_current_mse":          copy_mse,
-            "copy_current_lpips":        copy_lpips,
-            "copy_current_full_mse":     copy_mse,
-            "copy_current_full_lpips":   copy_lpips,
-            "copy_current_gripper_mse":  _mse(roi_crop_np(curr_np, cy_v, cx_v, roi_half), g_gt),
-            "copy_current_gripper_lpips": _lpips_safe(lpips_fn, roi_crop_np(curr_np, cy_v, cx_v, roi_half), g_gt),
-            "copy_current_dynamic_mse":  float("nan"),
-            "copy_current_dynamic_lpips": float("nan"),
-            "model_vs_copy_full_mse_delta": full_mse - copy_mse,
-            "model_vs_copy_gripper_mse_delta": gripper_mse - _mse(roi_crop_np(curr_np, cy_v, cx_v, roi_half), g_gt),
-            "model_vs_copy_dynamic_mse_delta": float("nan"),
-            "full_mse_over_copy_current_mse": full_mse / max(copy_mse, 1e-12),
-            "residual_abs_mean":         float(residual_pred[-1].abs().mean().item()),
-            "residual_abs_max":          float(residual_pred[-1].abs().max().item()),
-            "write_mask_mean":           float("nan"),
-            "write_mask_max":            float("nan"),
-            # v4-specific
-            "fuser_mask_mean":           fuser_mask_mean,
-            "fuser_mask_max":            fuser_mask_max,
-            "fuser_mask_entropy":        fuser_mask_entropy,
-            "fuser_mask_overlap":        fuser_mask_overlap,
-            "dynamic_mask_mean":         dyn_mask_mean,
-            "dynamic_mask_max":          dynamic_mask_max,
-            "dynamic_mask_entropy":      dynamic_mask_entropy,
-            "dynamic_mask_overlap":      dynamic_mask_overlap,
-            "future_dynamic_query_norm": future_dq_norm,
-            "ranking_score_correct":     ranking_score if ranking_score is not None else float("nan"),
-            # Ranking fields (filled later)
-            "correct_lpips":             full_lpips,
-            "shuffled_lpips":            float("nan"),
-            "lpips_gap":                 float("nan"),
-            "pairwise_win":              False,
-            "score_correct":             ranking_score if ranking_score is not None else float("nan"),
-            "score_shuffle":             float("nan"),
-            "score_gap":                 float("nan"),
-            "pairwise_win_score":        False,
+            "task_name":                     task_name,
+            "window_id":                     window_id,
+            # Reconstruction quality (horizon-averaged, RFT-aligned)
+            "horizon_avg_lpips":             horizon_avg_lpips,
+            "horizon_avg_mae":               horizon_avg_mae,
+            "horizon_avg_mse":               horizon_avg_mse,
+            "rft_reward_proxy":              rft_reward_proxy,
+            "copy_current_horizon_avg_mse":  copy_current_horizon_avg_mse,
+            "horizon_mse_over_copy":         horizon_mse_over_copy,
+            # Model internal structure
+            "fuser_mask_entropy":            fuser_mask_entropy,
+            "fuser_mask_overlap":            fuser_mask_overlap,
+            "dynamic_mask_entropy":          dynamic_mask_entropy,
+            "dynamic_mask_overlap":          dynamic_mask_overlap,
+            "future_dynamic_query_norm":     future_dq_norm,
+            # Ranking fields (filled in ranking block below)
+            "score_correct":                 score_correct_init,
+            "score_shuffle":                 float("nan"),
+            "score_gap":                     float("nan"),
+            "pairwise_win_score":            False,
+            "rft_reward_gap":                float("nan"),
+            "pairwise_win_rft":              False,
         }
         return row
 
@@ -441,6 +428,132 @@ def _eval_window_v4(
 # ---------------------------------------------------------------------------
 # Action variants
 # ---------------------------------------------------------------------------
+
+_NEGATIVE_TYPE_ALIASES = {
+    "same_task_same_phase_other_window": "same_phase",
+    "same_task_other_window": "same_phase",
+    "same_phase": "same_phase",
+    "temporal_shift": "temporal_shift",
+    "temporal_perturbation": "temporal_shift",
+    "action_noise": "action_noise",
+    "policy_like_perturbation": "action_noise",
+    "mixed": "mixed",
+}
+
+
+def _parse_negative_eval_types(raw: str) -> List[str]:
+    out: List[str] = []
+    for part in raw.replace(";", ",").split(","):
+        key = part.strip()
+        if not key:
+            continue
+        norm = _NEGATIVE_TYPE_ALIASES.get(key)
+        if norm is None:
+            raise ValueError(f"Unknown negative eval type: {key}")
+        if norm not in out:
+            out.append(norm)
+    return out or ["same_phase", "temporal_shift", "action_noise", "mixed"]
+
+
+def _negative_metric_suffix(neg_type: str) -> str:
+    return "".join(c if c.isalnum() else "_" for c in neg_type).strip("_")
+
+
+def _prediction_action_start(act_win: np.ndarray, horizon: int) -> int:
+    return max(0, act_win.shape[0] - horizon)
+
+
+def _select_same_phase_action(
+    task_windows: List[Tuple],
+    local_idx: int,
+    phase: str,
+    horizon: int,
+    rng: random.Random,
+) -> np.ndarray:
+    candidates = [
+        i for i, (_, _, meta) in enumerate(task_windows)
+        if i != local_idx and str(meta.get("window_phase", "")) == phase
+    ]
+    if not candidates:
+        candidates = [i for i in range(len(task_windows)) if i != local_idx]
+    if candidates:
+        return task_windows[rng.choice(candidates)][1]
+
+    act_win = task_windows[local_idx][1]
+    neg = np.array(act_win, copy=True)
+    pred_start = _prediction_action_start(neg, horizon)
+    pred = neg[pred_start:]
+    if len(pred) > 1:
+        perm = np.arange(len(pred))
+        rng.shuffle(perm)
+        neg[pred_start:] = pred[perm]
+    return neg
+
+
+def _make_temporal_shift_action(
+    act_win: np.ndarray,
+    horizon: int,
+    rng: random.Random,
+    max_shift: int,
+) -> np.ndarray:
+    neg = np.array(act_win, copy=True)
+    pred_start = _prediction_action_start(neg, horizon)
+    pred = np.array(neg[pred_start:], copy=True)
+    if pred.shape[0] <= 1:
+        return neg
+    shift_cap = max(1, min(max_shift, pred.shape[0] - 1))
+    shift = rng.choice([s for s in range(-shift_cap, shift_cap + 1) if s != 0])
+    shifted = np.empty_like(pred)
+    if shift > 0:
+        shifted[:shift] = pred[0]
+        shifted[shift:] = pred[:-shift]
+    else:
+        s = -shift
+        shifted[:-s] = pred[s:]
+        shifted[-s:] = pred[-1]
+    neg[pred_start:] = shifted
+    return neg
+
+
+def _make_action_noise_action(
+    act_win: np.ndarray,
+    horizon: int,
+    rng: random.Random,
+    noise_std: float,
+) -> np.ndarray:
+    neg = np.array(act_win, copy=True)
+    pred_start = _prediction_action_start(neg, horizon)
+    pred = np.array(neg[pred_start:], copy=True)
+    if pred.size == 0:
+        return neg
+    scale = np.nanstd(pred, axis=0, keepdims=True)
+    scale = np.where(np.isfinite(scale) & (scale > 1e-6), scale, 1.0)
+    noise_rng = np.random.default_rng(rng.randint(0, 2**31 - 1))
+    neg[pred_start:] = pred + noise_rng.normal(0.0, noise_std * scale, size=pred.shape).astype(pred.dtype)
+    return neg
+
+
+def _make_negative_action_v4(
+    neg_type: str,
+    act_win: np.ndarray,
+    task_windows: List[Tuple],
+    local_idx: int,
+    phase: str,
+    horizon: int,
+    rng: random.Random,
+    temporal_shift_max: int,
+    action_noise_std: float,
+) -> np.ndarray:
+    if neg_type == "mixed":
+        neg_type = rng.choice(["same_phase", "temporal_shift", "action_noise"])
+    if neg_type == "same_phase":
+        return _select_same_phase_action(task_windows, local_idx, phase, horizon, rng)
+    if neg_type == "temporal_shift":
+        return _make_temporal_shift_action(act_win, horizon, rng, temporal_shift_max)
+    if neg_type == "action_noise":
+        return _make_action_noise_action(act_win, horizon, rng, action_noise_std)
+    raise ValueError(f"Unknown negative action type: {neg_type}")
+
 
 def _make_action_variants_v4(
     act_win: np.ndarray,
@@ -673,6 +786,25 @@ def run_evaluation(args: argparse.Namespace) -> None:
 
     ds = tfds.load(dataset_name, data_dir=args.data_root, split="train", shuffle_files=False)
     rng = random.Random(args.seed)
+    negative_eval_types = _parse_negative_eval_types(args.negative_eval_types)
+    default_negative_type = "mixed" if "mixed" in negative_eval_types else negative_eval_types[0]
+    logger.info("negative_eval_types=%s  default=%s", ",".join(negative_eval_types), default_negative_type)
+
+    # Build per-task episode index once, filtering by episode file path so that
+    # each task_idx only sees episodes whose file names match the task name.
+    logger.info("Loading all episodes to build per-task index ...")
+    all_episodes_raw = list(enumerate(tfds.as_numpy(ds)))
+    episodes_by_task: Dict[str, List[Tuple[int, Dict]]] = {}
+    for task_idx_tmp in task_indices:
+        tname = task_names_all[task_idx_tmp] if task_idx_tmp < len(task_names_all) else f"task{task_idx_tmp}"
+        task_key = tname.lower().replace(" ", "_")
+        filtered = [
+            (gi, ep) for gi, ep in all_episodes_raw
+            if task_key in os.path.basename(_ep_file(ep)).lower()
+        ]
+        episodes_by_task[tname] = filtered
+        logger.info("  task %d (%s): %d matching episodes", task_idx_tmp, tname, len(filtered))
+    del all_episodes_raw  # free memory
 
     all_rows: List[Dict] = []
     action_ablation_rows: List[Dict] = []
@@ -689,7 +821,7 @@ def run_evaluation(args: argparse.Namespace) -> None:
 
         logger.info("Collecting windows for task %d (%s) ...", task_idx, task_name)
         task_windows = _collect_task_windows_v4(
-            ds=ds,
+            episodes=episodes_by_task.get(task_name, []),
             task_name=task_name,
             K=K, H=H,
             windows_per_task=windows_per_task,
@@ -747,63 +879,82 @@ def run_evaluation(args: argparse.Namespace) -> None:
             })
             global_id += 1
 
-            # ---- LPIPS-based ranking ----
-            if ranked_windows < args.num_ranking_windows:
-                pix_t = torch.from_numpy(pix_win).unsqueeze(0).to(device)
-                correct_lpips = row["full_lpips"]
+            # ---- RFT reward + score-based ranking (all eval windows) ----
+            pix_t = torch.from_numpy(pix_win).unsqueeze(0).to(device)
+            phase = str(win_meta.get("window_phase", "unknown"))
 
-                shuf_lpips_list = []
+            for neg_type in negative_eval_types:
+                neg_suffix = _negative_metric_suffix(neg_type)
+                shuf_rft_reward_list = []
+                shuf_score_list = []    # ActionFutureScorer scores across reps (v4b)
+
                 for _ in range(args.num_shuffle_reps):
-                    if len(task_windows) > 1:
-                        neg_idx = rng.randrange(len(task_windows) - 1)
-                        if neg_idx >= local_idx:
-                            neg_idx += 1
-                        neg_act = task_windows[neg_idx][1]
-                    else:
-                        perm = np.random.permutation(act_win.shape[0])
-                        neg_act = act_win[perm]
+                    neg_act = _make_negative_action_v4(
+                        neg_type=neg_type,
+                        act_win=act_win,
+                        task_windows=task_windows,
+                        local_idx=local_idx,
+                        phase=phase,
+                        horizon=H,
+                        rng=rng,
+                        temporal_shift_max=args.temporal_shift_max,
+                        action_noise_std=args.action_noise_std,
+                    )
 
                     act_shuf_t = torch.from_numpy(neg_act).unsqueeze(0).to(device)
                     with torch.no_grad():
                         out_shuf = model.rollout(pix_t, act_shuf_t, horizon=H)
-                    pred_shuf = _to_uint8_np(out_shuf["pred_future"][0, -1])
-                    gt_last   = _to_uint8_np(out_shuf["future_gt"][0, -1])
-                    shuf_lpips_list.append(_lpips_safe(lpips_fn, pred_shuf, gt_last))
 
-                shuffled_lpips = float(np.mean(shuf_lpips_list))
-                lpips_gap = shuffled_lpips - correct_lpips
-                row["correct_lpips"]  = correct_lpips
-                row["shuffled_lpips"] = shuffled_lpips
-                row["lpips_gap"]      = lpips_gap
-                row["pairwise_win"]   = lpips_gap > 0
+                    _s_h_lpips, _s_h_mae = [], []
+                    for _t in range(H):
+                        _p_t = _to_uint8_np(out_shuf["pred_future"][0, _t])
+                        _g_t = _to_uint8_np(out_shuf["future_gt"][0, _t])
+                        _s_h_lpips.append(_lpips_safe(lpips_fn, _p_t, _g_t))
+                        _s_h_mae.append(_mae(_p_t, _g_t))
+                    _s_avg_lpips = float(np.nanmean(_s_h_lpips)) if _s_h_lpips else float("nan")
+                    _s_avg_mae   = float(np.nanmean(_s_h_mae))   if _s_h_mae   else float("nan")
+                    shuf_rft_reward_list.append(-(_s_avg_lpips + _s_avg_mae))
 
-                # ---- Score-based ranking (v4b) ----
+                    if cfg.use_action_future_scorer:
+                        _s_score = out_shuf.get("ranking_score")
+                        if _s_score is not None:
+                            shuf_score_list.append(_s_score[0].item())
+
+                shuffled_rft_reward = float(np.nanmean(shuf_rft_reward_list))
+                rft_reward_gap = row["rft_reward_proxy"] - shuffled_rft_reward
+                row[f"rft_reward_gap_{neg_suffix}"] = rft_reward_gap
+                row[f"pairwise_win_rft_{neg_suffix}"] = rft_reward_gap > 0
+
                 if cfg.use_action_future_scorer:
-                    act_correct_t = torch.from_numpy(act_win).unsqueeze(0).to(device)
-                    with torch.no_grad():
-                        out_correct = model.rollout(pix_t, act_correct_t, horizon=H)
-                    score_correct = out_correct.get("ranking_score")
-                    score_correct_v = score_correct[0].item() if score_correct is not None else float("nan")
+                    score_correct_v = row["score_correct"]
+                    score_neg_v = float(np.nanmean(shuf_score_list)) if shuf_score_list else float("nan")
+                    score_gap_v = (score_correct_v - score_neg_v
+                                   if not (np.isnan(score_correct_v) or np.isnan(score_neg_v))
+                                   else float("nan"))
+                    row[f"score_shuffle_{neg_suffix}"] = score_neg_v
+                    row[f"score_gap_{neg_suffix}"] = score_gap_v
+                    row[f"pairwise_win_score_{neg_suffix}"] = (
+                        score_correct_v > score_neg_v if not np.isnan(score_correct_v) else False
+                    )
+                else:
+                    row[f"score_shuffle_{neg_suffix}"] = float("nan")
+                    row[f"score_gap_{neg_suffix}"] = float("nan")
+                    row[f"pairwise_win_score_{neg_suffix}"] = False
 
-                    # Use first shuffled negative for score ranking
-                    act_neg_t = torch.from_numpy(task_windows[
-                        (rng.randrange(len(task_windows) - 1) if len(task_windows) > 1 else 0)
-                    ][1]).unsqueeze(0).to(device) if len(task_windows) > 1 else torch.from_numpy(act_win[np.random.permutation(act_win.shape[0])]).unsqueeze(0).to(device)
-                    with torch.no_grad():
-                        out_neg = model.rollout(pix_t, act_neg_t, horizon=H)
-                    score_neg = out_neg.get("ranking_score")
-                    score_neg_v = score_neg[0].item() if score_neg is not None else float("nan")
+            # Backward-compatible representative metrics use the mixed negative
+            # when available; otherwise they use the first requested negative.
+            default_suffix = _negative_metric_suffix(default_negative_type)
+            row["negative_metric_type"] = default_negative_type
+            row["rft_reward_gap"] = row.get(f"rft_reward_gap_{default_suffix}", float("nan"))
+            row["pairwise_win_rft"] = row.get(f"pairwise_win_rft_{default_suffix}", False)
+            row["score_shuffle"] = row.get(f"score_shuffle_{default_suffix}", float("nan"))
+            row["score_gap"] = row.get(f"score_gap_{default_suffix}", float("nan"))
+            row["pairwise_win_score"] = row.get(f"pairwise_win_score_{default_suffix}", False)
 
-                    row["score_correct"]  = score_correct_v
-                    row["score_shuffle"]  = score_neg_v
-                    row["score_gap"]      = score_correct_v - score_neg_v if not np.isnan(score_correct_v) and not np.isnan(score_neg_v) else float("nan")
-                    row["pairwise_win_score"] = (score_correct_v > score_neg_v) if not np.isnan(score_correct_v) else False
-
-                ranked_windows += 1
+            ranked_windows += 1
 
             # ---- Action ablation / debug visuals ----
             if args.action_ablation or args.save_debug_visuals:
-                pix_t = torch.from_numpy(pix_win).unsqueeze(0).to(device)
                 variants = _make_action_variants_v4(act_win, task_windows, local_idx, rng)
 
                 bundles: Dict[str, Dict] = {}
@@ -865,6 +1016,10 @@ def run_evaluation(args: argparse.Namespace) -> None:
         "window_position_mode": args.window_position_mode,
         "num_eval_windows":     args.num_eval_windows,
         "context_gap_frames":   2,
+        "negative_eval_types":  negative_eval_types,
+        "default_negative_type": default_negative_type,
+        "temporal_shift_max":   args.temporal_shift_max,
+        "action_noise_std":     args.action_noise_std,
     }
     with open(output_dir / "eval_protocol_config.json", "w") as f:
         json.dump(protocol_info, f, indent=2)
@@ -879,10 +1034,9 @@ def run_evaluation(args: argparse.Namespace) -> None:
         json.dumps(manifest_payload, indent=2, ensure_ascii=False), encoding="utf-8"
     )
 
-    # ---- Aggregate standard metrics ----
+    # ---- Aggregate metrics ----
     agg = aggregate_phase1_metrics(all_rows, str(output_dir), condition_name)
 
-    # Add v4-specific aggregated metrics
     def _valid_mean(key):
         vals = [r[key] for r in all_rows if not np.isnan(r.get(key, float("nan")))]
         return float(np.mean(vals)) if vals else float("nan")
@@ -891,47 +1045,65 @@ def run_evaluation(args: argparse.Namespace) -> None:
         vals = [r[key] for r in all_rows if not np.isnan(r.get(key, float("nan")))]
         return float(np.min(vals)) if vals else float("nan")
 
-    score_wins = [r for r in all_rows if not np.isnan(r.get("pairwise_win_score", float("nan")))]
+    # pairwise_acc_score: exclude windows where scorer returned NaN (score_shuffle = NaN).
+    # Consistent with the per-task gating in aggregate_phase1_metrics.
+    _score_rows = [r for r in all_rows if not np.isnan(r.get("score_shuffle", float("nan")))]
+    _pairwise_acc_score = (float(np.mean([r["pairwise_win_score"] for r in _score_rows]))
+                           if _score_rows else float("nan"))
+
     agg.update({
-        "model_generation":        "v4",
-        "target_mode":             "temporal_query_residual",
-        "history_length":          K,
-        "num_dynamic_queries":     cfg.num_dynamic_queries,
-        "use_motion_bias":         cfg.use_motion_bias,
-        "use_action_future_scorer": cfg.use_action_future_scorer,
-        "lambda_rank":             cfg.lambda_rank,
-        "pairwise_acc_lpips":      agg.get("pairwise_acc", float("nan")),
-        "pairwise_acc_score":      float(np.mean([r["pairwise_win_score"] for r in score_wins])) if score_wins else float("nan"),
-        "score_gap_mean":          _valid_mean("score_gap"),
-        "score_gap_min":           _valid_min("score_gap"),
-        "reverse_windows_score":   sum(1 for r in score_wins if not r.get("pairwise_win_score", True)),
-        "fuser_mask_mean":         _valid_mean("fuser_mask_mean"),
-        "fuser_mask_entropy":      _valid_mean("fuser_mask_entropy"),
-        "fuser_mask_overlap":      _valid_mean("fuser_mask_overlap"),
-        "dynamic_mask_mean":       _valid_mean("dynamic_mask_mean"),
-        "dynamic_mask_max":        _valid_mean("dynamic_mask_max"),
-        "dynamic_mask_entropy":    _valid_mean("dynamic_mask_entropy"),
-        "dynamic_mask_overlap":    _valid_mean("dynamic_mask_overlap"),
+        "model_generation":          "v4",
+        "target_mode":               "temporal_query_residual",
+        "history_length":            K,
+        "num_dynamic_queries":       cfg.num_dynamic_queries,
+        "use_motion_bias":           cfg.use_motion_bias,
+        "use_action_future_scorer":  cfg.use_action_future_scorer,
+        "lambda_rank":               cfg.lambda_rank,
+        "negative_eval_types":        negative_eval_types,
+        "default_negative_type":      default_negative_type,
+        "temporal_shift_max":         args.temporal_shift_max,
+        "action_noise_std":           args.action_noise_std,
+        "pairwise_acc_score":        _pairwise_acc_score,
+        "pairwise_acc_rft":          agg.get("pairwise_acc_rft", float("nan")),
+        "score_gap_mean":            _valid_mean("score_gap"),
+        "score_gap_min":             _valid_min("score_gap"),
+        "rft_reward_gap_mean":       _valid_mean("rft_reward_gap"),
+        "rft_reward_gap_min":        _valid_min("rft_reward_gap"),
+        "fuser_mask_entropy":        _valid_mean("fuser_mask_entropy"),
+        "fuser_mask_overlap":        _valid_mean("fuser_mask_overlap"),
+        "dynamic_mask_entropy":      _valid_mean("dynamic_mask_entropy"),
+        "dynamic_mask_overlap":      _valid_mean("dynamic_mask_overlap"),
         "future_dynamic_query_norm": _valid_mean("future_dynamic_query_norm"),
-        "skipped_history_windows": skipped_history,
+        "skipped_history_windows":   skipped_history,
     })
 
     with open(output_dir / "aggregate_metrics.json", "w") as f:
         json.dump({"condition": condition_name, "metrics": agg}, f, indent=2)
 
-    # Save score-based ranking CSV
-    score_rows = [r for r in all_rows if not np.isnan(r.get("score_gap", float("nan")))]
-    if score_rows:
+    # Per-window ranking CSV
+    rank_rows = [r for r in all_rows if not np.isnan(r.get("rft_reward_gap", float("nan")))]
+    if rank_rows:
         with open(output_dir / "ranking_score_by_window.csv", "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=[
+            fieldnames = [
                 "task_name", "window_id", "window_phase",
                 "score_correct", "score_shuffle", "score_gap", "pairwise_win_score",
-                "correct_lpips", "shuffled_lpips", "lpips_gap",
-            ])
+                "rft_reward_proxy", "rft_reward_gap", "pairwise_win_rft",
+                "horizon_avg_lpips", "horizon_avg_mae", "horizon_avg_mse",
+            ]
+            for neg_type in negative_eval_types:
+                neg_suffix = _negative_metric_suffix(neg_type)
+                fieldnames.extend([
+                    f"score_shuffle_{neg_suffix}",
+                    f"score_gap_{neg_suffix}",
+                    f"pairwise_win_score_{neg_suffix}",
+                    f"rft_reward_gap_{neg_suffix}",
+                    f"pairwise_win_rft_{neg_suffix}",
+                ])
+            w = csv.DictWriter(f, fieldnames=fieldnames)
             w.writeheader()
-            w.writerows([{k: r.get(k) for k in w.fieldnames} for r in score_rows])
+            w.writerows([{k: r.get(k) for k in w.fieldnames} for r in rank_rows])
 
-    # Save action ablation
+    # Action ablation
     if action_ablation_rows:
         abl_dir = output_dir / "action_ablation"
         abl_dir.mkdir(exist_ok=True)
@@ -940,24 +1112,18 @@ def run_evaluation(args: argparse.Namespace) -> None:
             w.writeheader()
             w.writerows(action_ablation_rows)
 
-        # Summary
         conds = set(r["condition"] for r in action_ablation_rows)
-        correct_rows_by_win = {(r["task_id"], r["window_id"]): r
-                               for r in action_ablation_rows if r["condition"] == "correct"}
         wins = sum(
             1 for r in action_ablation_rows
             if r["condition"] == "correct"
-            and r["full_lpips"] <= min(
-                rr["full_lpips"]
+            and r["horizon_avg_lpips"] <= min(
+                rr["horizon_avg_lpips"]
                 for rr in action_ablation_rows
                 if rr["task_id"] == r["task_id"] and rr["window_id"] == r["window_id"]
             )
         )
         total = sum(1 for r in action_ablation_rows if r["condition"] == "correct")
-        abl_summary = {
-            "correct_best_rate_lpips": wins / max(total, 1),
-            "num_windows": total,
-        }
+        abl_summary = {"correct_best_rate_horizon_lpips": wins / max(total, 1), "num_windows": total}
         for cond in conds:
             sc_rows = [r["ranking_score"] for r in action_ablation_rows
                        if r["condition"] == cond and not np.isnan(r.get("ranking_score", float("nan")))]
@@ -965,20 +1131,24 @@ def run_evaluation(args: argparse.Namespace) -> None:
         (abl_dir / "action_ablation_summary.json").write_text(json.dumps(abl_summary, indent=2))
 
     logger.info("=== v4 eval complete: %s ===", condition_name)
-    logger.info("  full_mse=%.6f  pairwise_acc_lpips=%.4f  pairwise_acc_score=%.4f  n=%d",
-                agg.get("full_mse", float("nan")),
-                agg.get("pairwise_acc_lpips", float("nan")),
-                agg.get("pairwise_acc_score", float("nan")),
+    logger.info("  horizon_avg_lpips=%.4f  horizon_avg_mae=%.4f  horizon_avg_mse=%.4f  n=%d",
+                agg.get("horizon_avg_lpips", float("nan")),
+                agg.get("horizon_avg_mae", float("nan")),
+                agg.get("horizon_avg_mse", float("nan")),
                 agg.get("num_windows", 0))
-    logger.info("  score_gap_mean=%.4f  fuser_mask_mean=%.4f  fuser_entropy=%.4f  fuser_overlap=%.4f",
-                agg.get("score_gap_mean", float("nan")),
-                agg.get("fuser_mask_mean", float("nan")),
+    logger.info("  rft_reward_proxy=%.4f  horizon_mse_over_copy=%.4f",
+                agg.get("rft_reward_proxy", float("nan")),
+                agg.get("horizon_mse_over_copy", float("nan")))
+    logger.info("  pairwise_acc_rft=%.4f  pairwise_acc_score=%.4f  rft_gap=%.4f  score_gap=%.4f",
+                agg.get("pairwise_acc_rft", float("nan")),
+                agg.get("pairwise_acc_score", float("nan")),
+                agg.get("rft_reward_gap_mean", float("nan")),
+                agg.get("score_gap_mean", float("nan")))
+    logger.info("  fuser_entropy=%.4f  fuser_overlap=%.4f  dyn_entropy=%.4f  dyn_overlap=%.4f  skipped=%d",
                 agg.get("fuser_mask_entropy", float("nan")),
-                agg.get("fuser_mask_overlap", float("nan")))
-    logger.info("  dynamic_mask_mean=%.4f  dynamic_entropy=%.4f  dynamic_max=%.4f  skipped=%d",
-                agg.get("dynamic_mask_mean", float("nan")),
+                agg.get("fuser_mask_overlap", float("nan")),
                 agg.get("dynamic_mask_entropy", float("nan")),
-                agg.get("dynamic_mask_max", float("nan")),
+                agg.get("dynamic_mask_overlap", float("nan")),
                 skipped_history)
     logger.info("  → %s", output_dir)
 

@@ -257,6 +257,7 @@ def apply_trajectory_transforms(
     window_size: int = 1,
     future_action_window_size: int = 0,
     future_obs_window_size: int = 0,    # new added parameter
+    wm_history_length: int = 0,         # WM wide-window; 0 = disabled
     subsample_length: Optional[int] = None,
     skip_unlabeled: bool = False,
     max_action: Optional[float] = None,
@@ -336,7 +337,8 @@ def apply_trajectory_transforms(
             traj_transforms.chunk_act_obs,
             window_size=window_size,
             future_action_window_size=future_action_window_size,
-            future_obs_window_size=future_obs_window_size,  # new added parameter
+            future_obs_window_size=future_obs_window_size,
+            wm_history_length=wm_history_length,
         ),
         num_parallel_calls,
     )

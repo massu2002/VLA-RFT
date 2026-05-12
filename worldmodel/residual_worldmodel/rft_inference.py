@@ -13,12 +13,14 @@ specific reconstruction in one place:
 Images are float [0, 1] unless noted otherwise.
 
 RFT reward modes (v4+):
-  visual      — negative MSE between pred_future last frame and target image
-  rank_score  — normalized ActionFutureScorer output (falls back to visual if unavailable)
-  hybrid      — alpha * visual_reward + beta * normalized_rank_score
+  lpips_mae   — -(LPIPS + MAE) horizon-averaged; matches eval's rft_reward_proxy exactly
+                used for baseline, v4a, and as the visual component in hybrid
+  visual      — horizon-averaged negative MSE (backward-compat only)
+  rank_score  — normalized ActionFutureScorer output (v4b only; falls back to lpips_mae if unavailable)
+  hybrid      — alpha * -(LPIPS+MAE) + beta * rank_score_norm  (v4b only)
 
 Environment variables consumed by compute_rft_reward():
-  WORLD_REWARD_TYPE        visual | rank_score | hybrid   (default: visual)
+  WORLD_REWARD_TYPE        lpips_mae | visual | rank_score | hybrid   (default: lpips_mae)
   RANK_REWARD_ALPHA        float weight for visual component in hybrid  (default: 0.2)
   RANK_REWARD_BETA         float weight for rank_score in hybrid        (default: 0.8)
   NORMALIZE_RANK_REWARD    1 to z-score normalise rank_score per batch  (default: 1)
@@ -41,6 +43,32 @@ from .pixel_residual_model import PixelResidualWorldModel
 from .pixel_residual_utils import _tensor_to_uint8
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Batched LPIPS model cache (one entry per device string, per worker process)
+# ---------------------------------------------------------------------------
+_LPIPS_MODELS: Dict[str, Any] = {}
+
+
+def _get_lpips_model(device: torch.device):
+    """Lazy-load and cache a batched lpips.LPIPS(AlexNet) model per device.
+
+    Accepts float tensors in [-1, 1]; returns [B, 1, 1, 1] per-image scores.
+    Returns None if the lpips package is not installed.
+    """
+    key = str(device)
+    if key not in _LPIPS_MODELS:
+        try:
+            import lpips as _lpips_lib
+        except ImportError:
+            raise ImportError(
+                "lpips package is required for reward_type='lpips_mae'. "
+                "Install it with: pip install lpips"
+            )
+        model = _lpips_lib.LPIPS(net="alex", verbose=False).to(device).eval()
+        _LPIPS_MODELS[key] = model
+        logger.info("LPIPS(AlexNet) model loaded on %s for lpips_mae reward.", device)
+    return _LPIPS_MODELS[key]
 
 
 def _dtype_from_name(name: str) -> torch.dtype:
@@ -262,7 +290,7 @@ def _env_bool(name: str, default: bool) -> bool:
 
 def compute_rft_reward(
     pred_future: torch.Tensor,
-    target_image: Optional[torch.Tensor] = None,
+    target_images: Optional[torch.Tensor] = None,
     ranking_score: Optional[torch.Tensor] = None,
     *,
     reward_type: Optional[str] = None,
@@ -277,11 +305,12 @@ def compute_rft_reward(
     Reads defaults from environment variables when keyword args are None.
 
     Args:
-        pred_future: [B, H, 3, H_img, W_img] float [0,1].  Visual reward uses
-            the last predicted frame (pred_future[:, -1]).
-        target_image: [B, 3, H_img, W_img] float [0,1].  Required for visual.
+        pred_future: [B, H, 3, H_img, W_img] float [0,1].
+        target_images: [B, H, 3, H_img, W_img] float [0,1].  Required for visual/lpips_mae.
+            lpips_mae: horizon-averaged -(LPIPS + MAE); matches eval rft_reward_proxy exactly.
+            visual:    horizon-averaged negative MSE (fast; used when LPIPS unavailable).
         ranking_score: [B] float from ActionFutureScorer, or None.
-        reward_type: visual | rank_score | hybrid (env: WORLD_REWARD_TYPE).
+        reward_type: lpips_mae | visual | rank_score | hybrid (env: WORLD_REWARD_TYPE).
         alpha: visual weight in hybrid (env: RANK_REWARD_ALPHA, default 0.2).
         beta: rank_score weight in hybrid (env: RANK_REWARD_BETA, default 0.8).
         normalize_rank: z-score normalise rank_score per batch (env: NORMALIZE_RANK_REWARD).
@@ -313,13 +342,27 @@ def compute_rft_reward(
     B = pred_future.shape[0]
     device = pred_future.device
 
-    # --- visual reward: negative MSE vs target last predicted frame --------
+    # --- visual reward -------------------------------------------------------
+    # lpips_mae / hybrid: -(LPIPS + MAE) horizon-averaged — matches eval rft_reward_proxy
+    # visual:             -(MSE)          horizon-averaged — backward-compat / fast fallback
     visual_reward: Optional[torch.Tensor] = None
-    if target_image is not None:
-        last_pred = pred_future[:, -1].float()          # [B, 3, H, W]
-        target_f  = target_image.to(device).float().clamp(0.0, 1.0)
-        mse = ((last_pred - target_f) ** 2).mean(dim=(1, 2, 3))   # [B]
-        visual_reward = -mse                            # higher is better
+    if target_images is not None:
+        target_f = target_images.to(device).float().clamp(0.0, 1.0)  # [B, H, 3, h, w]
+        B_val, H_val = pred_future.shape[0], pred_future.shape[1]
+        mae_per_step = (pred_future - target_f).abs().mean(dim=(2, 3, 4))  # [B, H]
+
+        if reward_type in ("lpips_mae", "hybrid"):
+            lpips_model = _get_lpips_model(device)  # raises ImportError if lpips not installed
+            # Flatten B×H → single batch for LPIPS, convert [0,1] → [-1,1]
+            pred_flat = (pred_future.reshape(B_val * H_val, *pred_future.shape[2:]) * 2 - 1).clamp(-1.0, 1.0)
+            tgt_flat  = (target_f.reshape(B_val * H_val, *target_f.shape[2:]) * 2 - 1).clamp(-1.0, 1.0)
+            with torch.no_grad():
+                lpips_flat = lpips_model(pred_flat, tgt_flat).squeeze(-1).squeeze(-1).squeeze(-1)  # [B*H]
+            lpips_per_step = lpips_flat.reshape(B_val, H_val)                                      # [B, H]
+            visual_reward = -(lpips_per_step.mean(dim=1) + mae_per_step.mean(dim=1))               # [B]
+        else:  # "visual": horizon-averaged negative MSE
+            mse_per_step = ((pred_future - target_f) ** 2).mean(dim=(2, 3, 4))  # [B, H]
+            visual_reward = -mse_per_step.mean(dim=1)                            # [B]
 
     # --- rank_score normalisation ------------------------------------------
     rank_score_raw  = ranking_score
@@ -338,25 +381,24 @@ def compute_rft_reward(
     if reward_type in ("rank_score", "hybrid") and rank_score_norm is None:
         logger.warning(
             "WORLD_REWARD_TYPE=%s requested but ranking_score is not available "
-            "(model may lack ActionFutureScorer). Falling back to visual reward.",
+            "(model may lack ActionFutureScorer). Falling back to lpips_mae reward.",
             reward_type,
         )
-        effective_type = "visual"
+        effective_type = "lpips_mae"
 
-    if effective_type == "visual" and visual_reward is None:
+    if effective_type in ("visual", "lpips_mae", "hybrid") and visual_reward is None:
         raise ValueError(
-            "visual reward requested but target_image was not provided"
+            "visual/lpips_mae/hybrid reward requested but target_images was not provided"
         )
 
     # --- compute final reward ----------------------------------------------
     reward: torch.Tensor
-    if effective_type == "visual":
+    if effective_type in ("visual", "lpips_mae"):
         reward = visual_reward
     elif effective_type == "rank_score":
         reward = rank_score_norm
-    else:  # hybrid
-        v = visual_reward if visual_reward is not None else torch.zeros(B, device=device)
-        reward = alpha * v + beta * rank_score_norm
+    else:  # hybrid: alpha * -(LPIPS+MAE) + beta * rank_score_norm
+        reward = alpha * visual_reward + beta * rank_score_norm
 
     # --- diagnostics -------------------------------------------------------
     def _mean(t):
@@ -462,9 +504,10 @@ def run_smoke_test(
             stats["ranking_score_min"] = float(ranking_score.min().item())
             stats["ranking_score_max"] = float(ranking_score.max().item())
 
+        target_images_smoke = current.unsqueeze(1).expand(-1, horizon, -1, -1, -1)
         reward_out = compute_rft_reward(
             pred,
-            target_image=current,        # smoke test: target = current (zero motion)
+            target_images=target_images_smoke,  # smoke: expand single frame to [B,H,3,h,w]
             ranking_score=ranking_score,
             reward_type=reward_type,
         )

@@ -85,6 +85,20 @@ OUT_ROOT="${OUT_ROOT:-${REPO_ROOT}/results/phase1/residual_worldmodel/${RUN_NAME
 LOG_ROOT="${LOG_ROOT:-${OUT_ROOT}/logs/node${NODE_INDEX}_of_${NUM_NODES}}"
 MANIFEST="${OUT_ROOT}/sweep_manifest_node${NODE_INDEX}_of_${NUM_NODES}.tsv"
 
+# Shared window manifest: all eval conditions reuse the same set of windows
+# for fair comparison. Populated after the first condition completes.
+# Can also be pre-set via SHARED_WINDOW_MANIFEST env var.
+SHARED_WINDOW_MANIFEST="${SHARED_WINDOW_MANIFEST:-}"
+# If a prior run already generated a manifest for the first condition, reuse it.
+if [ -z "${SHARED_WINDOW_MANIFEST}" ] && [ -n "${EXP_FILTER}" ] && [ "${OVERWRITE:-0}" != "1" ]; then
+  _first_exp="$(echo "${EXP_FILTER}" | tr ',' '\n' | head -1 | tr -d ' ')"
+  _candidate="${OUT_ROOT}/${_first_exp}/window_manifest.json"
+  if [ -f "${_candidate}" ]; then
+    SHARED_WINDOW_MANIFEST="${_candidate}"
+    log "Pre-existing shared manifest found from ${_first_exp}: ${SHARED_WINDOW_MANIFEST}"
+  fi
+fi
+
 # Validate
 [ -f "${SWEEP_CONFIG}" ] || die "SWEEP_CONFIG not found: ${SWEEP_CONFIG}"
 python3 -c "import json; json.load(open('${SWEEP_CONFIG}'))" \
@@ -158,6 +172,8 @@ for exp in cfg.get("experiments", []):
         get("lambda_static", 0.2),
         get("lambda_query", 0.5),
         get("lambda_sparse", 0.01),
+        get("max_steps", 150000),
+        get("init_from_checkpoint", ""),
     ]
     print("|".join(parts))
 PYEOF
@@ -197,9 +213,9 @@ if is_true "${DRY_RUN}"; then
   log "  out root : ${OUT_ROOT}/<EXP_NAME>"
   job_id=0
   while IFS='|' read -r exp stage hist_k num_q motion scorer lr_val margin rank_temp neg_type neg_mix \
-                          li ld ls lq lsp; do
+                          li ld ls lq lsp max_steps_exp init_ckpt; do
     if [ $((job_id % NUM_NODES)) -eq "${NODE_INDEX}" ]; then
-      log "  job=${job_id}  ${exp}  (stage=${stage} K=${hist_k} Q=${num_q} motion=${motion} scorer=${scorer} lambda_rank=${lr_val} rank_temp=${rank_temp} neg=${neg_type} neg_mix=${neg_mix:-none})"
+      log "  job=${job_id}  ${exp}  (stage=${stage} K=${hist_k} Q=${num_q} motion=${motion} scorer=${scorer} lambda_rank=${lr_val} rank_temp=${rank_temp} neg=${neg_type} neg_mix=${neg_mix:-none} max_steps=${max_steps_exp}${init_ckpt:+ init=${init_ckpt}})"
       log "       save=${CKPT_ROOT}/${TASK_SUITE}/${exp}/s${SEED}  eval=${OUT_ROOT}/${exp}"
     fi
     job_id=$((job_id + 1))
@@ -218,7 +234,7 @@ fail_count=0
 success_count=0
 
 while IFS='|' read -r exp stage hist_k num_q motion scorer lr_val margin rank_temp neg_type neg_mix \
-                        li ld ls lq lsp; do
+                        li ld ls lq lsp max_steps_exp init_ckpt; do
   current_id="${job_id}"
   job_id=$((job_id + 1))
 
@@ -229,13 +245,23 @@ while IFS='|' read -r exp stage hist_k num_q motion scorer lr_val margin rank_te
   log "──────────────────────────────────────────────────────────────"
   log "START job=${current_id}  ${exp}"
   log "  stage=${stage}  K=${hist_k}  Q=${num_q}  motion=${motion}  scorer=${scorer}"
-  log "  lambda_rank=${lr_val}  negative_type=${neg_type}"
+  log "  lambda_rank=${lr_val}  negative_type=${neg_type}  max_steps=${max_steps_exp}"
+  [ -n "${init_ckpt}" ] && log "  init_from_checkpoint=${init_ckpt}"
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\trunning\t%s\n' \
     "${current_id}" "${NODE_INDEX}" "${exp}" "${stage}" "${hist_k}" "${num_q}" \
     "${motion}" "${scorer}" "${lr_val}" "${neg_type}" \
     "${LOG_ROOT}/${exp}.log" >> "${MANIFEST}"
 
   log_file="${LOG_ROOT}/${exp}.log"
+
+  # Determine whether to reuse a shared manifest for this condition
+  _use_manifest=0
+  _manifest_path=""
+  if [ -n "${SHARED_WINDOW_MANIFEST}" ] && [ -f "${SHARED_WINDOW_MANIFEST}" ]; then
+    _use_manifest=1
+    _manifest_path="${SHARED_WINDOW_MANIFEST}"
+    log "  → reusing shared manifest: ${_manifest_path}"
+  fi
 
   set +e
   (
@@ -257,8 +283,12 @@ while IFS='|' read -r exp stage hist_k num_q motion scorer lr_val margin rank_te
     export LAMBDA_STATIC="${ls}"
     export LAMBDA_QUERY="${lq}"
     export LAMBDA_SPARSE="${lsp}"
+    # Per-experiment overrides (from JSON)
+    export MAX_STEPS="${max_steps_exp:-${MAX_STEPS:-150000}}"
+    export INIT_FROM_CHECKPOINT="${init_ckpt:-}"
     export TASK_SUITE
     export SEED
+    export CKPT_SEED="${CKPT_SEED:-${SEED}}"
     export RUN_NAME
     export CKPT_ROOT
     export OUT_ROOT
@@ -273,9 +303,14 @@ while IFS='|' read -r exp stage hist_k num_q motion scorer lr_val margin rank_te
     export PHASE0_COMPATIBLE="${PHASE0_COMPATIBLE:-1}"
     export NUM_EVAL_WINDOWS="${NUM_EVAL_WINDOWS:-200}"
     export NUM_RANKING_WINDOWS="${NUM_RANKING_WINDOWS:-100}"
-    export WINDOW_POSITION_MODE="${WINDOW_POSITION_MODE:-random}"
+    export WINDOW_POSITION_MODE="${WINDOW_POSITION_MODE:-episode_phases}"
+    export NEGATIVE_EVAL_TYPES="${NEGATIVE_EVAL_TYPES:-same_phase,temporal_shift,action_noise,mixed}"
+    export TEMPORAL_SHIFT_MAX="${TEMPORAL_SHIFT_MAX:-3}"
+    export ACTION_NOISE_STD="${ACTION_NOISE_STD:-0.15}"
     export ACTION_ABLATION="${ACTION_ABLATION:-0}"
     export SAVE_DEBUG_VISUALS="${SAVE_DEBUG_VISUALS:-0}"
+    export USE_WINDOW_MANIFEST="${_use_manifest}"
+    export WINDOW_MANIFEST="${_manifest_path}"
     # Passthrough training knobs
     export MAX_STEPS="${MAX_STEPS:-150000}"
     export LR="${LR:-5e-5}"
@@ -292,6 +327,14 @@ while IFS='|' read -r exp stage hist_k num_q motion scorer lr_val margin rank_te
   if [ "${rc}" -eq 0 ]; then
     log "DONE job=${current_id}: ${exp}"
     success_count=$((success_count + 1))
+    # Capture manifest from first successful eval to share with remaining conditions
+    if [ -z "${SHARED_WINDOW_MANIFEST}" ]; then
+      _new_manifest="${OUT_ROOT}/${exp}/window_manifest.json"
+      if [ -f "${_new_manifest}" ]; then
+        SHARED_WINDOW_MANIFEST="${_new_manifest}"
+        log "Shared manifest set from ${exp}: ${SHARED_WINDOW_MANIFEST}"
+      fi
+    fi
   else
     log "FAILED job=${current_id}: ${exp} (rc=${rc})"
     fail_count=$((fail_count + 1))

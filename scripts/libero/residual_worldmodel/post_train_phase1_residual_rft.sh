@@ -81,17 +81,19 @@ git status --short > "${OUTPUT_DIR}/git_status.txt" || true
   "${VENV_PATH}/bin/python" -V
 } > "${OUTPUT_DIR}/env_info.txt"
 
-if [[ "${MODEL_GENERATION}" != "baseline" ]]; then
-  "${VENV_PATH}/bin/python" -m worldmodel.residual_worldmodel.rft_inference \
-    --checkpoint "${WORLD_MODEL_CKPT}" \
-    --target-mode "${TARGET_MODE}" \
-    --model-generation "${MODEL_GENERATION}" \
-    --output-dir "${OUTPUT_DIR}/smoke" \
-    --device "${SMOKE_DEVICE:-cpu}" \
-    --horizon 8 | tee "${OUTPUT_DIR}/smoke/smoke.log"
-else
-  printf '{"model_generation":"baseline","target_mode":"pixel","note":"AR-Pixel baseline uses existing token world model path"}\n' \
-    > "${OUTPUT_DIR}/smoke/debug_stats.json"
+if [[ "${DRY_RUN}" != "1" ]]; then
+  if [[ "${MODEL_GENERATION}" != "baseline" ]]; then
+    "${VENV_PATH}/bin/python" -m worldmodel.residual_worldmodel.rft_inference \
+      --checkpoint "${WORLD_MODEL_CKPT}" \
+      --target-mode "${TARGET_MODE}" \
+      --model-generation "${MODEL_GENERATION}" \
+      --output-dir "${OUTPUT_DIR}/smoke" \
+      --device "${SMOKE_DEVICE:-cpu}" \
+      --horizon 8 | tee "${OUTPUT_DIR}/smoke/smoke.log"
+  else
+    printf '{"model_generation":"baseline","target_mode":"pixel","note":"AR-Pixel baseline uses existing token world model path"}\n' \
+      > "${OUTPUT_DIR}/smoke/debug_stats.json"
+  fi
 fi
 
 export LIBERO_TASK_NAME="${TASK_SUITE}"
@@ -102,8 +104,22 @@ export N_GPUS_PER_NODE
 export DATE="phase1"
 export POST_EXP_NAME="${EXP_NAME}"
 RFT_LOCAL_DIR="${RFT_CKPT_ROOT}/${TASK_SUITE}/${DATE}_${POST_EXP_NAME}"
+
+# Derive world_reward hydra overrides from env vars so that any caller
+# (e.g. run_v4_core_sweep.sh) that sets WORLD_REWARD_TYPE gets the correct
+# value forwarded to compute_rft_reward() — not silently overridden by the
+# YAML default. USER_EXTRA_RFT_ARGS is placed last so callers can still
+# override individual keys.
+_WR_TYPE="${WORLD_REWARD_TYPE:-lpips_mae}"
+_WR_ALPHA="${RANK_REWARD_ALPHA:-0.2}"
+_WR_BETA="${RANK_REWARD_BETA:-0.8}"
+_WR_NORM="${NORMALIZE_RANK_REWARD:-1}"
+_WR_CLIP="${CLIP_RANK_REWARD:-1}"
+_WR_CLIPV="${RANK_REWARD_CLIP_VALUE:-5.0}"
+_WR_OVERRIDES="world_reward.type=${_WR_TYPE} world_reward.rank_alpha=${_WR_ALPHA} world_reward.rank_beta=${_WR_BETA} world_reward.normalize_rank=${_WR_NORM} world_reward.clip_rank=${_WR_CLIP} world_reward.clip_value=${_WR_CLIPV}"
+
 if [[ "${MODEL_GENERATION}" != "baseline" ]]; then
-  export EXTRA_RFT_ARGS="processor.phase1_residual.enabled=True processor.phase1_residual.checkpoint=${WORLD_MODEL_CKPT} processor.phase1_residual.config=${WORLD_MODEL_CONFIG} processor.phase1_residual.target_mode=${TARGET_MODE} processor.phase1_residual.model_generation=${MODEL_GENERATION} world_model_rollout.phase1_residual.enabled=True data.video.dataset_path=${DATA_ROOT} data.video.dataset_name=libero_${TASK_SUITE}_no_noops trainer.default_local_dir=${RFT_LOCAL_DIR} ${USER_EXTRA_RFT_ARGS:-}"
+  export EXTRA_RFT_ARGS="processor.phase1_residual.enabled=True processor.phase1_residual.checkpoint=${WORLD_MODEL_CKPT} processor.phase1_residual.config=${WORLD_MODEL_CONFIG} processor.phase1_residual.target_mode=${TARGET_MODE} processor.phase1_residual.model_generation=${MODEL_GENERATION} world_model_rollout.phase1_residual.enabled=True data.video.dataset_path=${DATA_ROOT} data.video.dataset_name=libero_${TASK_SUITE}_no_noops trainer.default_local_dir=${RFT_LOCAL_DIR} ${_WR_OVERRIDES} ${USER_EXTRA_RFT_ARGS:-}"
 else
   export EXTRA_RFT_ARGS="data.video.dataset_path=${DATA_ROOT} data.video.dataset_name=libero_${TASK_SUITE}_no_noops trainer.default_local_dir=${RFT_LOCAL_DIR} ${USER_EXTRA_RFT_ARGS:-}"
 fi

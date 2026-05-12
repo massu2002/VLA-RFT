@@ -135,6 +135,7 @@ class RLDSDataset(IterableDataset):
         shuffle_buffer_size: int = 256_000,
         train: bool = True,
         image_aug: bool = False,
+        wm_history_length: int = 0,
     ) -> None:
         """Lightweight wrapper around RLDS TFDS Pipeline for use with PyTorch/OpenVLA Data Loaders."""
         self.data_root_dir, self.data_mix, self.batch_transform = data_root_dir, data_mix, batch_transform
@@ -168,6 +169,7 @@ class RLDSDataset(IterableDataset):
                 future_obs_window_size=NUM_ACTIONS_CHUNK,
                 skip_unlabeled=True,                                # Skip trajectories without language labels
                 goal_relabeling_strategy="uniform",                 # Goals are currently unused
+                wm_history_length=wm_history_length,               # WM wide-window; 0 = disabled
             ),
             frame_transform_kwargs=dict(
                 resize_size=resize_resolution,
@@ -307,7 +309,7 @@ class RLDSBatchTransform_V1:
     use_proprio: bool = False
     use_minivla: bool = False
     use_raw_image: bool = False
-
+    wm_history_length: int = 0  # K_max; when >0, also extracts wm_raw_pixel_values
 
     def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, Any]:
         """Converts a RLDS batch to the format expected by the OpenVLA collator/models."""
@@ -417,6 +419,10 @@ class RLDSBatchTransform_V1:
             assert "raw_image_primary" in rlds_batch["observation"], "Raw image not found in observation!"
             imgs_raw = rlds_batch["observation"]['raw_image_primary']
             return_dict["raw_pixel_values"] = imgs_raw
+            # WM wide-window: K_max+2+H frames with eval-identical layout
+            # [hist_0..hist_{K-1} | context | current | future_0..future_{H-1}]
+            if self.wm_history_length > 0 and "wm_raw_image_primary" in rlds_batch["observation"]:
+                return_dict["wm_raw_pixel_values"] = rlds_batch["observation"]["wm_raw_image_primary"]
         # Add additional inputs
         if self.use_wrist_image:
             all_wrist_pixels = []

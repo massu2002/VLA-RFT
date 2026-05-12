@@ -144,6 +144,13 @@ class PaddedCollatorForActionPrediction:
         else:
             raw_pixel_values = None
 
+        # Stack WM wide-window raw pixels (K_max+2+H frames) when present
+        if "wm_raw_pixel_values" in instances[0] and instances[0]["wm_raw_pixel_values"] is not None:
+            wm_raw_pixel_values = [torch.from_numpy(np.copy(instance["wm_raw_pixel_values"])) for instance in instances]
+            wm_raw_pixel_values = torch.stack(wm_raw_pixel_values)
+        else:
+            wm_raw_pixel_values = None
+
         # Stack proprio
         if "proprio" in instances[0]:
             proprio = [instance["proprio"] for instance in instances]
@@ -159,6 +166,7 @@ class PaddedCollatorForActionPrediction:
             labels=labels,
             actions=actions,
             raw_pixel_values=raw_pixel_values,
+            wm_raw_pixel_values=wm_raw_pixel_values,
         )
         if dataset_names is not None:
             output["dataset_names"] = dataset_names

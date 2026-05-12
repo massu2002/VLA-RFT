@@ -65,6 +65,7 @@ _V4_NEG_STAT_KEYS = [
     "neg_task_match_rate",        # fraction of negatives from same task as positive
     "num_same_task_negative",     # count: same_task_other_window negatives
     "num_temporal_perm_negative", # count: temporal permutation negatives
+    "num_action_noise_negative",  # count: action_noise negatives
     "num_zero_random_negative",   # count: zero or random action negatives
     "num_batch_roll_fallback",    # count: batch-roll fallback (no same-task candidate)
 ]
@@ -176,16 +177,19 @@ class V4Collator:
     """
 
     DEFAULT_NEGATIVE_MIX = "same_task_other_window:0.5,temporal_permutation:0.25,zero_random:0.25"
-    VALID_NEGATIVE_TYPES = {"same_task_other_window", "temporal_permutation", "zero_random"}
+    VALID_NEGATIVE_TYPES = {"same_task_other_window", "temporal_permutation", "zero_random", "action_noise"}
+    DEFAULT_ACTION_NOISE_STD = 0.15
 
     def __init__(
         self,
         history_length: int,
         action_horizon: int,
         negative_mix: str = "",
+        action_noise_std: float = DEFAULT_ACTION_NOISE_STD,
     ) -> None:
         self.K = history_length
         self.H = action_horizon
+        self.action_noise_std = float(os.environ.get("ACTION_NOISE_STD", action_noise_std))
 
         spec = os.environ.get("NEGATIVE_MIX", negative_mix or "")
         if not spec.strip():
@@ -229,10 +233,10 @@ class V4Collator:
         total = sum(raw.values()) or 1.0
         mix = {k: v / total for k, v in raw.items()}
 
-        # Build sorted cumulative thresholds for the three types
+        # Build sorted cumulative thresholds for the four types
         self._thresholds: list = []
         cumsum = 0.0
-        for name in ["same_task_other_window", "temporal_permutation", "zero_random"]:
+        for name in ["same_task_other_window", "temporal_permutation", "action_noise", "zero_random"]:
             cumsum += mix.get(name, 0.0)
             self._thresholds.append((cumsum, name))
 
@@ -261,6 +265,7 @@ class V4Collator:
         negative_actions = actions.clone()
         num_same_task    = 0
         num_temp_perm    = 0
+        num_action_noise = 0
         num_zero_random  = 0
         num_roll_fallbk  = 0
         same_task_count  = 0   # negatives whose task == positive's task
@@ -295,6 +300,19 @@ class V4Collator:
                 num_temp_perm += 1
                 same_task_count += 1   # same episode → same task
 
+            elif neg_type == "action_noise":
+                # Add Gaussian noise scaled by per-dim std of the prediction horizon.
+                # Matches eval _make_action_noise_action: use actual std when > 1e-6,
+                # fall back to 1.0 only for near-zero std (static actions).
+                # Same episode → same task.
+                horizon_acts = actions[i, K + 1: K + 1 + H]   # [H, D]
+                scale = horizon_acts.std(dim=0)                 # [D]
+                scale = torch.where(scale > 1e-6, scale, torch.ones_like(scale))
+                noise = torch.randn(H, D_act, dtype=actions.dtype) * scale * self.action_noise_std
+                negative_actions[i, K + 1: K + 1 + H] = horizon_acts + noise
+                num_action_noise += 1
+                same_task_count += 1   # same episode → same task
+
             else:  # zero_random
                 horizon_acts = actions[:, K + 1: K + 1 + H]   # [B, H, D]
                 if _rng.random() < 0.5:
@@ -318,11 +336,12 @@ class V4Collator:
             "negative_actions": negative_actions,
             # Collator diagnostic stats — stripped in V4Trainer.compute_loss.
             # Shape [1] (not scalar) so accelerate can torch.cat them across DDP devices.
-            "_neg_task_match_rate":        torch.tensor([neg_task_match_rate], dtype=torch.float32),
-            "_neg_num_same_task":          torch.tensor([num_same_task],       dtype=torch.long),
-            "_neg_num_temporal_perm":      torch.tensor([num_temp_perm],       dtype=torch.long),
-            "_neg_num_zero_random":        torch.tensor([num_zero_random],     dtype=torch.long),
-            "_neg_num_batch_roll_fallback": torch.tensor([num_roll_fallbk],   dtype=torch.long),
+            "_neg_task_match_rate":         torch.tensor([neg_task_match_rate], dtype=torch.float32),
+            "_neg_num_same_task":           torch.tensor([num_same_task],       dtype=torch.long),
+            "_neg_num_temporal_perm":       torch.tensor([num_temp_perm],       dtype=torch.long),
+            "_neg_num_action_noise":        torch.tensor([num_action_noise],    dtype=torch.long),
+            "_neg_num_zero_random":         torch.tensor([num_zero_random],     dtype=torch.long),
+            "_neg_num_batch_roll_fallback": torch.tensor([num_roll_fallbk],    dtype=torch.long),
         }
 
 
@@ -416,6 +435,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tf32",    action="store_true",  default=False)
     parser.add_argument("--no-tf32", dest="tf32", action="store_false")
 
+    # Warm-start: load weights from a prior checkpoint before training begins.
+    # Weights are loaded with strict=False so mismatched keys (e.g. new scorer
+    # weights in v4b initialised from a v4a checkpoint) are safely skipped.
+    parser.add_argument("--init-from-checkpoint", type=str, default="",
+                        help="Path to a saved model dir (contains config.json + pytorch_model.bin). "
+                             "Loaded with strict=False before training; useful for 2-stage training.")
+
+    # Negative sampling
+    parser.add_argument("--action-noise-std", type=float, default=V4Collator.DEFAULT_ACTION_NOISE_STD,
+                        help="Std multiplier for action_noise training negatives.")
+
     # v4-specific model args
     add_v4_args(parser)
 
@@ -446,6 +476,8 @@ def main() -> None:
         ("RESIDUAL_OUTPUT_ACTIVATION", "--residual-output-activation"),
         ("RESIDUAL_OUTPUT_SCALE",      "--residual-output-scale"),
         ("PIXEL_OUTPUT_ACTIVATION",    "--pixel-output-activation"),
+        ("INIT_FROM_CHECKPOINT",       "--init-from-checkpoint"),
+        ("ACTION_NOISE_STD",           "--action-noise-std"),
     ]
     import sys
     argv = sys.argv
@@ -585,6 +617,49 @@ def main() -> None:
 
     model = TemporalDynamicQueryResidualWM(cfg, torch_dtype=torch_dtype)
 
+    # 2-stage warm-start: load per-module weights from a prior checkpoint.
+    # Each module is loaded independently with strict=False so that:
+    #   - modules absent in the source (e.g. action_future_scorer for v4a→v4b)
+    #     remain randomly initialised.
+    #   - modules present in both source and target are loaded exactly.
+    if args.init_from_checkpoint:
+        ckpt_path = Path(args.init_from_checkpoint)
+        if not ckpt_path.exists():
+            raise FileNotFoundError(
+                f"--init-from-checkpoint path does not exist: {ckpt_path}"
+            )
+        _module_names = [
+            ("encoder",            model.encoder),
+            ("decoder",            model.decoder),
+            ("act_encoder",        model.act_encoder),
+            ("spatial_proj",       model.spatial_proj),
+            ("spatial_unproj",     model.spatial_unproj),
+            ("act_proj",           model.act_proj),
+            ("query_extractor",    model.query_extractor),
+            ("temporal_predictor", model.temporal_predictor),
+            ("token_fuser",        model.token_fuser),
+        ]
+        if model.action_future_scorer is not None:
+            _module_names.append(("action_future_scorer", model.action_future_scorer))
+        loaded, skipped = [], []
+        for mod_name, mod in _module_names:
+            pt_file = ckpt_path / f"{mod_name}.pt"
+            if pt_file.exists():
+                state = torch.load(str(pt_file), map_location="cpu")
+                result = mod.load_state_dict(state, strict=False)
+                loaded.append(mod_name)
+                if result.missing_keys or result.unexpected_keys:
+                    logger.info(
+                        "  %s: missing=%s unexpected=%s",
+                        mod_name, result.missing_keys, result.unexpected_keys,
+                    )
+            else:
+                skipped.append(mod_name)
+        logger.info(
+            "Warm-start from %s: loaded=%s  skipped(not in src)=%s",
+            ckpt_path, loaded, skipped,
+        )
+
     train_dataset = RldsIterableDataset(
         dataset_name     = dataset_name,
         data_dir         = args.data_root,
@@ -639,8 +714,9 @@ def main() -> None:
         args            = training_args,
         train_dataset   = train_dataset,
         data_collator   = V4Collator(
-            history_length = cfg.history_length,
-            action_horizon = cfg.action_horizon,
+            history_length  = cfg.history_length,
+            action_horizon  = cfg.action_horizon,
+            action_noise_std = args.action_noise_std,
         ),
     )
 

@@ -95,6 +95,12 @@ DYNAMIC_DILATE_KERNEL="${DYNAMIC_DILATE_KERNEL:-7}"
 ROI_CROP_SIZE="${ROI_CROP_SIZE:-64}"
 
 # ---------------------------------------------------------------------------
+# Negative sampling / warm-start
+# ---------------------------------------------------------------------------
+ACTION_NOISE_STD="${ACTION_NOISE_STD:-0.15}"
+INIT_FROM_CHECKPOINT="${INIT_FROM_CHECKPOINT:-}"
+
+# ---------------------------------------------------------------------------
 # Segment length: v4 requires K + H + 2 frames per window
 # ---------------------------------------------------------------------------
 # SEGMENT_LENGTH = HISTORY_LENGTH + TRAIN_HORIZON + 2
@@ -221,6 +227,8 @@ dump_run_config "${SAVE_DIR}" \
   "use_action_future_scorer=${USE_ACTION_FUTURE_SCORER}" \
   "use_motion_bias=${USE_MOTION_BIAS}" \
   "action_conditioning_mode=${ACTION_CONDITIONING_MODE}" \
+  "action_noise_std=${ACTION_NOISE_STD}" \
+  "init_from_checkpoint=${INIT_FROM_CHECKPOINT}" \
   "seed=${SEED}" \
   "data_root=${DATA_ROOT}" \
   "save_dir=${SAVE_DIR}"
@@ -288,6 +296,12 @@ case "${USE_MOTION_BIAS}" in
   1|true|TRUE|True|yes|YES) TRAIN_ARGS+=(--use-motion-bias) ;;
   *)                        TRAIN_ARGS+=(--no-motion-bias) ;;
 esac
+
+TRAIN_ARGS+=(--action-noise-std "${ACTION_NOISE_STD}")
+
+if [ -n "${INIT_FROM_CHECKPOINT}" ]; then
+  TRAIN_ARGS+=(--init-from-checkpoint "${INIT_FROM_CHECKPOINT}")
+fi
 
 if [ "${TF32:-0}" = "1" ]; then
   TRAIN_ARGS+=(--tf32)

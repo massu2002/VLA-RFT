@@ -9,6 +9,8 @@ import hashlib
 import json
 import math
 import os
+import random
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -116,6 +118,14 @@ def dynamic_mask_np(current: np.ndarray, future: np.ndarray, threshold: float, d
     return mask
 
 
+def horizon_avg_mae(pred_frames: list[np.ndarray], gt_frames: list[np.ndarray]) -> float:
+    maes = [
+        float(np.mean(np.abs(p.astype(np.float32) / 255.0 - g.astype(np.float32) / 255.0)))
+        for p, g in zip(pred_frames, gt_frames)
+    ]
+    return float(np.mean(maes)) if maes else float("nan")
+
+
 def lpips_np(lpips_fn, a: np.ndarray, b: np.ndarray) -> float:
     try:
         return float(lpips_fn(a, b))
@@ -178,6 +188,61 @@ def load_phase0_model(args: argparse.Namespace, device: torch.device):
     return _load_model(str(model_dir), args.tokenizer_ckpt, device)
 
 
+_NEGATIVE_TYPE_ALIASES = {
+    "same_task_same_phase_other_window": "same_phase",
+    "same_task_other_window": "same_phase",
+    "same_phase": "same_phase",
+    "temporal_shift": "temporal_shift",
+    "temporal_perturbation": "temporal_shift",
+    "action_noise": "action_noise",
+    "policy_like_perturbation": "action_noise",
+    "mixed": "mixed",
+}
+
+
+def parse_negative_eval_types(raw: str) -> list[str]:
+    out: list[str] = []
+    for part in raw.replace(";", ",").split(","):
+        key = part.strip()
+        if not key:
+            continue
+        norm = _NEGATIVE_TYPE_ALIASES.get(key)
+        if norm is None:
+            raise ValueError(f"Unknown negative eval type: {key}")
+        if norm not in out:
+            out.append(norm)
+    return out or ["same_phase", "temporal_shift", "action_noise", "mixed"]
+
+
+def negative_metric_suffix(neg_type: str) -> str:
+    return "".join(c if c.isalnum() else "_" for c in neg_type).strip("_")
+
+
+def temporal_shift_actions(actions, rng: random.Random, max_shift: int):
+    arr = np.asarray(actions)
+    if len(arr) <= 1:
+        return actions
+    shift_cap = max(1, min(max_shift, len(arr) - 1))
+    shift = rng.choice([s for s in range(-shift_cap, shift_cap + 1) if s != 0])
+    shifted = np.empty_like(arr)
+    if shift > 0:
+        shifted[:shift] = arr[0]
+        shifted[shift:] = arr[:-shift]
+    else:
+        s = -shift
+        shifted[:-s] = arr[s:]
+        shifted[-s:] = arr[-1]
+    return shifted
+
+
+def noisy_actions(actions, rng: random.Random, noise_std: float):
+    arr = np.asarray(actions)
+    scale = np.nanstd(arr, axis=0, keepdims=True)
+    scale = np.where(np.isfinite(scale) & (scale > 1e-6), scale, 1.0)
+    noise_rng = np.random.default_rng(rng.randint(0, 2**31 - 1))
+    return arr + noise_rng.normal(0.0, noise_std * scale, size=arr.shape).astype(arr.dtype)
+
+
 def save_ranking_by_task(rows: list[dict], out: Path) -> None:
     groups: dict[str, dict[str, list[float]]] = {}
     for row in rows:
@@ -224,6 +289,13 @@ def main() -> None:
     ap.add_argument("--device", default="auto")
     ap.add_argument("--dynamic-threshold", type=float, default=0.05)
     ap.add_argument("--dynamic-dilate-kernel", type=int, default=7)
+    ap.add_argument("--num-shuffle-reps", type=int, default=3,
+                    help="Number of negative action samples per window (same default as v4 eval)")
+    ap.add_argument("--negative-eval-types", default=os.environ.get("NEGATIVE_EVAL_TYPES", "same_phase,temporal_shift,action_noise,mixed"))
+    ap.add_argument("--temporal-shift-max", type=int, default=int(os.environ.get("TEMPORAL_SHIFT_MAX", "3")))
+    ap.add_argument("--action-noise-std", type=float, default=float(os.environ.get("ACTION_NOISE_STD", "0.15")))
+    ap.add_argument("--seed", type=int, default=42,
+                    help="Base seed for negative sampling RNG")
     ap.add_argument("--smoke", action="store_true")
     args = ap.parse_args()
 
@@ -256,6 +328,14 @@ def main() -> None:
     windows = manifest.get("windows", [])
     if args.smoke:
         windows = windows[: max(1, min(2, len(windows)))]
+    negative_eval_types = parse_negative_eval_types(args.negative_eval_types)
+    default_negative_type = "mixed" if "mixed" in negative_eval_types else negative_eval_types[0]
+
+    # Build per-task window list for negative sampling (same strategy as v4 eval:
+    # sample actions from another window of the same task, args.num_shuffle_reps times).
+    task_wins_by_id: dict[int, list[dict]] = defaultdict(list)
+    for w in windows:
+        task_wins_by_id[int(w["task_id"])].append(w)
 
     for rec in windows:
         task_id = int(rec["task_id"])
@@ -264,17 +344,17 @@ def main() -> None:
         ep = find_episode(lookup, rec)
         frames, actions = slice_phase0_window(ep, current, args.eval_horizon)
 
-        neg_ep = ep
-        neg_current = int(rec.get("negative_current_frame_index") or current)
-        if rec.get("negative_episode_id") not in (None, "", rec.get("episode_id")):
-            neg_ep = find_episode(lookup, rec, prefix="negative_")
-        _, neg_actions = slice_phase0_window(neg_ep, neg_current, args.eval_horizon)
-
         pred, gt = rollout_episode_single_pass(model, frames, actions, args.decode_chunk_size)
-        pred_neg, _ = rollout_episode_single_pass(model, frames, neg_actions, args.decode_chunk_size)
+
+        # Negative sampling: evaluate multiple negative designs so RFT reward
+        # sensitivity can be checked at different difficulty levels.
+        same_task = [w for w in task_wins_by_id[task_id]
+                     if w.get("global_window_id") != rec.get("global_window_id")]
+        same_phase = [w for w in same_task
+                      if w.get("window_position") == rec.get("window_position")]
+        neg_rng = random.Random(args.seed * 10000 + int(rec.get("global_window_id", 0)))
 
         seq = compute_sequence_metrics_all(gt, pred, lpips_model, device)
-        seq_neg = compute_sequence_metrics_all(gt, pred_neg, lpips_model, device)
         current_img = frames[0]
         roi_half = get_roi_half(args.task_suite, task_id, roi_config)
         goal_center = get_goal_roi_center(args.task_suite, task_id, roi_config)
@@ -287,9 +367,52 @@ def main() -> None:
             gt, current_img, lpips_model, device, lpips_fn,
             args.dynamic_threshold, args.dynamic_dilate_kernel, roi_half, goal_center
         )
-        correct_lpips = float(seq["avg_lpips"])
-        shuffled_lpips = float(seq_neg["avg_lpips"])
-        full_mse = float(seq["avg_mse"])
+        _h_avg_lpips = float(seq["avg_lpips"])
+        _h_avg_mse = float(seq["avg_mse"])
+        _h_avg_mae = horizon_avg_mae(pred, gt)
+        _rft_proxy = -(_h_avg_lpips + _h_avg_mae)
+
+        neg_stats: dict[str, dict[str, float]] = {}
+        for neg_type in negative_eval_types:
+            neg_lpips_list: list[float] = []
+            neg_mae_list: list[float] = []
+            for _ in range(args.num_shuffle_reps):
+                concrete_type = neg_type
+                if concrete_type == "mixed":
+                    concrete_type = neg_rng.choice(["same_phase", "temporal_shift", "action_noise"])
+                if concrete_type == "same_phase":
+                    candidates = same_phase or same_task
+                    if candidates:
+                        neg_rec = neg_rng.choice(candidates)
+                        neg_ep_i = find_episode(lookup, neg_rec)
+                        _, neg_acts_i = slice_phase0_window(neg_ep_i, int(neg_rec["current_frame_index"]), args.eval_horizon)
+                    else:
+                        neg_acts_i = temporal_shift_actions(actions, neg_rng, args.temporal_shift_max)
+                elif concrete_type == "temporal_shift":
+                    neg_acts_i = temporal_shift_actions(actions, neg_rng, args.temporal_shift_max)
+                elif concrete_type == "action_noise":
+                    neg_acts_i = noisy_actions(actions, neg_rng, args.action_noise_std)
+                else:
+                    raise ValueError(f"Unknown negative type: {concrete_type}")
+
+                pred_neg_i, _ = rollout_episode_single_pass(model, frames, neg_acts_i, args.decode_chunk_size)
+                seq_neg_i = compute_sequence_metrics_all(gt, pred_neg_i, lpips_model, device)
+                neg_lpips_list.append(float(seq_neg_i["avg_lpips"]))
+                neg_mae_list.append(horizon_avg_mae(pred_neg_i, gt))
+            _neg_lpips = float(np.nanmean(neg_lpips_list)) if neg_lpips_list else float("nan")
+            _neg_mae = float(np.nanmean(neg_mae_list)) if neg_mae_list else float("nan")
+            _neg_proxy = -(_neg_lpips + _neg_mae)
+            neg_stats[neg_type] = {
+                "lpips": _neg_lpips,
+                "mae": _neg_mae,
+                "rft_proxy": _neg_proxy,
+                "rft_gap": _rft_proxy - _neg_proxy,
+            }
+
+        default_stats = neg_stats[default_negative_type]
+        _shuffled_lpips = default_stats["lpips"]
+        _rft_reward_gap = default_stats["rft_gap"]
+        _copy_mse = cmet["copy_current_full_mse"]
         row = {
             "model_name": "phase0_ar_pixel_direct_eval",
             "model_family": "phase0_ar_pixel",
@@ -307,8 +430,29 @@ def main() -> None:
             "episode_file": rec.get("episode_file", ""),
             "frame_indices": json.dumps([current] + rec.get("future_frame_indices", [])),
             "action_indices": json.dumps(rec.get("action_indices", [])),
-            "full_mse": full_mse,
-            "full_lpips": correct_lpips,
+            # Fields expected by aggregate_phase1_metrics
+            "horizon_avg_lpips": _h_avg_lpips,
+            "horizon_avg_mae": _h_avg_mae,
+            "horizon_avg_mse": _h_avg_mse,
+            "rft_reward_proxy": _rft_proxy,
+            "copy_current_horizon_avg_mse": _copy_mse,
+            "horizon_mse_over_copy": _h_avg_mse / _copy_mse if _copy_mse > 0 else float("nan"),
+            "rft_reward_gap": _rft_reward_gap,
+            "pairwise_win_rft": _rft_reward_gap > 0,
+            # v4-specific fields are not applicable for Phase0
+            "score_gap": float("nan"),
+            "fuser_mask_entropy": float("nan"),
+            "fuser_mask_overlap": float("nan"),
+            "dynamic_mask_entropy": float("nan"),
+            "dynamic_mask_overlap": float("nan"),
+            "future_dynamic_query_norm": float("nan"),
+            # Legacy / auxiliary fields kept for ranking_by_task and diagnostics
+            "correct_lpips": _h_avg_lpips,
+            "shuffled_lpips": _shuffled_lpips,
+            "lpips_gap": _shuffled_lpips - _h_avg_lpips,
+            "pairwise_win": _h_avg_lpips < _shuffled_lpips,
+            "full_mse": _h_avg_mse,
+            "full_lpips": _h_avg_lpips,
             "gripper_mse": roi.get("roi/gripper_mse", float("nan")),
             "gripper_lpips": roi.get("roi/gripper_lpips", float("nan")),
             "goal_mse": roi.get("roi/goal_mse", float("nan")),
@@ -317,15 +461,15 @@ def main() -> None:
             "dynamic_lpips": dyn_lpips,
             "static_consistency_mse": static_mse,
             **cmet,
-            "model_vs_copy_full_mse_delta": full_mse - cmet["copy_current_full_mse"],
-            "model_vs_copy_gripper_mse_delta": roi.get("roi/gripper_mse", float("nan")) - cmet["copy_current_gripper_mse"],
-            "model_vs_copy_dynamic_mse_delta": dyn_mse - cmet["copy_current_dynamic_mse"],
-            "full_mse_over_copy_current_mse": full_mse / cmet["copy_current_full_mse"] if cmet["copy_current_full_mse"] > 0 else float("nan"),
-            "correct_lpips": correct_lpips,
-            "shuffled_lpips": shuffled_lpips,
-            "lpips_gap": shuffled_lpips - correct_lpips,
-            "pairwise_win": correct_lpips < shuffled_lpips,
         }
+        row["negative_metric_type"] = default_negative_type
+        for neg_type, stats in neg_stats.items():
+            suffix = negative_metric_suffix(neg_type)
+            row[f"rft_reward_gap_{suffix}"] = stats["rft_gap"]
+            row[f"pairwise_win_rft_{suffix}"] = stats["rft_gap"] > 0
+            row[f"score_shuffle_{suffix}"] = float("nan")
+            row[f"score_gap_{suffix}"] = float("nan")
+            row[f"pairwise_win_score_{suffix}"] = False
         rows.append(row)
 
     metrics = aggregate_phase1_metrics(rows, str(out), "phase0_ar_pixel_direct_eval")
@@ -338,6 +482,17 @@ def main() -> None:
         "metric_source": "direct_eval_on_phase1_manifest",
         "window_manifest_hash": manifest_hash,
         "phase0_compatible": True,
+        "negative_eval_types": negative_eval_types,
+        "default_negative_type": default_negative_type,
+        "temporal_shift_max": args.temporal_shift_max,
+        "action_noise_std": args.action_noise_std,
+        # Alias: summary scripts read rft_reward_gap_mean; aggregate_phase1_metrics
+        # stores the mean under plain "rft_reward_gap" (in scalar_keys).
+        "rft_reward_gap_mean": metrics.get("rft_reward_gap", float("nan")),
+        # Phase0 has no ActionFutureScorer — set explicitly to NaN for consistency.
+        "pairwise_acc_score": float("nan"),
+        "score_gap_mean":     float("nan"),
+        "score_gap_min":      float("nan"),
     })
     (out / "aggregate_metrics.json").write_text(
         json.dumps({"condition": "phase0_ar_pixel_direct_eval", "metrics": metrics}, indent=2, allow_nan=True),
@@ -356,6 +511,10 @@ def main() -> None:
         "rollout_mode": "phase0 AR-Pixel single_pass on Phase1 manifest",
         "decode_chunk_size": args.decode_chunk_size,
         "phase0_compatible": True,
+        "negative_eval_types": negative_eval_types,
+        "default_negative_type": default_negative_type,
+        "temporal_shift_max": args.temporal_shift_max,
+        "action_noise_std": args.action_noise_std,
     }
     (out / "eval_protocol_config.json").write_text(json.dumps(protocol, indent=2, ensure_ascii=False), encoding="utf-8")
     (out / "config_used.json").write_text(json.dumps({"condition": "phase0_ar_pixel_direct_eval", "eval_protocol": protocol}, indent=2), encoding="utf-8")

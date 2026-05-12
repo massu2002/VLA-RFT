@@ -1164,6 +1164,7 @@ class RayVLARFTGRPOTrainer(RayPPOTrainer):
             processor_list = self.actor_rollout_wg.get_processor()
             processor = processor_list[0]
         action_tokenizer = ActionTokenizer(processor.tokenizer)
+        _wm_history_length = int(self.config.data.video.get("wm_history_length", 0))
         batch_transform = RLDSBatchTransform_V1(
             action_tokenizer,
             processor.tokenizer,
@@ -1172,7 +1173,8 @@ class RayVLARFTGRPOTrainer(RayPPOTrainer):
             use_wrist_image=False,
             use_proprio=True,
             use_minivla=True,
-            use_raw_image=self.config.data.use_raw_image
+            use_raw_image=self.config.data.use_raw_image,
+            wm_history_length=_wm_history_length,
         )
         self.train_dataset = RLDSDataset(
             config.dataset_path,
@@ -1181,6 +1183,7 @@ class RayVLARFTGRPOTrainer(RayPPOTrainer):
             resize_resolution=tuple(config.resolution),
             shuffle_buffer_size=self.config.data.shuffle_buffer_size,
             image_aug=self.config.data.image_aug,
+            wm_history_length=_wm_history_length,
         )
         collator = PaddedCollatorForActionPrediction(
             processor.tokenizer.model_max_length, processor.tokenizer.pad_token_id, padding_side="right"
@@ -1568,6 +1571,7 @@ class RayVLARFTGRPOTrainer(RayPPOTrainer):
                 actor_labels = batch['labels']
                 gt_actions = batch['actions']  
                 raw_pixel_values = batch['raw_pixel_values']
+                wm_raw_pixel_values = batch.get('wm_raw_pixel_values', None)
                 # breakpoint()
                 actor_batch = DataProto.from_single_dict({
                     "pixels": pixel_values, 
@@ -1578,8 +1582,9 @@ class RayVLARFTGRPOTrainer(RayPPOTrainer):
                     "gt_actions": gt_actions
                 })
 
+                _wm_pixels = wm_raw_pixel_values if wm_raw_pixel_values is not None else raw_pixel_values
                 wm_batch = DataProto.from_single_dict({
-                    "pixels": raw_pixel_values
+                    "pixels": _wm_pixels
                 })
                 
                 if self.config.world_model_rollout.rollout.w_gt_ac:
@@ -1654,6 +1659,12 @@ class RayVLARFTGRPOTrainer(RayPPOTrainer):
                                     self.config.trainer.loss_weight,
                                     resolve=True,
                                 )
+                                if "world_reward" in self.config:
+                                    wm_batch.meta_info["world_reward"] = OmegaConf.to_container(
+                                        self.config.world_reward,
+                                        resolve=True,
+                                    )
+                                wm_batch.meta_info["wm_history_length"] = int(self.config.data.video.get("wm_history_length", 0))
                                 phase1_output = self.tokenizer_wg.phase1_residual_reward(wm_batch)
                                 phase1_loss = phase1_output.batch["loss"]
 

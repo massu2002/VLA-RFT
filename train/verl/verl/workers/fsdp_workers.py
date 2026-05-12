@@ -2236,6 +2236,8 @@ class TokenizerWorker(Worker):
         self.psnr = piqa.PSNR(epsilon=1e-08, value_range=1.0, reduction='none').to(device)
         self.ssim = piqa.SSIM(window_size=11, sigma=1.5, n_channels=3, reduction='none').to(device)
         self.phase1_residual_wm = None
+        self.phase1_residual_model_generation = "v1"
+        self._phase1_v4_reward_logged = False
         phase1_cfg = self.config.get("phase1_residual", {})
         if phase1_cfg.get("enabled", False):
             ckpt = phase1_cfg.get("checkpoint", None)
@@ -2245,17 +2247,33 @@ class TokenizerWorker(Worker):
                 raise FileNotFoundError(f"Phase1 residual world model checkpoint not found: {ckpt}")
             dtype_name = str(phase1_cfg.get("dtype", "bfloat16"))
             dtype = torch.bfloat16 if dtype_name in ("bf16", "bfloat16") else torch.float32
-            from worldmodel.residual_worldmodel.pixel_residual_model import PixelResidualWorldModel
-            self.phase1_residual_wm = PixelResidualWorldModel.load_pretrained(
-                ckpt,
-                torch_dtype=dtype,
-            ).to(device).eval()
-            expected_mode = phase1_cfg.get("target_mode", None)
-            if expected_mode and self.phase1_residual_wm.cfg.target_mode != expected_mode:
-                raise ValueError(
-                    f"Phase1 WM target_mode mismatch: config={expected_mode} "
-                    f"checkpoint={self.phase1_residual_wm.cfg.target_mode}"
+            model_gen = phase1_cfg.get("model_generation", "v1")
+            self.phase1_residual_model_generation = model_gen
+            self._phase1_v4_reward_logged = False
+
+            if model_gen == "v4":
+                from worldmodel.residual_worldmodel.rft_inference import load_v4_world_model
+                self.phase1_residual_wm = load_v4_world_model(
+                    ckpt, torch_dtype=dtype, device=device
                 )
+                expected_mode = phase1_cfg.get("target_mode", None)
+                if expected_mode and self.phase1_residual_wm.cfg.target_mode != expected_mode:
+                    raise ValueError(
+                        f"Phase1 v4 WM target_mode mismatch: config={expected_mode} "
+                        f"checkpoint={self.phase1_residual_wm.cfg.target_mode}"
+                    )
+            else:
+                from worldmodel.residual_worldmodel.pixel_residual_model import PixelResidualWorldModel
+                self.phase1_residual_wm = PixelResidualWorldModel.load_pretrained(
+                    ckpt,
+                    torch_dtype=dtype,
+                ).to(device).eval()
+                expected_mode = phase1_cfg.get("target_mode", None)
+                if expected_mode and self.phase1_residual_wm.cfg.target_mode != expected_mode:
+                    raise ValueError(
+                        f"Phase1 WM target_mode mismatch: config={expected_mode} "
+                        f"checkpoint={self.phase1_residual_wm.cfg.target_mode}"
+                    )
         
     @torch.no_grad()
     def _perceptual_loss(self, real, pred):
@@ -2335,9 +2353,81 @@ class TokenizerWorker(Worker):
             raise RuntimeError("Phase1 residual world model is not initialized")
 
         device = torch.cuda.current_device()
-        raw_pixels = data.batch["pixels"].to(device)                 # [B, T, H, W, C] uint8
-        raw_actions = data.batch["predicted_actions"].to(device)     # [B, T or T-1, A]
+        raw_pixels  = data.batch["pixels"].to(device)            # [B, T, H, W, C] uint8
+        raw_actions = data.batch["predicted_actions"].to(device)  # [B, T or T-1, A]
 
+        # ── v4 branch ────────────────────────────────────────────────────────
+        if self.phase1_residual_model_generation == "v4":
+            from worldmodel.residual_worldmodel.rft_inference import (
+                predict_future_with_v4_model, compute_rft_reward,
+            )
+            pixels_f   = raw_pixels.permute(0, 1, 4, 2, 3).float() / 255.0  # [B,T,C,H,W]
+            K_max      = int(data.meta_info.get("wm_history_length", 0))
+            K          = int(self.phase1_residual_wm.cfg.history_length)
+            action_dim = int(self.phase1_residual_wm.cfg.action_dim)
+
+            if K_max > 0:
+                # pixels_f layout: [hist×K_max | context | current | future×H]
+                # context slot at index K_max is ignored by the model.
+                hist_start     = K_max - K
+                history_images = pixels_f[:, hist_start:K_max]              # [B, K, C, H, W]
+                current_image  = pixels_f[:, K_max + 1]                     # [B, C, H, W]
+                H              = min(pixels_f.shape[1] - (K_max + 2), raw_actions.shape[1])
+                actions        = self._align_phase1_actions(raw_actions[:, :H], action_dim)
+                target_images  = pixels_f[:, K_max+2 : K_max+2+H].to(torch.float32)  # [B,H,C,H,W]
+            else:
+                history_images = None
+                current_image  = pixels_f[:, 0]                             # [B, C, H, W]
+                H              = min(pixels_f.shape[1] - 1, raw_actions.shape[1])
+                actions        = self._align_phase1_actions(raw_actions[:, :H], action_dim)
+                target_images  = pixels_f[:, 1:1+H].to(torch.float32)      # [B,H,C,H,W]
+
+            out           = predict_future_with_v4_model(
+                self.phase1_residual_wm, current_image, actions,
+                history_images=history_images, horizon=H,
+            )
+            pred_future   = out["pred_future"]         # [B,H,C,H,W]
+            ranking_score = out.get("ranking_score")   # [B] or None
+
+            # world_reward config は ray_trainer が meta_info["world_reward"] に詰めて渡す
+            wr = data.meta_info.get("world_reward", {})
+            reward_out = compute_rft_reward(
+                pred_future,
+                target_images=target_images,
+                ranking_score=ranking_score,
+                reward_type=wr.get("type", None),
+                alpha=wr.get("rank_alpha", None),
+                beta=wr.get("rank_beta", None),
+                normalize_rank=wr.get("normalize_rank", None),
+                clip_rank=wr.get("clip_rank", None),
+                rank_clip_value=wr.get("clip_value", None),
+            )
+
+            # 初回のみ有効報酬タイプをログ出力（string は DataProto に入れられないため）
+            if not self._phase1_v4_reward_logged:
+                print(
+                    f"[Phase1 v4 reward] requested={wr.get('type', 'env-default')} "
+                    f"effective={reward_out['reward_type']} "
+                    f"ranking_score_available={ranking_score is not None}",
+                    flush=True,
+                )
+                self._phase1_v4_reward_logged = True
+
+            # DataProto には tensor のみ。None は条件付きで追加。
+            tensors = {
+                "loss":   -reward_out["reward"],
+                "reward":  reward_out["reward"],
+            }
+            if reward_out["visual_reward"] is not None:
+                tensors["visual_reward"]   = reward_out["visual_reward"]
+            if reward_out["rank_score_raw"] is not None:
+                tensors["ranking_score"]   = reward_out["rank_score_raw"]
+            if reward_out["rank_score_norm"] is not None:
+                tensors["rank_score_norm"] = reward_out["rank_score_norm"]
+
+            return DataProto.from_dict(tensors=tensors).to("cpu")
+
+        # ── 既存 v3/v1 branch（変更なし）─────────────────────────────────────
         pixels_f = raw_pixels.permute(0, 1, 4, 2, 3).float() / 255.0
         first_frame = pixels_f[:, 0:1]
         pixels_w_ctx = torch.cat([first_frame, pixels_f], dim=1)     # [B, T+1, C, H, W]

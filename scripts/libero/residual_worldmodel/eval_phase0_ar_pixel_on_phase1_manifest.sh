@@ -15,11 +15,15 @@ WINDOW_MANIFEST="${WINDOW_MANIFEST:?'WINDOW_MANIFEST is required'}"
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/results/phase1/residual_worldmodel/phase0_ar_pixel_direct_eval}"
 LIBERO_DATA_ROOT="${LIBERO_DATA_ROOT:-$(default_libero_data_root)}"
 EVAL_HORIZON="${EVAL_HORIZON:-7}"
-DECODE_CHUNK_SIZE="${DECODE_CHUNK_SIZE:-2}"
+DECODE_CHUNK_SIZE="${DECODE_CHUNK_SIZE:-7}"
 DEVICE="${DEVICE:-auto}"
-VENV_NAME="${VENV_NAME:-.venv5090_eval}"
+VENV_NAME="${VENV_NAME:-.venv}"
 SMOKE="${SMOKE:-0}"
 DRY_RUN="${DRY_RUN:-0}"
+SEED="${SEED:-42}"
+NEGATIVE_EVAL_TYPES="${NEGATIVE_EVAL_TYPES:-same_phase,temporal_shift,action_noise,mixed}"
+TEMPORAL_SHIFT_MAX="${TEMPORAL_SHIFT_MAX:-3}"
+ACTION_NOISE_STD="${ACTION_NOISE_STD:-0.15}"
 
 mkdir -p "${OUTPUT_DIR}"
 setup_env
@@ -37,6 +41,10 @@ CMD=(
   --eval-horizon "${EVAL_HORIZON}"
   --decode-chunk-size "${DECODE_CHUNK_SIZE}"
   --device "${DEVICE}"
+  --seed "${SEED}"
+  --negative-eval-types "${NEGATIVE_EVAL_TYPES}"
+  --temporal-shift-max "${TEMPORAL_SHIFT_MAX}"
+  --action-noise-std "${ACTION_NOISE_STD}"
 )
 
 if [ -n "${PHASE0_AR_PIXEL_CONFIG}" ]; then
