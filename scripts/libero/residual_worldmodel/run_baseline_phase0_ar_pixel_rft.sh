@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # run_baseline_phase0_ar_pixel_rft.sh — RFT using phase0 token WM (AR-Pixel) as reward.
 #
-# Uses the existing token world model (checkpoints/libero/WorldModel/${TASK_SUITE})
+# Uses the existing token world model checkpoint
+# (checkpoints/libero/WorldModel/${TASK_SUITE}/20260429_worldmodel_scratch/checkpoint-150000)
 # as the reward model for GRPO training. This serves as the baseline comparison
 # against v4 WM-based RFT.
 # Saves to checkpoints/libero/TemporalQueryResidualWM-RFT/baseline_phase0_ar_pixel/...
@@ -11,13 +12,14 @@
 #     bash scripts/libero/residual_worldmodel/run_baseline_phase0_ar_pixel_rft.sh
 #
 #   # Specify a particular checkpoint step:
-#   TOKEN_WM_PATH=checkpoints/libero/WorldModel/spatial/checkpoint-150000 \
+#   TOKEN_WM_PATH=checkpoints/libero/WorldModel/spatial/20260429_worldmodel_scratch/checkpoint-150000 \
 #   TASK_SUITE=spatial \
 #     bash scripts/libero/residual_worldmodel/run_baseline_phase0_ar_pixel_rft.sh
 #
 # Key env vars:
 #   TASK_SUITE       spatial | object | goal | 10 (default: spatial)
-#   TOKEN_WM_PATH    Path to token WM dir (default: checkpoints/libero/WorldModel/${TASK_SUITE})
+#   TOKEN_WM_PATH    Path to token WM checkpoint dir
+#                    (default: checkpoints/libero/WorldModel/${TASK_SUITE}/20260429_worldmodel_scratch/checkpoint-150000)
 #   RFT_EXP_NAME     RFT run label (default: baseline_phase0_ar_pixel)
 #   RFT_STEPS        GRPO gradient steps (default: 400)
 #   N_GPUS_PER_NODE  Number of GPUs (default: 8)
@@ -31,7 +33,7 @@ cd "${REPO_ROOT}"
 
 # ── Config ──────────────────────────────────────────────────────────────────
 export TASK_SUITE="${TASK_SUITE:-spatial}"
-TOKEN_WM_PATH="${TOKEN_WM_PATH:-${REPO_ROOT}/checkpoints/libero/WorldModel/${TASK_SUITE}}"
+TOKEN_WM_PATH="${TOKEN_WM_PATH:-${REPO_ROOT}/checkpoints/libero/WorldModel/${TASK_SUITE}/20260429_worldmodel_scratch/checkpoint-150000}"
 RFT_EXP_NAME="${RFT_EXP_NAME:-baseline_phase0_ar_pixel}"
 
 # ── Validate ─────────────────────────────────────────────────────────────────
@@ -39,8 +41,7 @@ if [[ ! -d "${TOKEN_WM_PATH}" ]]; then
     echo "[run_baseline_phase0_ar_pixel_rft] ERROR: TOKEN_WM_PATH not found: ${TOKEN_WM_PATH}" >&2
     echo "  Set TOKEN_WM_PATH to the token WM checkpoint dir." >&2
     echo "  Examples:" >&2
-    echo "    checkpoints/libero/WorldModel/spatial" >&2
-    echo "    checkpoints/libero/WorldModel/spatial/checkpoint-150000" >&2
+    echo "    checkpoints/libero/WorldModel/spatial/20260429_worldmodel_scratch/checkpoint-150000" >&2
     exit 2
 fi
 

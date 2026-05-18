@@ -9,29 +9,56 @@
 #     ${OUT_ROOT}/seed43/
 #     ${OUT_ROOT}/seed44/
 #
+#
 # 使い方:
 #   bash command_eval_aggregate.sh
+#   bash command_eval_aggregate.sh v4_next_exps
+#   bash command_eval_aggregate.sh checkpoints/libero/TemporalQueryResidualWM/v4_next_exps
 #
 # 別ディレクトリを集計する場合:
-#   OUT_ROOT=results/phase1/v4_improved_spatial bash command_eval_aggregate.sh
+#   RUN_NAME=v4_next_exps bash command_eval_aggregate.sh
+#   OUT_ROOT=results/phase1/v4_next_exps bash command_eval_aggregate.sh
 #
 # 特定シードのみで集計する場合:
 #   EVAL_SEEDS="42 43" bash command_eval_aggregate.sh
 # ==============================================================
 
 set -euo pipefail
-cd "$(dirname "$0")"
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+cd "${SCRIPT_DIR}"
+
+TARGET="${1:-}"
 
 # ==============================================================
 # 設定変数
 # ==============================================================
-export RUN_NAME="${RUN_NAME:-v4_improved_spatial}"
 export SWEEP_CONFIG="${SWEEP_CONFIG:-configs/libero/phase1/v4_core_sweep.json}"
-export EXP_FILTER="${EXP_FILTER:-v4a_q8_k2_motion,v4b_q8_k2_rank1_motion,v4b_q8_k2_rank2_motion,v4b_q8_k2_rank1_mixedneg}"
-# OUT_ROOT は常に RUN_NAME から計算する（シェル環境変数の引き継ぎを防ぐため）
-# ベースディレクトリを変えたい場合: RESULTS_ROOT=/other/base bash ...
-export OUT_ROOT="${RESULTS_ROOT:-results/phase1}/${RUN_NAME}"
+export EXP_FILTER="${EXP_FILTER:-}"
 export EVAL_SEEDS="${EVAL_SEEDS:-42 43 44}"
+RESULTS_ROOT="${RESULTS_ROOT:-results/phase1}"
+
+# 対象は以下の優先順で決める:
+#   1. 第1引数
+#   2. 明示された OUT_ROOT
+#   3. RUN_NAME
+#   4. 従来デフォルト v4_improved_spatial
+if [ -n "${TARGET}" ]; then
+  if [ -d "${TARGET}/seed42" ] || [[ "${TARGET}" == results/* ]] || [[ "${TARGET}" = /*/results/* ]]; then
+    export OUT_ROOT="${TARGET%/}"
+    export RUN_NAME="${RUN_NAME:-$(basename "${OUT_ROOT}")}"
+  elif [[ "${TARGET}" == checkpoints/* ]] || [[ "${TARGET}" = /*/checkpoints/* ]]; then
+    export RUN_NAME="${RUN_NAME:-$(basename "${TARGET%/}")}"
+    export OUT_ROOT="${OUT_ROOT:-${RESULTS_ROOT}/${RUN_NAME}}"
+  else
+    export RUN_NAME="${RUN_NAME:-${TARGET}}"
+    export OUT_ROOT="${OUT_ROOT:-${RESULTS_ROOT}/${RUN_NAME}}"
+  fi
+else
+  export RUN_NAME="${RUN_NAME:-${OUT_ROOT:+$(basename "${OUT_ROOT}")}}"
+  export RUN_NAME="${RUN_NAME:-v4_improved_spatial}"
+  export OUT_ROOT="${OUT_ROOT:-${RESULTS_ROOT}/${RUN_NAME}}"
+fi
 
 # ==============================================================
 # 設定確認ログ

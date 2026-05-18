@@ -1,54 +1,40 @@
 #!/usr/bin/env bash
-# run_v4_core_sweep.sh — Phase 1 v4 core sweep orchestrator.
+# run_dynquery_core_sweep.sh — DynQueryWorldModel core sweep orchestrator.
 #
-# Reads SWEEP_CONFIG (JSON), iterates enabled experiments, and dispatches
-# each to the backend runner with full env-var injection.
+# Reads SWEEP_CONFIG (JSON), iterates enabled experiments, dispatches each
+# to the backend runner with full env-var injection.
 #
 # Usage:
-#   SWEEP_CONFIG=configs/libero/phase1/v4_core_sweep.json \
-#   TASK_SUITE=spatial \
-#   RUN_NAME=v4_core_sweep_spatial \
-#   MODE=train_eval \
-#     bash scripts/libero/phase1/run_v4_core_sweep.sh
+#   TASK_SUITE=spatial RUN_NAME=DynQueryWorldModel_core_sweep MODE=train_only \
+#     bash scripts/libero/phase1/run_dynquery_core_sweep.sh
 #
 # Examples:
-#
 #   # Dry run — print all planned commands without executing
-#   DRY_RUN=1 TASK_SUITE=spatial RUN_NAME=v4_core_sweep_spatial \
-#     bash scripts/libero/phase1/run_v4_core_sweep.sh
+#   DRY_RUN=1 TASK_SUITE=spatial \
+#     bash scripts/libero/phase1/run_dynquery_core_sweep.sh
 #
-#   # Smoke test — tiny steps/windows, fast verification
-#   SMOKE=1 TASK_SUITE=spatial RUN_NAME=v4_core_sweep_smoke \
-#     bash scripts/libero/phase1/run_v4_core_sweep.sh
+#   # Smoke test — tiny steps/windows
+#   SMOKE=1 TASK_SUITE=spatial \
+#     bash scripts/libero/phase1/run_dynquery_core_sweep.sh
 #
-#   # Distributed: 4-way split, this node handles experiments 0,4,8
-#   NUM_NODES=4 NODE_INDEX=0 TASK_SUITE=spatial RUN_NAME=v4_core_sweep_spatial \
-#     bash scripts/libero/phase1/run_v4_core_sweep.sh
+#   # Single condition
+#   EXP_FILTER=dq_full_rank1 TASK_SUITE=spatial \
+#     bash scripts/libero/phase1/run_dynquery_core_sweep.sh
 #
-#   # Eval only (after training has completed)
-#   MODE=eval_only TASK_SUITE=spatial RUN_NAME=v4_core_sweep_spatial \
-#     bash scripts/libero/phase1/run_v4_core_sweep.sh
-#
-#   # Summarize results
-#   RUN_NAME=v4_core_sweep_spatial \
-#     bash scripts/libero/phase1/summarize_v4_core_sweep.sh
+#   # Eval only (after training)
+#   MODE=eval_only TASK_SUITE=spatial \
+#     bash scripts/libero/phase1/run_dynquery_core_sweep.sh
 #
 # Key env-var overrides:
-#   SWEEP_CONFIG      path to JSON config  (default: configs/libero/phase1/v4_core_sweep.json)
-#   TASK_SUITE        spatial | object | goal | 10
-#   RUN_NAME          unique name for this sweep run
-#   MODE              train_only | eval_only | train_eval | rft_only | all
-#   OUT_ROOT          results root  (default: results/phase1/residual_worldmodel/${RUN_NAME})
-#   CKPT_ROOT         checkpoint root
-#   NUM_NODES         total number of parallel nodes
-#   NODE_INDEX        0-based index of this node
-#   DRY_RUN           1 = print commands only, do not execute
-#   SMOKE             1 = reduced steps/windows for fast verification
-#   SKIP_EXISTING     1 = skip conditions whose checkpoint/eval already exists (default: 1)
-#   OVERWRITE         1 = re-run even if outputs exist (overrides SKIP_EXISTING)
-#   STOP_ON_FAIL      1 = abort sweep on first failure
-#   EXP_FILTER        comma-separated exp_names to run (empty = all enabled)
-#   GPU_IDS           comma-separated GPU indices or "auto"
+#   SWEEP_CONFIG   path to JSON   (default: configs/libero/phase1/dynquery_core_sweep.json)
+#   TASK_SUITE     spatial | object | goal | 10
+#   RUN_NAME       unique name for this sweep run
+#   MODE           train_only | eval_only | train_eval
+#   CKPT_ROOT      checkpoint root  (default: checkpoints/libero/DynQueryWorldModel/core_sweep)
+#   OUT_ROOT       results root     (default: results/phase1/DynQueryWorldModel_core_sweep)
+#   EXP_FILTER     comma-separated exp_names to run (empty = all)
+#   DRY_RUN, SMOKE, SKIP_EXISTING, OVERWRITE, STOP_ON_FAIL
+#   NUM_NODES, NODE_INDEX   for distributed scheduling across nodes
 
 set -euo pipefail
 
@@ -59,53 +45,39 @@ WM_SCRIPTS="${SCRIPT_DIR}/../residual_worldmodel"
 source "${WM_SCRIPTS}/common.sh"
 
 is_true() { case "${1:-}" in 1|true|TRUE|True|yes|YES) return 0 ;; *) return 1 ;; esac; }
-log()     { echo "[v4-core-sweep] $(date +%H:%M:%S) $*"; }
-die()     { echo "[v4-core-sweep] ERROR: $*" >&2; exit 1; }
+log()     { echo "[dynquery-core-sweep] $(date +%H:%M:%S) $*"; }
+die()     { echo "[dynquery-core-sweep] ERROR: $*" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-SWEEP_CONFIG="${SWEEP_CONFIG:-${REPO_ROOT}/configs/libero/phase1/v4_core_sweep.json}"
+SWEEP_CONFIG="${SWEEP_CONFIG:-${REPO_ROOT}/configs/libero/phase1/dynquery_core_sweep.json}"
 TASK_SUITE="${TASK_SUITE:-spatial}"
-RUN_NAME="${RUN_NAME:-v4_core_sweep_$(timestamp)_${TASK_SUITE}}"
-MODE="${MODE:-train_eval}"
+RUN_NAME="${RUN_NAME:-DynQueryWorldModel_core_sweep}"
+MODE="${MODE:-train_only}"
 SEED="${SEED:-42}"
-NUM_NODES="${NUM_NODES:-${NUM_PCS:-${SHARD_COUNT:-1}}}"
-NODE_INDEX="${NODE_INDEX:-${PC_INDEX:-${SHARD_INDEX:-0}}}"
+NUM_NODES="${NUM_NODES:-1}"
+NODE_INDEX="${NODE_INDEX:-0}"
 GPU_IDS="${GPU_IDS:-auto}"
 DRY_RUN="${DRY_RUN:-0}"
 SMOKE="${SMOKE:-0}"
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
 OVERWRITE="${OVERWRITE:-0}"
 STOP_ON_FAIL="${STOP_ON_FAIL:-0}"
-EXP_FILTER="${EXP_FILTER:-}"   # comma-separated exp_names to run; empty = all
+EXP_FILTER="${EXP_FILTER:-}"
 
-CKPT_ROOT="${CKPT_ROOT:-${REPO_ROOT}/checkpoints/libero/TemporalQueryResidualWM/${RUN_NAME}}"
-OUT_ROOT="${OUT_ROOT:-${REPO_ROOT}/results/phase1/residual_worldmodel/${RUN_NAME}}"
+CKPT_ROOT="${CKPT_ROOT:-${REPO_ROOT}/checkpoints/libero/DynQueryWorldModel/core_sweep}"
+OUT_ROOT="${OUT_ROOT:-${REPO_ROOT}/results/phase1/DynQueryWorldModel_core_sweep}"
 LOG_ROOT="${LOG_ROOT:-${OUT_ROOT}/logs/node${NODE_INDEX}_of_${NUM_NODES}}"
 MANIFEST="${OUT_ROOT}/sweep_manifest_node${NODE_INDEX}_of_${NUM_NODES}.tsv"
 
-# Shared window manifest: all eval conditions reuse the same set of windows
-# for fair comparison. Populated after the first condition completes.
-# Can also be pre-set via SHARED_WINDOW_MANIFEST env var.
 SHARED_WINDOW_MANIFEST="${SHARED_WINDOW_MANIFEST:-}"
-# If a prior run already generated a manifest for the first condition, reuse it.
-if [ -z "${SHARED_WINDOW_MANIFEST}" ] && [ -n "${EXP_FILTER}" ] && [ "${OVERWRITE:-0}" != "1" ]; then
-  _first_exp="$(echo "${EXP_FILTER}" | tr ',' '\n' | head -1 | tr -d ' ')"
-  _candidate="${OUT_ROOT}/${_first_exp}/window_manifest.json"
-  if [ -f "${_candidate}" ]; then
-    SHARED_WINDOW_MANIFEST="${_candidate}"
-    log "Pre-existing shared manifest found from ${_first_exp}: ${SHARED_WINDOW_MANIFEST}"
-  fi
-fi
 
-# Validate
 [ -f "${SWEEP_CONFIG}" ] || die "SWEEP_CONFIG not found: ${SWEEP_CONFIG}"
 python3 -c "import json; json.load(open('${SWEEP_CONFIG}'))" \
   || die "SWEEP_CONFIG is not valid JSON: ${SWEEP_CONFIG}"
 
 mkdir -p "${OUT_ROOT}" "${LOG_ROOT}"
-printf '%s\n' "${OUT_ROOT}" > "${REPO_ROOT}/results/phase1/latest.txt"
 
 # GPU detection
 auto_gpu_ids() {
@@ -126,12 +98,16 @@ LOCAL_NPROC="${#GPU_ARRAY[@]}"
 setup_env
 
 # ---------------------------------------------------------------------------
-# Emit experiment list from config via Python
+# Emit experiment list from JSON via Python
+# Columns (pipe-separated):
+#   exp_name|stage|history_length|num_dynamic_queries|
+#   use_action_conditioned_mask|predictor_mode|use_dynamic_residual_gate|
+#   lambda_mask_dynamic|lambda_query_delta_sparse|
+#   use_motion_bias|use_action_future_scorer|lambda_rank|rank_margin|rank_temperature|
+#   negative_type|negative_mix|
+#   lambda_image|lambda_dynamic|lambda_static|lambda_query|
+#   max_steps|init_from_checkpoint
 # ---------------------------------------------------------------------------
-# Output: TSV with columns:
-# exp_name|stage|history_length|num_dynamic_queries|use_motion_bias|
-# use_action_future_scorer|lambda_rank|rank_margin|rank_temperature|negative_type|negative_mix|
-# lambda_image|lambda_dynamic|lambda_static|lambda_query|lambda_sparse
 JOBS_TSV="$(python3 - <<PYEOF
 import json, sys
 
@@ -157,21 +133,25 @@ for exp in cfg.get("experiments", []):
 
     parts = [
         get("exp_name"),
-        get("stage", "v4b"),
+        get("stage", "dq_b"),
         get("history_length", 2),
         get("num_dynamic_queries", 8),
-        get("use_motion_bias", 0),
+        get("use_action_conditioned_mask", 1),
+        get("predictor_mode", "query_wise"),
+        get("use_dynamic_residual_gate", 1),
+        get("lambda_mask_dynamic", 0.1),
+        get("lambda_query_delta_sparse", 0.001),
+        get("use_motion_bias", 1),
         get("use_action_future_scorer", 1),
         get("lambda_rank", 1.0),
         get("rank_margin", 0.1),
         get("rank_temperature", 0.07),
-        get("negative_type", "same_task_other_window"),
+        get("negative_type", "mixed"),
         get("negative_mix", ""),
         get("lambda_image", 0.1),
         get("lambda_dynamic", 1.0),
         get("lambda_static", 0.2),
         get("lambda_query", 0.5),
-        get("lambda_sparse", 0.01),
         get("max_steps", 150000),
         get("init_from_checkpoint", ""),
     ]
@@ -186,7 +166,7 @@ fi
 
 TOTAL_JOBS=$(echo "${JOBS_TSV}" | wc -l)
 
-log "=== Phase 1 v4 core sweep ==="
+log "=== DynQuery core sweep ==="
 log "config     : ${SWEEP_CONFIG}"
 log "task_suite : ${TASK_SUITE}"
 log "run_name   : ${RUN_NAME}"
@@ -198,31 +178,28 @@ log "skip_exist : ${SKIP_EXISTING}  overwrite: ${OVERWRITE}  dry_run: ${DRY_RUN}
 log "ckpt_root  : ${CKPT_ROOT}"
 log "out_root   : ${OUT_ROOT}"
 
-# Manifest header
 {
-  printf 'job_id\tnode_index\texp_name\tstage\thistory_K\tnum_queries_Q'
-  printf '\tuse_motion_bias\tuse_scorer\tlambda_rank\tnegative_type\tstatus\tlog\n'
+  printf 'job_id\tnode_index\texp_name\tstage\tK\tQ\tact_cond\tpred_mode\tgate\tscorer\tlambda_rank\tneg_type\tstatus\tlog\n'
 } > "${MANIFEST}"
 
-# DRY_RUN: show plan only
 if is_true "${DRY_RUN}"; then
   log ""
   log "DRY_RUN plan (this node would run):"
-  log "  run knobs: MODE=${MODE} MAX_STEPS=${MAX_STEPS:-150000} BATCH_SIZE=${BATCH_SIZE:-1} WORLD_MODEL_BATCH_SIZE=${WORLD_MODEL_BATCH_SIZE:-16} LR=${LR:-5e-5}"
-  log "  ckpt root: ${CKPT_ROOT}/${TASK_SUITE}/<EXP_NAME>/s${SEED}"
-  log "  out root : ${OUT_ROOT}/<EXP_NAME>"
   job_id=0
-  while IFS='|' read -r exp stage hist_k num_q motion scorer lr_val margin rank_temp neg_type neg_mix \
-                          li ld ls lq lsp max_steps_exp init_ckpt; do
+  while IFS='|' read -r exp stage hist_k num_q act_cond pred_mode gate \
+                          lmd lqds motion scorer lr_val margin rank_temp \
+                          neg_type neg_mix li ld ls lq max_steps_exp init_ckpt; do
     if [ $((job_id % NUM_NODES)) -eq "${NODE_INDEX}" ]; then
-      log "  job=${job_id}  ${exp}  (stage=${stage} K=${hist_k} Q=${num_q} motion=${motion} scorer=${scorer} lambda_rank=${lr_val} rank_temp=${rank_temp} neg=${neg_type} neg_mix=${neg_mix:-none} max_steps=${max_steps_exp}${init_ckpt:+ init=${init_ckpt}})"
-      log "       save=${CKPT_ROOT}/${TASK_SUITE}/${exp}/s${SEED}  eval=${OUT_ROOT}/${exp}"
+      log "  job=${job_id}  ${exp}  (stage=${stage} K=${hist_k} Q=${num_q})"
+      log "       Core1=${act_cond} Core2=${pred_mode} Core3=${gate} λ_mask_dyn=${lmd} λ_q_delta=${lqds}"
+      log "       motion=${motion} scorer=${scorer} λ_rank=${lr_val} neg=${neg_type} max_steps=${max_steps_exp}"
+      [ -n "${init_ckpt}" ] && log "       init_ckpt=${init_ckpt}"
+      log "       ckpt=${CKPT_ROOT}/${TASK_SUITE}/${exp}/s${SEED}  eval=${OUT_ROOT}/${exp}"
     fi
     job_id=$((job_id + 1))
   done <<< "${JOBS_TSV}"
   log ""
   log "  Set DRY_RUN=0 to execute."
-  log "  Set MODE=train_only|eval_only|train_eval|rft_only|all"
   exit 0
 fi
 
@@ -233,8 +210,9 @@ job_id=0
 fail_count=0
 success_count=0
 
-while IFS='|' read -r exp stage hist_k num_q motion scorer lr_val margin rank_temp neg_type neg_mix \
-                        li ld ls lq lsp max_steps_exp init_ckpt; do
+while IFS='|' read -r exp stage hist_k num_q act_cond pred_mode gate \
+                        lmd lqds motion scorer lr_val margin rank_temp \
+                        neg_type neg_mix li ld ls lq max_steps_exp init_ckpt; do
   current_id="${job_id}"
   job_id=$((job_id + 1))
 
@@ -244,23 +222,19 @@ while IFS='|' read -r exp stage hist_k num_q motion scorer lr_val margin rank_te
 
   log "──────────────────────────────────────────────────────────────"
   log "START job=${current_id}  ${exp}"
-  log "  stage=${stage}  K=${hist_k}  Q=${num_q}  motion=${motion}  scorer=${scorer}"
-  log "  lambda_rank=${lr_val}  negative_type=${neg_type}  max_steps=${max_steps_exp}"
-  [ -n "${init_ckpt}" ] && log "  init_from_checkpoint=${init_ckpt}"
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\trunning\t%s\n' \
+  log "  stage=${stage}  K=${hist_k}  Q=${num_q}"
+  log "  Core1(act_cond)=${act_cond}  Core2(pred)=${pred_mode}  Core3(gate)=${gate}"
+  log "  λ_mask_dyn=${lmd}  λ_q_delta=${lqds}  motion=${motion}  scorer=${scorer}  λ_rank=${lr_val}"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\trunning\t%s\n' \
     "${current_id}" "${NODE_INDEX}" "${exp}" "${stage}" "${hist_k}" "${num_q}" \
-    "${motion}" "${scorer}" "${lr_val}" "${neg_type}" \
+    "${act_cond}" "${pred_mode}" "${gate}" "${scorer}" "${lr_val}" "${neg_type}" \
     "${LOG_ROOT}/${exp}.log" >> "${MANIFEST}"
 
   log_file="${LOG_ROOT}/${exp}.log"
 
-  # Determine whether to reuse a shared manifest for this condition
-  _use_manifest=0
-  _manifest_path=""
+  _use_manifest=0; _manifest_path=""
   if [ -n "${SHARED_WINDOW_MANIFEST}" ] && [ -f "${SHARED_WINDOW_MANIFEST}" ]; then
-    _use_manifest=1
-    _manifest_path="${SHARED_WINDOW_MANIFEST}"
-    log "  → reusing shared manifest: ${_manifest_path}"
+    _use_manifest=1; _manifest_path="${SHARED_WINDOW_MANIFEST}"
   fi
 
   set +e
@@ -271,6 +245,11 @@ while IFS='|' read -r exp stage hist_k num_q motion scorer lr_val margin rank_te
     export STAGE="${stage}"
     export HISTORY_LENGTH="${hist_k}"
     export NUM_DYNAMIC_QUERIES="${num_q}"
+    export USE_ACTION_CONDITIONED_MASK="${act_cond}"
+    export PREDICTOR_MODE="${pred_mode}"
+    export USE_DYNAMIC_RESIDUAL_GATE="${gate}"
+    export LAMBDA_MASK_DYNAMIC="${lmd}"
+    export LAMBDA_QUERY_DELTA_SPARSE="${lqds}"
     export USE_MOTION_BIAS="${motion}"
     export USE_ACTION_FUTURE_SCORER="${scorer}"
     export LAMBDA_RANK="${lr_val}"
@@ -282,8 +261,6 @@ while IFS='|' read -r exp stage hist_k num_q motion scorer lr_val margin rank_te
     export LAMBDA_DYNAMIC="${ld}"
     export LAMBDA_STATIC="${ls}"
     export LAMBDA_QUERY="${lq}"
-    export LAMBDA_SPARSE="${lsp}"
-    # Per-experiment overrides (from JSON)
     export MAX_STEPS="${max_steps_exp:-${MAX_STEPS:-150000}}"
     export INIT_FROM_CHECKPOINT="${init_ckpt:-}"
     export TASK_SUITE
@@ -311,15 +288,17 @@ while IFS='|' read -r exp stage hist_k num_q motion scorer lr_val margin rank_te
     export SAVE_DEBUG_VISUALS="${SAVE_DEBUG_VISUALS:-0}"
     export USE_WINDOW_MANIFEST="${_use_manifest}"
     export WINDOW_MANIFEST="${_manifest_path}"
-    # Passthrough training knobs
-    export MAX_STEPS="${MAX_STEPS:-150000}"
-    export LR="${LR:-5e-5}"
+    export LR="${LR:-1e-4}"
     export PRECISION="${PRECISION:-bf16}"
     export LR_SCHEDULER="${LR_SCHEDULER:-constant}"
     export WARMUP_RATIO="${WARMUP_RATIO:-0.0}"
-    export WORLD_MODEL_BATCH_SIZE="${WORLD_MODEL_BATCH_SIZE:-16}"
-    export BATCH_SIZE="${BATCH_SIZE:-1}"
-    bash "${WM_SCRIPTS}/run_v4_core_sweep.sh"
+    export BATCH_SIZE="${BATCH_SIZE:-8}"
+    export WORLD_MODEL_BATCH_SIZE="${WORLD_MODEL_BATCH_SIZE:-64}"
+    export SAVE_STEPS="${SAVE_STEPS:-10000}"
+    export SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-2}"
+    export LOGGING_STEPS="${LOGGING_STEPS:-20}"
+    export TF32="${TF32:-1}"
+    bash "${WM_SCRIPTS}/run_dynquery_core_sweep.sh"
   ) 2>&1 | tee "${log_file}"
   rc="${PIPESTATUS[0]}"
   set -e
@@ -327,7 +306,6 @@ while IFS='|' read -r exp stage hist_k num_q motion scorer lr_val margin rank_te
   if [ "${rc}" -eq 0 ]; then
     log "DONE job=${current_id}: ${exp}"
     success_count=$((success_count + 1))
-    # Capture manifest from first successful eval to share with remaining conditions
     if [ -z "${SHARED_WINDOW_MANIFEST}" ]; then
       _new_manifest="${OUT_ROOT}/${exp}/window_manifest.json"
       if [ -f "${_new_manifest}" ]; then
@@ -348,9 +326,8 @@ log "manifest : ${MANIFEST}"
 log "results  : ${OUT_ROOT}"
 log ""
 log "Next steps:"
-log "  Summarize:        RUN_NAME=${RUN_NAME} bash scripts/libero/phase1/summarize_v4_core_sweep.sh"
-log "  Select best:      RUN_NAME=${RUN_NAME} BEST_CRITERION=hybrid_score bash scripts/libero/residual_worldmodel/select_best_v4_for_rft.sh"
-log "  RFT sweep:        RUN_NAME=${RUN_NAME} bash scripts/libero/phase1/run_v4_selected_rft_sweep.sh"
+log "  Summarize:  RUN_NAME=${RUN_NAME} bash scripts/libero/phase1/summarize_v4_core_sweep.sh"
+log "  RFT:        best checkpoint → command_train_rft.sh"
 
 [ "${fail_count}" -gt 0 ] && exit 1
 exit 0

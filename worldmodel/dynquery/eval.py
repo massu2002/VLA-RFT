@@ -1,4 +1,4 @@
-"""Evaluation script for TemporalDynamicQueryResidualWM (v4) on LIBERO.
+"""Evaluation script for DynQueryWorldModel on LIBERO.
 
 Outputs (per condition directory):
     aggregate_metrics.json    — aggregated metrics
@@ -22,7 +22,7 @@ Metrics in aggregate_metrics.json:
     Ranking accuracy:
         pairwise_acc_rft         — fraction(rft_reward_correct > rft_reward_shuffled)
         pairwise_acc_score       — fraction(score_correct > score_shuffled)
-                                   v4b only; NaN for v4a (no ActionFutureScorer)
+                                   stage_b only; NaN for stage_a (no ActionFutureScorer)
 
     Ranking gaps:
         rft_reward_gap_mean/min  — correct − shuffled RFT reward
@@ -37,11 +37,11 @@ Metrics in aggregate_metrics.json:
         skipped_history_windows  — windows dropped due to insufficient history
 
 Usage:
-    python -m worldmodel.residual_worldmodel.eval_v4_temporal_query_libero \\
+    python -m worldmodel.dynquery.eval \\
         --task-suite spatial \\
-        --model-dir checkpoints/libero/PixelResidualWM/spatial/temporal_query_residual/v4b/s42/final \\
+        --model-dir checkpoints/libero/dynquery/spatial/stage_b/s42/final \\
         --data-root /localdata/modified_libero_rlds \\
-        --output-dir results/phase1/residual_worldmodel/v4b_spatial
+        --output-dir results/phase1/dynquery/stage_b_spatial
 """
 
 from __future__ import annotations
@@ -61,13 +61,8 @@ import tensorflow_datasets as tfds
 import torch
 
 from ..datasets.libero.data import resolve_dataset_name
-from .models.temporal_query_residual_wm import TemporalDynamicQueryResidualWM
-from .pixel_residual_utils import (
-    aggregate_phase1_metrics,
-    compute_dynamic_mask,
-    get_lpips_fn,
-    motion_center_of_mass,
-)
+from .model import DynQueryWorldModel, compute_dynamic_mask
+from .utils import aggregate_phase1_metrics, get_lpips_fn, motion_center_of_mass
 from ..eval_roi_utils import (
     load_roi_config,
     get_goal_roi_center,
@@ -77,6 +72,7 @@ from ..eval_roi_utils import (
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+
 
 _FALLBACK_TASK_NAMES = {
     "spatial": [
@@ -100,7 +96,7 @@ _FALLBACK_TASK_NAMES = {
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Evaluate TemporalDynamicQueryResidualWM (v4) on LIBERO."
+        description="Evaluate DynQueryWorldModel on LIBERO."
     )
     parser.add_argument("--task-suite",      type=str, required=True,
                         choices=["spatial", "object", "goal", "10"])
@@ -175,13 +171,11 @@ def _mae(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def _mask_entropy_np(mask: torch.Tensor) -> float:
-    """Mean per-query entropy of a [..., Q, N] softmax mask (higher = more uniform)."""
     p = mask.float().clamp(min=1e-9)
     return float(-(p * torch.log(p)).sum(dim=-1).mean().item())
 
 
 def _mask_overlap_np(mask: torch.Tensor) -> float:
-    """Mean off-diagonal pairwise cosine similarity across Q queries in [..., Q, N]."""
     flat = mask.float().reshape(-1, mask.shape[-2], mask.shape[-1])  # [B, Q, N]
     Q = flat.shape[1]
     if Q < 2:
@@ -218,7 +212,7 @@ def _ep_id(path: str) -> str:
 # Window collection with history support
 # ---------------------------------------------------------------------------
 
-def _collect_task_windows_v4(
+def _collect_task_windows(
     episodes: List[Tuple[int, Dict]],
     task_name: str,
     K: int,
@@ -228,23 +222,9 @@ def _collect_task_windows_v4(
     episodes_per_task: int,
     rng: random.Random,
 ) -> List[Tuple[np.ndarray, np.ndarray, Dict]]:
-    """Collect windows including K history frames.
-
-    Window layout [total frames = K+2+H]:
-        imgs[s:s+K]         → history frames
-        imgs[s+K]           → context slot (unused)
-        imgs[s+K+1]         → current frame
-        imgs[s+K+2:s+K+2+H] → future frames
-
-    Action layout [total = K+1+H]:
-        acts[s:s+K+1]       → history+context (skipped by model)
-        acts[s+K+1:s+K+1+H] → prediction horizon
-
-    Args:
-        episodes: Pre-filtered list of (global_idx, ep_dict) for this task only.
-    """
-    seg = K + 2 + H     # total frames per window
-    act_seg = K + 1 + H  # total actions per window
+    """Collect windows including K history frames."""
+    seg = K + 1 + H
+    act_seg = K + H
 
     windows: List[Tuple[np.ndarray, np.ndarray, Dict]] = []
     episodes = list(episodes)
@@ -278,7 +258,6 @@ def _collect_task_windows_v4(
 
         max_start = T_ep - seg
         if window_position_mode == "episode_phases":
-            # Pick one random start from each third of the episode start range.
             e0, e1 = 0,              max(0, max_start // 3)
             m0, m1 = max_start // 3, max(max_start // 3, 2 * max_start // 3)
             l0, l1 = 2 * max_start // 3, max_start
@@ -292,7 +271,6 @@ def _collect_task_windows_v4(
             phase_starts = [("random", s) for s in range(0, max_start + 1, stride)]
 
         used = set()
-        added = 0
         for phase, start in phase_starts:
             if len(windows) >= windows_per_task and window_position_mode != "episode_phases":
                 break
@@ -306,7 +284,7 @@ def _collect_task_windows_v4(
             if pix_win.shape[0] < seg or act_win.shape[0] < act_seg:
                 continue
 
-            current_abs = start + K + 1
+            current_abs = start + K
             windows.append((
                 pix_win, act_win,
                 {
@@ -323,7 +301,6 @@ def _collect_task_windows_v4(
                     "history_length":        K,
                 },
             ))
-            added += 1
             if phase in phase_counts:
                 phase_counts[phase] += 1
 
@@ -335,10 +312,10 @@ def _collect_task_windows_v4(
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def _eval_window_v4(
-    model: TemporalDynamicQueryResidualWM,
-    pixels_np: np.ndarray,    # [K+2+H, H_img, W_img, C] uint8
-    actions_np: np.ndarray,   # [K+1+H, action_dim]
+def _eval_window(
+    model: DynQueryWorldModel,
+    pixels_np: np.ndarray,    # [K+1+H, H_img, W_img, C] uint8
+    actions_np: np.ndarray,   # [K+H, action_dim]
     horizon: int,
     device: torch.device,
     lpips_fn,
@@ -353,20 +330,18 @@ def _eval_window_v4(
 
         out = model.rollout(pixels_t, actions_t, horizon=horizon)
 
-        pred_future     = out["pred_future"][0]           # [H, 3, H_img, W_img]
-        current_img     = out["current_image"][0]         # [3, H_img, W_img]
-        future_gt_t     = out["future_gt"][0]             # [H, 3, H_img, W_img]
-        fuser_masks     = out["fuser_masks"][0]           # [H, Q, N]
-        future_dq       = out["future_dynamic_queries"][0]  # [H, Q, D]
-        dynamic_masks_t = out["dynamic_masks"][0]         # [K+1, Q, N]
+        pred_future     = out["pred_future"][0]
+        current_img     = out["current_image"][0]
+        future_gt_t     = out["future_gt"][0]
+        fuser_masks     = out["fuser_masks"][0]
+        future_dq       = out["future_dynamic_queries"][0]
+        dynamic_masks_t = out["dynamic_masks"][0]
         ranking_score   = out.get("ranking_score")
         if ranking_score is not None:
             ranking_score = ranking_score[0].item()
 
         curr_np = _to_uint8_np(current_img)
 
-        # Horizon-averaged metrics over all H steps — directly matches
-        # phase1_residual_reward = -(LPIPS + MAE) averaged across the horizon.
         _h_lpips, _h_mae, _h_mse, _copy_mse = [], [], [], []
         for _t in range(horizon):
             _pt = _to_uint8_np(pred_future[_t])
@@ -383,33 +358,28 @@ def _eval_window_v4(
         copy_current_horizon_avg_mse = float(np.nanmean(_copy_mse)) if _copy_mse else float("nan")
         horizon_mse_over_copy        = horizon_avg_mse / max(copy_current_horizon_avg_mse, 1e-12)
 
-        # Model internal structure metrics
         fuser_mask_entropy   = _mask_entropy_np(fuser_masks)
         fuser_mask_overlap   = _mask_overlap_np(fuser_masks)
         dynamic_mask_entropy = _mask_entropy_np(dynamic_masks_t)
         dynamic_mask_overlap = _mask_overlap_np(dynamic_masks_t)
         future_dq_norm       = float(future_dq.float().norm(dim=-1).mean().item())
 
-        # score_correct: ActionFutureScorer output (v4b only); NaN for v4a (no scorer)
         score_correct_init = float(ranking_score) if ranking_score is not None else float("nan")
 
         row: Dict = {
             "task_name":                     task_name,
             "window_id":                     window_id,
-            # Reconstruction quality (horizon-averaged, RFT-aligned)
             "horizon_avg_lpips":             horizon_avg_lpips,
             "horizon_avg_mae":               horizon_avg_mae,
             "horizon_avg_mse":               horizon_avg_mse,
             "rft_reward_proxy":              rft_reward_proxy,
             "copy_current_horizon_avg_mse":  copy_current_horizon_avg_mse,
             "horizon_mse_over_copy":         horizon_mse_over_copy,
-            # Model internal structure
             "fuser_mask_entropy":            fuser_mask_entropy,
             "fuser_mask_overlap":            fuser_mask_overlap,
             "dynamic_mask_entropy":          dynamic_mask_entropy,
             "dynamic_mask_overlap":          dynamic_mask_overlap,
             "future_dynamic_query_norm":     future_dq_norm,
-            # Ranking fields (filled in ranking block below)
             "score_correct":                 score_correct_init,
             "score_shuffle":                 float("nan"),
             "score_gap":                     float("nan"),
@@ -533,7 +503,7 @@ def _make_action_noise_action(
     return neg
 
 
-def _make_negative_action_v4(
+def _make_negative_action(
     neg_type: str,
     act_win: np.ndarray,
     task_windows: List[Tuple],
@@ -555,7 +525,7 @@ def _make_negative_action_v4(
     raise ValueError(f"Unknown negative action type: {neg_type}")
 
 
-def _make_action_variants_v4(
+def _make_action_variants(
     act_win: np.ndarray,
     task_windows: List[Tuple],
     local_idx: int,
@@ -585,14 +555,14 @@ def _make_action_variants_v4(
 
 
 # ---------------------------------------------------------------------------
-# Debug visualization (v4)
+# Debug visualization
 # ---------------------------------------------------------------------------
 
-def _save_v4_debug_visuals(
+def _save_debug_visuals(
     output_dir: Path,
     task_idx: int,
     window_id: int,
-    model: TemporalDynamicQueryResidualWM,
+    model: DynQueryWorldModel,
     pixels_t: torch.Tensor,
     actions_t: torch.Tensor,
     neg_actions_t: torch.Tensor,
@@ -612,10 +582,6 @@ def _save_v4_debug_visuals(
     def _save(arr: np.ndarray, name: str):
         Image.fromarray(arr.astype(np.uint8)).save(out_dir / name)
 
-    def _residual_vis(t: torch.Tensor) -> np.ndarray:
-        arr = t.float().permute(1, 2, 0).cpu().numpy()
-        return (((arr + 1.0) / 2.0).clip(0, 1) * 255).astype(np.uint8)
-
     def _mask_vis(t: torch.Tensor) -> np.ndarray:
         arr = t.float().squeeze().cpu().numpy()
         arr = arr / max(float(arr.max()), 1e-8)
@@ -631,17 +597,14 @@ def _save_v4_debug_visuals(
     K = model.cfg.history_length
     pixels_f = pixels_t[0].float().permute(0, 3, 1, 2) / 255.0
 
-    # History frames
     for k in range(K):
         _save(_to_uint8_np(pixels_f[k]), f"history_{k}.png")
-    _save(_to_uint8_np(pixels_f[K + 1]), "current.png")
-    _save(_to_uint8_np(pixels_f[K + 2]), "future.png")
+    _save(_to_uint8_np(pixels_f[K]), "current.png")
+    _save(_to_uint8_np(pixels_f[K + 1]), "future.png")
 
-    # Predictions
     _save(_to_uint8_np(out_correct["pred_future"][0, -1]), "pred_correct.png")
     _save(_to_uint8_np(out_shuffle["pred_future"][0, -1]), "pred_shuffle.png")
 
-    # Residual abs
     res_c = out_correct["residual_pred"][0, -1]
     res_s = out_shuffle["residual_pred"][0, -1]
     _save(
@@ -653,17 +616,15 @@ def _save_v4_debug_visuals(
         "pred_diff_correct_minus_shuffle.png",
     )
 
-    # Dynamic masks per query
-    dyn_masks = out_correct.get("dynamic_masks")  # [1, K+1, Q, N]
+    dyn_masks = out_correct.get("dynamic_masks")
     if dyn_masks is not None:
-        dm = dyn_masks[0, -1]   # [Q, N]
+        dm = dyn_masks[0, -1]
         N = dm.shape[1]
         sp = int(N ** 0.5)
         for q in range(dm.shape[0]):
             _save(_mask_vis(dm[q].reshape(sp, sp).unsqueeze(0)), f"dynamic_mask_q{q}.png")
 
-    # Fuser masks
-    fuser = out_correct.get("fuser_masks")   # [1, H, Q, N]
+    fuser = out_correct.get("fuser_masks")
     if fuser is not None:
         for t_idx in range(min(3, fuser.shape[1])):
             for q in range(fuser.shape[2]):
@@ -671,8 +632,7 @@ def _save_v4_debug_visuals(
                 _save(_mask_vis(fuser[0, t_idx, q].reshape(sp, sp).unsqueeze(0)),
                       f"fuser_mask_t{t_idx}_q{q}.png")
 
-    # Overlays
-    curr_np = _to_uint8_np(pixels_f[K + 1])
+    curr_np = _to_uint8_np(pixels_f[K])
     if dyn_masks is not None:
         dm_mean = dyn_masks[0, -1].float().mean(0)
         dm_sp = dm_mean.reshape(int(dm_mean.shape[0] ** 0.5), -1)
@@ -689,16 +649,12 @@ def _save_v4_debug_visuals(
         _save(_overlay(curr_np, (fm_img / max(fm_img.max(), 1e-8) * 255).astype(np.uint8), (0, 180, 255)),
               "overlay_fuser_mask_on_current.png")
 
-    # Debug stats JSON
     stats = {
         "task_idx":               task_idx,
         "window_id":              window_id,
         "ranking_score_correct":  row.get("ranking_score_correct", float("nan")),
         "ranking_score_shuffle":  row.get("score_shuffle", float("nan")),
         "score_gap":              row.get("score_gap", float("nan")),
-        "lpips_correct":          row.get("correct_lpips", float("nan")),
-        "lpips_shuffle":          row.get("shuffled_lpips", float("nan")),
-        "lpips_gap":              row.get("lpips_gap", float("nan")),
         "fuser_mask_mean":        row.get("fuser_mask_mean", float("nan")),
         "fuser_mask_max":         row.get("fuser_mask_max", float("nan")),
         "dynamic_mask_mean":      row.get("dynamic_mask_mean", float("nan")),
@@ -722,9 +678,8 @@ def run_evaluation(args: argparse.Namespace) -> None:
 
     condition_name = args.condition_name or Path(args.model_dir).name
 
-    # Load v4 model
-    logger.info("Loading v4 model from %s", args.model_dir)
-    model = TemporalDynamicQueryResidualWM.load_pretrained(args.model_dir).to(device).eval()
+    logger.info("Loading DynQueryWorldModel from %s", args.model_dir)
+    model = DynQueryWorldModel.load_pretrained(args.model_dir).to(device).eval()
     cfg = model.cfg
     K = cfg.history_length
     H = min(args.eval_horizon, cfg.action_horizon)
@@ -732,34 +687,28 @@ def run_evaluation(args: argparse.Namespace) -> None:
     logger.info("use_action_future_scorer=%s  num_dynamic_queries=%d",
                 cfg.use_action_future_scorer, cfg.num_dynamic_queries)
     logger.info(
-        "v4 frame layout (per window, seg_len=%d):\n"
+        "frame layout (per window, seg_len=%d):\n"
         "  pixels[0:%d]       → history  (episode idx: start … start+%d)\n"
-        "  pixels[%d]          → context slot (NOT fed to model)\n"
         "  pixels[%d]          → current frame (episode idx: start+%d)\n"
-        "  pixels[%d:%d]      → future GT  (H=%d steps)\n"
-        "  *** context gap: history[-1]=start+%d, current=start+%d → 2-step gap via context slot ***",
-        K + 2 + H,
+        "  pixels[%d:%d]      → future GT  (H=%d steps)",
+        K + 1 + H,
         K, K - 1,
-        K,
-        K + 1, K + 1,
-        K + 2, K + 2 + H, H,
-        K - 1, K + 1,
+        K, K,
+        K + 1, K + 1 + H, H,
     )
 
-    # Save config
     import dataclasses
     with open(output_dir / "config_used.json", "w") as f:
         json.dump({
             "condition": condition_name,
             "model_dir": args.model_dir,
-            "model_generation": "v4",
+            "model_generation": "dynquery",
             "cfg": dataclasses.asdict(cfg),
         }, f, indent=2)
 
     lpips_fn  = get_lpips_fn(device=str(device))
     roi_config = load_roi_config()
 
-    # Task names
     try:
         from libero.libero import benchmark as lb
         bench = lb.get_benchmark_dict()
@@ -790,8 +739,6 @@ def run_evaluation(args: argparse.Namespace) -> None:
     default_negative_type = "mixed" if "mixed" in negative_eval_types else negative_eval_types[0]
     logger.info("negative_eval_types=%s  default=%s", ",".join(negative_eval_types), default_negative_type)
 
-    # Build per-task episode index once, filtering by episode file path so that
-    # each task_idx only sees episodes whose file names match the task name.
     logger.info("Loading all episodes to build per-task index ...")
     all_episodes_raw = list(enumerate(tfds.as_numpy(ds)))
     episodes_by_task: Dict[str, List[Tuple[int, Dict]]] = {}
@@ -804,7 +751,7 @@ def run_evaluation(args: argparse.Namespace) -> None:
         ]
         episodes_by_task[tname] = filtered
         logger.info("  task %d (%s): %d matching episodes", task_idx_tmp, tname, len(filtered))
-    del all_episodes_raw  # free memory
+    del all_episodes_raw
 
     all_rows: List[Dict] = []
     action_ablation_rows: List[Dict] = []
@@ -820,7 +767,7 @@ def run_evaluation(args: argparse.Namespace) -> None:
         roi_half    = get_roi_half(args.task_suite, task_idx, roi_config)
 
         logger.info("Collecting windows for task %d (%s) ...", task_idx, task_name)
-        task_windows = _collect_task_windows_v4(
+        task_windows = _collect_task_windows(
             episodes=episodes_by_task.get(task_name, []),
             task_name=task_name,
             K=K, H=H,
@@ -834,7 +781,7 @@ def run_evaluation(args: argparse.Namespace) -> None:
         window_count = 0
         for local_idx, (pix_win, act_win, win_meta) in enumerate(task_windows):
 
-            row = _eval_window_v4(
+            row = _eval_window(
                 model=model,
                 pixels_np=pix_win,
                 actions_np=act_win,
@@ -861,7 +808,6 @@ def run_evaluation(args: argparse.Namespace) -> None:
                 "history_frame_indices": json.dumps(win_meta.get("history_frame_indices", [])),
             })
 
-            # Record manifest entry
             manifest_records.append({
                 "global_window_id":      global_id,
                 "task_id":               task_idx,
@@ -879,17 +825,16 @@ def run_evaluation(args: argparse.Namespace) -> None:
             })
             global_id += 1
 
-            # ---- RFT reward + score-based ranking (all eval windows) ----
             pix_t = torch.from_numpy(pix_win).unsqueeze(0).to(device)
             phase = str(win_meta.get("window_phase", "unknown"))
 
             for neg_type in negative_eval_types:
                 neg_suffix = _negative_metric_suffix(neg_type)
                 shuf_rft_reward_list = []
-                shuf_score_list = []    # ActionFutureScorer scores across reps (v4b)
+                shuf_score_list = []
 
                 for _ in range(args.num_shuffle_reps):
-                    neg_act = _make_negative_action_v4(
+                    neg_act = _make_negative_action(
                         neg_type=neg_type,
                         act_win=act_win,
                         task_windows=task_windows,
@@ -941,8 +886,6 @@ def run_evaluation(args: argparse.Namespace) -> None:
                     row[f"score_gap_{neg_suffix}"] = float("nan")
                     row[f"pairwise_win_score_{neg_suffix}"] = False
 
-            # Backward-compatible representative metrics use the mixed negative
-            # when available; otherwise they use the first requested negative.
             default_suffix = _negative_metric_suffix(default_negative_type)
             row["negative_metric_type"] = default_negative_type
             row["rft_reward_gap"] = row.get(f"rft_reward_gap_{default_suffix}", float("nan"))
@@ -953,9 +896,8 @@ def run_evaluation(args: argparse.Namespace) -> None:
 
             ranked_windows += 1
 
-            # ---- Action ablation / debug visuals ----
             if args.action_ablation or args.save_debug_visuals:
-                variants = _make_action_variants_v4(act_win, task_windows, local_idx, rng)
+                variants = _make_action_variants(act_win, task_windows, local_idx, rng)
 
                 bundles: Dict[str, Dict] = {}
                 for cond, acts_np in variants.items():
@@ -987,7 +929,7 @@ def run_evaluation(args: argparse.Namespace) -> None:
                         and task_idx < args.debug_num_tasks
                         and window_count < args.debug_windows_per_task):
                     act_shuf_t = torch.from_numpy(variants.get("same_task_shuffle", act_win)).unsqueeze(0).to(device)
-                    _save_v4_debug_visuals(
+                    _save_debug_visuals(
                         output_dir=output_dir,
                         task_idx=task_idx,
                         window_id=window_count,
@@ -1006,16 +948,15 @@ def run_evaluation(args: argparse.Namespace) -> None:
 
         logger.info("  Task %d: %d windows evaluated.", task_idx, window_count)
 
-    # ---- Save window manifest with history extension ----
     protocol_info = {
-        "model_generation":     "v4",
+        "model_generation":     "dynquery",
         "target_mode":          "temporal_query_residual",
         "task_suite":           args.task_suite,
         "history_length":       K,
         "eval_horizon":         H,
         "window_position_mode": args.window_position_mode,
         "num_eval_windows":     args.num_eval_windows,
-        "context_gap_frames":   2,
+        "context_gap_frames":   1,
         "negative_eval_types":  negative_eval_types,
         "default_negative_type": default_negative_type,
         "temporal_shift_max":   args.temporal_shift_max,
@@ -1034,7 +975,6 @@ def run_evaluation(args: argparse.Namespace) -> None:
         json.dumps(manifest_payload, indent=2, ensure_ascii=False), encoding="utf-8"
     )
 
-    # ---- Aggregate metrics ----
     agg = aggregate_phase1_metrics(all_rows, str(output_dir), condition_name)
 
     def _valid_mean(key):
@@ -1045,14 +985,12 @@ def run_evaluation(args: argparse.Namespace) -> None:
         vals = [r[key] for r in all_rows if not np.isnan(r.get(key, float("nan")))]
         return float(np.min(vals)) if vals else float("nan")
 
-    # pairwise_acc_score: exclude windows where scorer returned NaN (score_shuffle = NaN).
-    # Consistent with the per-task gating in aggregate_phase1_metrics.
     _score_rows = [r for r in all_rows if not np.isnan(r.get("score_shuffle", float("nan")))]
     _pairwise_acc_score = (float(np.mean([r["pairwise_win_score"] for r in _score_rows]))
                            if _score_rows else float("nan"))
 
     agg.update({
-        "model_generation":          "v4",
+        "model_generation":          "dynquery",
         "target_mode":               "temporal_query_residual",
         "history_length":            K,
         "num_dynamic_queries":       cfg.num_dynamic_queries,
@@ -1080,7 +1018,6 @@ def run_evaluation(args: argparse.Namespace) -> None:
     with open(output_dir / "aggregate_metrics.json", "w") as f:
         json.dump({"condition": condition_name, "metrics": agg}, f, indent=2)
 
-    # Per-window ranking CSV
     rank_rows = [r for r in all_rows if not np.isnan(r.get("rft_reward_gap", float("nan")))]
     if rank_rows:
         with open(output_dir / "ranking_score_by_window.csv", "w", newline="") as f:
@@ -1103,7 +1040,6 @@ def run_evaluation(args: argparse.Namespace) -> None:
             w.writeheader()
             w.writerows([{k: r.get(k) for k in w.fieldnames} for r in rank_rows])
 
-    # Action ablation
     if action_ablation_rows:
         abl_dir = output_dir / "action_ablation"
         abl_dir.mkdir(exist_ok=True)
@@ -1116,21 +1052,21 @@ def run_evaluation(args: argparse.Namespace) -> None:
         wins = sum(
             1 for r in action_ablation_rows
             if r["condition"] == "correct"
-            and r["horizon_avg_lpips"] <= min(
-                rr["horizon_avg_lpips"]
+            and r.get("full_lpips", float("nan")) <= min(
+                rr.get("full_lpips", float("nan"))
                 for rr in action_ablation_rows
                 if rr["task_id"] == r["task_id"] and rr["window_id"] == r["window_id"]
             )
         )
         total = sum(1 for r in action_ablation_rows if r["condition"] == "correct")
-        abl_summary = {"correct_best_rate_horizon_lpips": wins / max(total, 1), "num_windows": total}
+        abl_summary = {"correct_best_rate_full_lpips": wins / max(total, 1), "num_windows": total}
         for cond in conds:
             sc_rows = [r["ranking_score"] for r in action_ablation_rows
                        if r["condition"] == cond and not np.isnan(r.get("ranking_score", float("nan")))]
             abl_summary[f"score_{cond}_mean"] = float(np.mean(sc_rows)) if sc_rows else float("nan")
         (abl_dir / "action_ablation_summary.json").write_text(json.dumps(abl_summary, indent=2))
 
-    logger.info("=== v4 eval complete: %s ===", condition_name)
+    logger.info("=== DynQuery eval complete: %s ===", condition_name)
     logger.info("  horizon_avg_lpips=%.4f  horizon_avg_mae=%.4f  horizon_avg_mse=%.4f  n=%d",
                 agg.get("horizon_avg_lpips", float("nan")),
                 agg.get("horizon_avg_mae", float("nan")),

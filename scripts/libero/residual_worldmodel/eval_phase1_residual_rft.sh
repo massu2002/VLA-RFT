@@ -52,6 +52,14 @@ done
 if [[ "${SMOKE}" == "1" ]]; then
   NUM_TRIALS="${NUM_TRIALS_SMOKE:-1}"
 fi
+if [[ -x "${VENV_PATH}/bin/python" ]]; then
+  EVAL_PYTHON="${VENV_PATH}/bin/python"
+elif [[ -x "${VENV_PATH}/bin/python3" ]]; then
+  EVAL_PYTHON="${VENV_PATH}/bin/python3"
+else
+  echo "Python executable not found under VENV_PATH: ${VENV_PATH}" >&2
+  exit 2
+fi
 
 mkdir -p "${OUTPUT_DIR}"
 mkdir -p "${LIBERO_CONFIG_PATH}"
@@ -94,7 +102,7 @@ cfg = {
 PY
 
 CMD=(
-  python train/verl/vla-adapter/openvla-oft/experiments/robot/libero/run_libero_eval.py
+  "${EVAL_PYTHON}" train/verl/vla-adapter/openvla-oft/experiments/robot/libero/run_libero_eval.py
   --use_l1_regression False
   --use_diffusion False
   --use_flow_matching True
@@ -125,7 +133,10 @@ source "${VENV_PATH}/bin/activate"
 export PYTHONPATH="${REPO_ROOT}/third_party/LIBERO:${PYTHONPATH:-}"
 export LIBERO_CONFIG_PATH="${LIBERO_CONFIG_PATH}"
 export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
+set +e
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}" "${CMD[@]}" 2>&1 | tee "${OUTPUT_DIR}/eval.log"
+eval_rc=${PIPESTATUS[0]}
+set -e
 
 "${REPO_ROOT}/.venv/bin/python" - <<PY
 import csv, json, pathlib
@@ -148,3 +159,11 @@ if tasks:
 
 (out / "rollout_root.txt").write_text(str(rollout.resolve()) + "\n", encoding="utf-8")
 PY
+
+if [[ "${eval_rc}" -ne 0 ]]; then
+  if [[ -f "${OUTPUT_DIR}/success_summary.json" ]]; then
+    echo "WARNING: eval command exited rc=${eval_rc}, but success_summary.json was recovered; continuing." >&2
+  else
+    exit "${eval_rc}"
+  fi
+fi

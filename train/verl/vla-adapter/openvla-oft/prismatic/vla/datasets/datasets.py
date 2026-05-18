@@ -419,8 +419,8 @@ class RLDSBatchTransform_V1:
             assert "raw_image_primary" in rlds_batch["observation"], "Raw image not found in observation!"
             imgs_raw = rlds_batch["observation"]['raw_image_primary']
             return_dict["raw_pixel_values"] = imgs_raw
-            # WM wide-window: K_max+2+H frames with eval-identical layout
-            # [hist_0..hist_{K-1} | context | current | future_0..future_{H-1}]
+            # WM wide-window: K_max+1+H frames with eval-identical layout
+            # [hist_0..hist_{K-1} | current | future_0..future_{H-1}]
             if self.wm_history_length > 0 and "wm_raw_image_primary" in rlds_batch["observation"]:
                 return_dict["wm_raw_pixel_values"] = rlds_batch["observation"]["wm_raw_image_primary"]
         # Add additional inputs

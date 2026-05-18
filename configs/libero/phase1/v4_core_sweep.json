@@ -1,13 +1,13 @@
 {
   "sweep_name": "v4_core_sweep",
   "version": "1.0.0",
-  "description": "Phase1 v4 TemporalDynamicQueryResidualWM core sweep. v4a = no scorer, v4b = with ActionFutureScorer.",
+  "description": "Phase1 DynQueryWorldModel core sweep. stage_a = no scorer, stage_b = with ActionFutureScorer.",
 
   "common": {
-    "model_generation": "v4",
+    "model_generation": "dynquery",
     "target_mode": "temporal_query_residual",
-    "eval_horizon": 7,
-    "train_horizon": 7,
+    "eval_horizon": 8,
+    "train_horizon": 8,
     "phase0_compatible": 1,
     "max_steps": 150000,
     "lr": "1e-4",

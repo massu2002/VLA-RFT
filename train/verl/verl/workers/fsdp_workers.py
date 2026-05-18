@@ -2236,7 +2236,7 @@ class TokenizerWorker(Worker):
         self.psnr = piqa.PSNR(epsilon=1e-08, value_range=1.0, reduction='none').to(device)
         self.ssim = piqa.SSIM(window_size=11, sigma=1.5, n_channels=3, reduction='none').to(device)
         self.phase1_residual_wm = None
-        self.phase1_residual_model_generation = "v1"
+        self.phase1_residual_model_generation = "dynquery"
         self._phase1_v4_reward_logged = False
         phase1_cfg = self.config.get("phase1_residual", {})
         if phase1_cfg.get("enabled", False):
@@ -2247,33 +2247,26 @@ class TokenizerWorker(Worker):
                 raise FileNotFoundError(f"Phase1 residual world model checkpoint not found: {ckpt}")
             dtype_name = str(phase1_cfg.get("dtype", "bfloat16"))
             dtype = torch.bfloat16 if dtype_name in ("bf16", "bfloat16") else torch.float32
-            model_gen = phase1_cfg.get("model_generation", "v1")
+            model_gen = phase1_cfg.get("model_generation", "dynquery")
             self.phase1_residual_model_generation = model_gen
             self._phase1_v4_reward_logged = False
 
-            if model_gen == "v4":
-                from worldmodel.residual_worldmodel.rft_inference import load_v4_world_model
-                self.phase1_residual_wm = load_v4_world_model(
+            if model_gen in ("v4", "dynquery"):
+                from worldmodel.dynquery.rft import load_world_model
+                self.phase1_residual_wm = load_world_model(
                     ckpt, torch_dtype=dtype, device=device
                 )
                 expected_mode = phase1_cfg.get("target_mode", None)
                 if expected_mode and self.phase1_residual_wm.cfg.target_mode != expected_mode:
                     raise ValueError(
-                        f"Phase1 v4 WM target_mode mismatch: config={expected_mode} "
+                        f"Phase1 DynQuery WM target_mode mismatch: config={expected_mode} "
                         f"checkpoint={self.phase1_residual_wm.cfg.target_mode}"
                     )
             else:
-                from worldmodel.residual_worldmodel.pixel_residual_model import PixelResidualWorldModel
-                self.phase1_residual_wm = PixelResidualWorldModel.load_pretrained(
-                    ckpt,
-                    torch_dtype=dtype,
-                ).to(device).eval()
-                expected_mode = phase1_cfg.get("target_mode", None)
-                if expected_mode and self.phase1_residual_wm.cfg.target_mode != expected_mode:
-                    raise ValueError(
-                        f"Phase1 WM target_mode mismatch: config={expected_mode} "
-                        f"checkpoint={self.phase1_residual_wm.cfg.target_mode}"
-                    )
+                raise ValueError(
+                    f"Unsupported phase1_residual model_generation: {model_gen!r}. "
+                    "Use 'dynquery' (or legacy 'v4')."
+                )
         
     @torch.no_grad()
     def _perceptual_loss(self, real, pred):
@@ -2356,10 +2349,10 @@ class TokenizerWorker(Worker):
         raw_pixels  = data.batch["pixels"].to(device)            # [B, T, H, W, C] uint8
         raw_actions = data.batch["predicted_actions"].to(device)  # [B, T or T-1, A]
 
-        # ── v4 branch ────────────────────────────────────────────────────────
-        if self.phase1_residual_model_generation == "v4":
-            from worldmodel.residual_worldmodel.rft_inference import (
-                predict_future_with_v4_model, compute_rft_reward,
+        # ── DynQuery branch ──────────────────────────────────────────────────
+        if self.phase1_residual_model_generation in ("v4", "dynquery"):
+            from worldmodel.dynquery.rft import (
+                predict_future as predict_future_with_v4_model, compute_rft_reward,
             )
             pixels_f   = raw_pixels.permute(0, 1, 4, 2, 3).float() / 255.0  # [B,T,C,H,W]
             K_max      = int(data.meta_info.get("wm_history_length", 0))
@@ -2367,14 +2360,13 @@ class TokenizerWorker(Worker):
             action_dim = int(self.phase1_residual_wm.cfg.action_dim)
 
             if K_max > 0:
-                # pixels_f layout: [hist×K_max | context | current | future×H]
-                # context slot at index K_max is ignored by the model.
+                # pixels_f layout: [hist×K_max | current | future×H]
                 hist_start     = K_max - K
                 history_images = pixels_f[:, hist_start:K_max]              # [B, K, C, H, W]
-                current_image  = pixels_f[:, K_max + 1]                     # [B, C, H, W]
-                H              = min(pixels_f.shape[1] - (K_max + 2), raw_actions.shape[1])
+                current_image  = pixels_f[:, K_max]                         # [B, C, H, W]
+                H              = min(pixels_f.shape[1] - (K_max + 1), raw_actions.shape[1])
                 actions        = self._align_phase1_actions(raw_actions[:, :H], action_dim)
-                target_images  = pixels_f[:, K_max+2 : K_max+2+H].to(torch.float32)  # [B,H,C,H,W]
+                target_images  = pixels_f[:, K_max+1 : K_max+1+H].to(torch.float32)  # [B,H,C,H,W]
             else:
                 history_images = None
                 current_image  = pixels_f[:, 0]                             # [B, C, H, W]
@@ -2480,7 +2472,7 @@ class TokenizerWorker(Worker):
         output = {'pixels': pixels}
         if 'lpips' in lpips_data.meta_info.keys() and lpips_data.meta_info['lpips']:
             if 'real' not in lpips_data.batch.keys():
-                real = self.cached_pixels[:, 2:]   # TODO: magic number
+                real = self.cached_pixels[:, 1:]
             else:
                 real_tokens = lpips_data.batch['real'].to(torch.cuda.current_device())
                 real_pixels = self.processor.detokenize(ctx_tokens,real_tokens)
@@ -2489,7 +2481,7 @@ class TokenizerWorker(Worker):
                 raise ValueError('real.shape[0] < pixels.shape[0]')
                 real = real.repeat_interleave(pixels.shape[0] // real.shape[0], dim=0)
             if self.config.interact:
-                pred = pixels[:, 1:].clamp(0.0, 1.0)
+                pred = pixels.clamp(0.0, 1.0)
                 perceptual_loss = self._perceptual_loss(
                     real.reshape(-1, *real.shape[-3:]), 
                     pred.reshape(-1, *pred.shape[-3:]),

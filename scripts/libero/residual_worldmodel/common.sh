@@ -376,10 +376,13 @@ run_train_command() {
   if (( nproc == 1 )); then
     "${REPO_ROOT}/${_VENV_NAME}/bin/python" "$@" 2>&1 | tee "${logfile}"
   else
+    # Pick a free port each run to avoid EADDRINUSE when tasks run back-to-back.
+    local _port="${MASTER_PORT:-$(python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()')}"
     torchrun \
       --standalone \
       --nnodes=1 \
       --nproc_per_node="${nproc}" \
+      --master_port="${_port}" \
       "$@" 2>&1 | tee "${logfile}"
   fi
 }

@@ -1,30 +1,38 @@
 #!/usr/bin/env bash
-# train_v4_temporal_query_worldmodel.sh — Train TemporalDynamicQueryResidualWM (v4) on LIBERO data.
+# train_dynquery.sh — Train DynQueryWorldModel on LIBERO data.
 #
 # Usage:
-#   bash scripts/libero/residual_worldmodel/train_v4_temporal_query_worldmodel.sh [spatial|object|goal|10]
-#   HISTORY_LENGTH=2 NUM_DYNAMIC_QUERIES=8 \
-#     bash scripts/libero/residual_worldmodel/train_v4_temporal_query_worldmodel.sh spatial
-#   DRY_RUN=1 bash scripts/libero/residual_worldmodel/train_v4_temporal_query_worldmodel.sh spatial
+#   bash scripts/libero/residual_worldmodel/train_dynquery.sh [spatial|object|goal|10]
+#
+#   # With overrides:
+#   EXP_NAME=dq_full_rank1 NUM_DYNAMIC_QUERIES=8 \
+#     bash scripts/libero/residual_worldmodel/train_dynquery.sh spatial
+#
+#   DRY_RUN=1 bash scripts/libero/residual_worldmodel/train_dynquery.sh spatial
 #
 # Key env-var overrides (all have defaults):
-#   TASK_SUITE, EXP_NAME, SEED, DEVICE
+#   TASK_SUITE, EXP_NAME, SEED
 #   LR, WORLD_MODEL_BATCH_SIZE, BATCH_SIZE, GRAD_ACCUM, TRAIN_HORIZON
 #   SEGMENT_LENGTH, MAX_STEPS, PRECISION
 #   HISTORY_LENGTH, NUM_DYNAMIC_QUERIES
-#   LAMBDA_IMAGE, LAMBDA_DYNAMIC, LAMBDA_STATIC, LAMBDA_QUERY, LAMBDA_RANK, LAMBDA_SPARSE
-#   RANK_MARGIN, DYNAMIC_THRESHOLD
-#   N_CONTEXT_LAYERS, N_FUSER_LAYERS, N_SCORER_LAYERS
-#   USE_ACTION_FUTURE_SCORER (1=v4b, 0=v4a)
+#   -- Core 1-4 feature flags --
+#   USE_ACTION_CONDITIONED_MASK   1=on (Core 1)     default: 1
+#   PREDICTOR_MODE                query_wise|linear_expand (Core 2)  default: query_wise
+#   USE_DYNAMIC_RESIDUAL_GATE     1=on (Core 3)     default: 1
+#   LAMBDA_MASK_DYNAMIC           Core 4a loss weight  default: 0.1
+#   LAMBDA_QUERY_DELTA_SPARSE     Core 4b loss weight  default: 0.001
+#   -- Standard loss weights --
+#   LAMBDA_IMAGE, LAMBDA_DYNAMIC, LAMBDA_STATIC, LAMBDA_QUERY
+#   LAMBDA_RANK, RANK_MARGIN
+#   -- Scorer / negatives --
+#   USE_ACTION_FUTURE_SCORER      1=stage_b (with scorer), 0=stage_a
 #   USE_MOTION_BIAS
+#   NEGATIVE_TYPE, NEGATIVE_MIX   (read as env vars by DynQueryCollator)
+#   -- Paths --
 #   DATA_ROOT, OUTPUT_ROOT
 #
-# Stage variants:
-#   v4a: USE_ACTION_FUTURE_SCORER=0  LAMBDA_RANK=0.0
-#   v4b: USE_ACTION_FUTURE_SCORER=1  LAMBDA_RANK=1.0  (default)
-#
 # Outputs under:
-#   checkpoints/libero/TemporalQueryResidualWM/<suite>/<exp_name>/s<seed>/
+#   checkpoints/libero/DynQueryWorldModel/core_sweep/<suite>/<exp_name>/s<seed>/
 
 set -euo pipefail
 
@@ -33,36 +41,35 @@ export REPO_ROOT=$(cd "${SCRIPT_DIR}/../../.." && pwd)
 source "${SCRIPT_DIR}/common.sh"
 
 # ---------------------------------------------------------------------------
-# User config — all overridable via env vars
+# Config — all overridable via env vars
 # ---------------------------------------------------------------------------
 TASK_SUITE="${1:-${TASK_SUITE:-spatial}}"
-EXP_NAME="${EXP_NAME:-v4b}"
+EXP_NAME="${EXP_NAME:-dq_full_rank1}"
 
 SEED="${SEED:-42}"
-DEVICE="${DEVICE:-auto}"
 
 # ---------------------------------------------------------------------------
-# Training hyperparameters — match Phase 0 AR-Pixel defaults
+# Training hyperparameters
 # ---------------------------------------------------------------------------
-LR="${LR:-5e-5}"
-WORLD_MODEL_BATCH_SIZE="${WORLD_MODEL_BATCH_SIZE:-16}"
-BATCH_SIZE="${BATCH_SIZE:-1}"
+LR="${LR:-1e-4}"
+WORLD_MODEL_BATCH_SIZE="${WORLD_MODEL_BATCH_SIZE:-64}"
+BATCH_SIZE="${BATCH_SIZE:-8}"
 TRAIN_HORIZON="${TRAIN_HORIZON:-8}"
 PRECISION="${PRECISION:-bf16}"
 NUM_WORKERS="${NUM_WORKERS:-0}"
-SAVE_STEPS="${SAVE_STEPS:-5000}"
-SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-3}"
-LOGGING_STEPS="${LOGGING_STEPS:-10}"
+SAVE_STEPS="${SAVE_STEPS:-10000}"
+SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-2}"
+LOGGING_STEPS="${LOGGING_STEPS:-20}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.0}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.0}"
 MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
 LR_SCHEDULER="${LR_SCHEDULER:-constant}"
 
 # ---------------------------------------------------------------------------
-# V4 architecture
+# DynQuery architecture
 # ---------------------------------------------------------------------------
-HISTORY_LENGTH="${HISTORY_LENGTH:-2}"           # K
-NUM_DYNAMIC_QUERIES="${NUM_DYNAMIC_QUERIES:-8}" # Q
+HISTORY_LENGTH="${HISTORY_LENGTH:-2}"            # K
+NUM_DYNAMIC_QUERIES="${NUM_DYNAMIC_QUERIES:-8}"  # Q
 ENCODER_CHANNELS="${ENCODER_CHANNELS:-256}"
 HIDDEN_DIM="${HIDDEN_DIM:-256}"
 N_HEADS="${N_HEADS:-4}"
@@ -74,8 +81,16 @@ DROPOUT="${DROPOUT:-0.0}"
 ACTION_EMB_DIM="${ACTION_EMB_DIM:-128}"
 ACTION_BINS="${ACTION_BINS:-256}"
 ACTION_CONDITIONING_MODE="${ACTION_CONDITIONING_MODE:-discrete_tokens}"
-USE_ACTION_FUTURE_SCORER="${USE_ACTION_FUTURE_SCORER:-1}"  # 1=v4b, 0=v4a
-USE_MOTION_BIAS="${USE_MOTION_BIAS:-0}"
+
+# Core feature flags (default: all cores on)
+USE_ACTION_CONDITIONED_MASK="${USE_ACTION_CONDITIONED_MASK:-1}"   # Core 1
+PREDICTOR_MODE="${PREDICTOR_MODE:-query_wise}"                    # Core 2
+USE_DYNAMIC_RESIDUAL_GATE="${USE_DYNAMIC_RESIDUAL_GATE:-1}"       # Core 3
+
+# Scorer (stage_b = 1, stage_a = 0)
+USE_ACTION_FUTURE_SCORER="${USE_ACTION_FUTURE_SCORER:-1}"
+USE_MOTION_BIAS="${USE_MOTION_BIAS:-1}"
+
 RESIDUAL_OUTPUT_ACTIVATION="${RESIDUAL_OUTPUT_ACTIVATION:-tanh}"
 RESIDUAL_OUTPUT_SCALE="${RESIDUAL_OUTPUT_SCALE:-1.0}"
 PIXEL_OUTPUT_ACTIVATION="${PIXEL_OUTPUT_ACTIVATION:-sigmoid}"
@@ -88,41 +103,36 @@ LAMBDA_DYNAMIC="${LAMBDA_DYNAMIC:-1.0}"
 LAMBDA_STATIC="${LAMBDA_STATIC:-0.2}"
 LAMBDA_QUERY="${LAMBDA_QUERY:-0.5}"
 LAMBDA_RANK="${LAMBDA_RANK:-1.0}"
-LAMBDA_SPARSE="${LAMBDA_SPARSE:-0.01}"
+LAMBDA_MASK_DYNAMIC="${LAMBDA_MASK_DYNAMIC:-0.1}"          # Core 4a
+LAMBDA_QUERY_DELTA_SPARSE="${LAMBDA_QUERY_DELTA_SPARSE:-0.001}"  # Core 4b
 RANK_MARGIN="${RANK_MARGIN:-0.1}"
 DYNAMIC_THRESHOLD="${DYNAMIC_THRESHOLD:-0.05}"
 DYNAMIC_DILATE_KERNEL="${DYNAMIC_DILATE_KERNEL:-7}"
 ROI_CROP_SIZE="${ROI_CROP_SIZE:-64}"
 
 # ---------------------------------------------------------------------------
-# Negative sampling / warm-start
+# Negatives / warm-start
+# (NEGATIVE_TYPE and NEGATIVE_MIX are passed as env vars to DynQueryCollator)
 # ---------------------------------------------------------------------------
 ACTION_NOISE_STD="${ACTION_NOISE_STD:-0.15}"
 INIT_FROM_CHECKPOINT="${INIT_FROM_CHECKPOINT:-}"
 
 # ---------------------------------------------------------------------------
-# Segment length: v4 requires K + current + H frames per window
+# Segment length: K + current + H frames per window
 # ---------------------------------------------------------------------------
-# SEGMENT_LENGTH = HISTORY_LENGTH + TRAIN_HORIZON + 1
 SEGMENT_LENGTH="${SEGMENT_LENGTH:-$(( HISTORY_LENGTH + TRAIN_HORIZON + 1 ))}"
 ACTION_HORIZON=$(( SEGMENT_LENGTH - HISTORY_LENGTH - 1 ))
 
 # ---------------------------------------------------------------------------
 # Max steps
 # ---------------------------------------------------------------------------
-_default_max_steps() {
-  case "${TASK_SUITE}" in
-    spatial|object|goal|10|long) echo "150000" ;;
-    *)                           echo "150000" ;;
-  esac
-}
-MAX_STEPS="${MAX_STEPS:-$(_default_max_steps)}"
+MAX_STEPS="${MAX_STEPS:-150000}"
 
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
 DATA_ROOT="${DATA_ROOT:-$(default_libero_data_root)}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_ROOT}/checkpoints/libero/TemporalQueryResidualWM}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_ROOT}/checkpoints/libero/DynQueryWorldModel/core_sweep}"
 
 # ---------------------------------------------------------------------------
 # Environment
@@ -135,12 +145,12 @@ if [ -z "${GRAD_ACCUM:-}" ]; then
   if [ -n "${WORLD_MODEL_BATCH_SIZE}" ]; then
     TOTAL_PER_STEP=$(( BATCH_SIZE * NPROC ))
     if (( WORLD_MODEL_BATCH_SIZE % TOTAL_PER_STEP != 0 )); then
-      echo "[train_v4] WORLD_MODEL_BATCH_SIZE=${WORLD_MODEL_BATCH_SIZE} must be divisible by BATCH_SIZE*NPROC=${TOTAL_PER_STEP}." >&2
+      echo "[train_dynquery] WORLD_MODEL_BATCH_SIZE=${WORLD_MODEL_BATCH_SIZE} must be divisible by BATCH_SIZE*NPROC=${TOTAL_PER_STEP}." >&2
       exit 1
     fi
     GRAD_ACCUM=$(( WORLD_MODEL_BATCH_SIZE / TOTAL_PER_STEP ))
   else
-    GRAD_ACCUM=4
+    GRAD_ACCUM=1
   fi
 fi
 GLOBAL_BATCH_SIZE=$(( BATCH_SIZE * NPROC * GRAD_ACCUM ))
@@ -151,15 +161,15 @@ fi
 
 # Stage label
 if [ "${USE_ACTION_FUTURE_SCORER}" = "0" ] || [ "${USE_ACTION_FUTURE_SCORER}" = "false" ]; then
-  STAGE="v4a"
+  STAGE="dq_a"
 else
-  STAGE="v4b"
+  STAGE="dq_b"
 fi
 
 SAVE_DIR="${OUTPUT_ROOT}/${TASK_SUITE}/${EXP_NAME}/s${SEED}"
 mkdir -p "${SAVE_DIR}"
 
-LOG_DIR="${REPO_ROOT}/logs/libero/TemporalQueryResidualWM/${TASK_SUITE}/${EXP_NAME}/s${SEED}"
+LOG_DIR="${REPO_ROOT}/logs/libero/DynQueryWorldModel/${TASK_SUITE}/${EXP_NAME}/s${SEED}"
 mkdir -p "${LOG_DIR}"
 LOGFILE="${LOG_DIR}/train_$(timestamp).log"
 
@@ -167,36 +177,26 @@ LOGFILE="${LOG_DIR}/train_$(timestamp).log"
 # Print summary
 # ---------------------------------------------------------------------------
 print_run_summary \
-  "TASK_SUITE"        "${TASK_SUITE}" \
-  "EXP_NAME"          "${EXP_NAME}" \
-  "STAGE"             "${STAGE}" \
-  "HISTORY_LENGTH"    "${HISTORY_LENGTH} (K)" \
-  "NUM_DYNAMIC_Q"     "${NUM_DYNAMIC_QUERIES} (Q)" \
-  "SEGMENT_LEN"       "${SEGMENT_LENGTH}  (K=${HISTORY_LENGTH}  H=${ACTION_HORIZON})" \
-  "LR"                "${LR}" \
-  "BATCH(eff.)"       "per-dev=${BATCH_SIZE}  gpus=${NPROC}  accum=${GRAD_ACCUM}  eff=${GLOBAL_BATCH_SIZE}" \
-  "TRAIN_HORIZON"     "${TRAIN_HORIZON}" \
-  "MAX_STEPS"         "${MAX_STEPS}" \
-  "SAVE_STEPS"        "${SAVE_STEPS}" \
-  "SAVE_TOTAL_LIMIT"  "${SAVE_TOTAL_LIMIT}" \
-  "LOGGING_STEPS"     "${LOGGING_STEPS}" \
-  "LR_SCHEDULER"      "${LR_SCHEDULER}" \
-  "PRECISION"         "${PRECISION}" \
-  "λ image"           "${LAMBDA_IMAGE}" \
-  "λ dynamic"         "${LAMBDA_DYNAMIC}" \
-  "λ static"          "${LAMBDA_STATIC}" \
-  "λ query"           "${LAMBDA_QUERY}" \
-  "λ rank"            "${LAMBDA_RANK}" \
-  "λ sparse"          "${LAMBDA_SPARSE}" \
-  "rank_margin"       "${RANK_MARGIN}" \
-  "dyn_threshold"     "${DYNAMIC_THRESHOLD}" \
-  "action_cond"       "${ACTION_CONDITIONING_MODE}" \
-  "use_scorer"        "${USE_ACTION_FUTURE_SCORER}" \
-  "use_motion_bias"   "${USE_MOTION_BIAS}" \
-  "SEED"              "${SEED}" \
-  "DATA_ROOT"         "${DATA_ROOT}" \
-  "SAVE_DIR"          "${SAVE_DIR}" \
-  "LOGFILE"           "${LOGFILE}"
+  "TASK_SUITE"            "${TASK_SUITE}" \
+  "EXP_NAME"              "${EXP_NAME}" \
+  "STAGE"                 "${STAGE}" \
+  "HISTORY_LENGTH"        "${HISTORY_LENGTH} (K)" \
+  "NUM_DYNAMIC_Q"         "${NUM_DYNAMIC_QUERIES} (Q)" \
+  "SEGMENT_LEN"           "${SEGMENT_LENGTH}  (K=${HISTORY_LENGTH}  H=${ACTION_HORIZON})" \
+  "LR"                    "${LR}" \
+  "BATCH(eff.)"           "per-dev=${BATCH_SIZE}  gpus=${NPROC}  accum=${GRAD_ACCUM}  eff=${GLOBAL_BATCH_SIZE}" \
+  "MAX_STEPS"             "${MAX_STEPS}" \
+  "PRECISION"             "${PRECISION}" \
+  "Core1 act_cond_mask"   "${USE_ACTION_CONDITIONED_MASK}" \
+  "Core2 predictor_mode"  "${PREDICTOR_MODE}" \
+  "Core3 dyn_res_gate"    "${USE_DYNAMIC_RESIDUAL_GATE}" \
+  "Core4 λ_mask_dyn"      "${LAMBDA_MASK_DYNAMIC}  λ_q_delta=${LAMBDA_QUERY_DELTA_SPARSE}" \
+  "motion_bias"           "${USE_MOTION_BIAS}" \
+  "use_scorer"            "${USE_ACTION_FUTURE_SCORER}  λ_rank=${LAMBDA_RANK}" \
+  "SEED"                  "${SEED}" \
+  "DATA_ROOT"             "${DATA_ROOT}" \
+  "SAVE_DIR"              "${SAVE_DIR}" \
+  "LOGFILE"               "${LOGFILE}"
 
 # ---------------------------------------------------------------------------
 # Config dump
@@ -213,15 +213,18 @@ dump_run_config "${SAVE_DIR}" \
   "batch_size=${BATCH_SIZE}" \
   "grad_accum=${GRAD_ACCUM}" \
   "global_batch_size=${GLOBAL_BATCH_SIZE}" \
-  "train_horizon=${TRAIN_HORIZON}" \
   "max_steps=${MAX_STEPS}" \
   "precision=${PRECISION}" \
+  "use_action_conditioned_mask=${USE_ACTION_CONDITIONED_MASK}" \
+  "predictor_mode=${PREDICTOR_MODE}" \
+  "use_dynamic_residual_gate=${USE_DYNAMIC_RESIDUAL_GATE}" \
+  "lambda_mask_dynamic=${LAMBDA_MASK_DYNAMIC}" \
+  "lambda_query_delta_sparse=${LAMBDA_QUERY_DELTA_SPARSE}" \
   "lambda_image=${LAMBDA_IMAGE}" \
   "lambda_dynamic=${LAMBDA_DYNAMIC}" \
   "lambda_static=${LAMBDA_STATIC}" \
   "lambda_query=${LAMBDA_QUERY}" \
   "lambda_rank=${LAMBDA_RANK}" \
-  "lambda_sparse=${LAMBDA_SPARSE}" \
   "rank_margin=${RANK_MARGIN}" \
   "dynamic_threshold=${DYNAMIC_THRESHOLD}" \
   "use_action_future_scorer=${USE_ACTION_FUTURE_SCORER}" \
@@ -257,12 +260,16 @@ TRAIN_ARGS=(
   --action-bins              "${ACTION_BINS}"
   --action-emb-dim           "${ACTION_EMB_DIM}"
   --action-conditioning-mode "${ACTION_CONDITIONING_MODE}"
+  # Core 2: predictor mode
+  --predictor-mode           "${PREDICTOR_MODE}"
+  # Loss weights
   --lambda-image             "${LAMBDA_IMAGE}"
   --lambda-dynamic           "${LAMBDA_DYNAMIC}"
   --lambda-static            "${LAMBDA_STATIC}"
   --lambda-query             "${LAMBDA_QUERY}"
   --lambda-rank              "${LAMBDA_RANK}"
-  --lambda-sparse            "${LAMBDA_SPARSE}"
+  --lambda-mask-dynamic      "${LAMBDA_MASK_DYNAMIC}"
+  --lambda-query-delta-sparse "${LAMBDA_QUERY_DELTA_SPARSE}"
   --rank-margin              "${RANK_MARGIN}"
   --dynamic-threshold        "${DYNAMIC_THRESHOLD}"
   --dynamic-dilate-kernel    "${DYNAMIC_DILATE_KERNEL}"
@@ -288,11 +295,25 @@ TRAIN_ARGS=(
   --seed                     "${SEED}"
 )
 
+# Core 1: action-conditioned mask
+case "${USE_ACTION_CONDITIONED_MASK}" in
+  0|false|FALSE|False|no|NO) TRAIN_ARGS+=(--no-action-conditioned-mask) ;;
+  *)                         TRAIN_ARGS+=(--use-action-conditioned-mask) ;;
+esac
+
+# Core 3: dynamic residual gate
+case "${USE_DYNAMIC_RESIDUAL_GATE}" in
+  0|false|FALSE|False|no|NO) TRAIN_ARGS+=(--no-dynamic-residual-gate) ;;
+  *)                         TRAIN_ARGS+=(--use-dynamic-residual-gate) ;;
+esac
+
+# Scorer (stage_b)
 case "${USE_ACTION_FUTURE_SCORER}" in
   0|false|FALSE|False|no|NO) TRAIN_ARGS+=(--no-action-future-scorer) ;;
   *)                         TRAIN_ARGS+=(--use-action-future-scorer) ;;
 esac
 
+# Motion bias
 case "${USE_MOTION_BIAS}" in
   1|true|TRUE|True|yes|YES) TRAIN_ARGS+=(--use-motion-bias) ;;
   *)                        TRAIN_ARGS+=(--no-motion-bias) ;;
@@ -312,7 +333,7 @@ fi
 # Run training
 # ---------------------------------------------------------------------------
 echo ""
-echo "  Starting v4 training → ${SAVE_DIR}"
+echo "  Starting DynQuery training → ${SAVE_DIR}"
 echo "  Stage: ${STAGE}  (use_action_future_scorer=${USE_ACTION_FUTURE_SCORER})"
 echo "  Log → ${LOGFILE}"
 echo ""
@@ -323,9 +344,9 @@ run_train_command "${NPROC}" "${SAVE_DIR}" "${LOGFILE}" "${TRAIN_ARGS[@]}"
 
 echo ""
 echo "  Training complete."
-echo "    checkpoint : ${SAVE_DIR}"
+echo "    checkpoint : ${SAVE_DIR}/final"
 echo "    log        : ${LOGFILE}"
 echo ""
 echo "  To evaluate:"
 echo "    bash scripts/libero/residual_worldmodel/eval_v4_temporal_query_worldmodel.sh \\"
-echo "      MODEL_DIR=${SAVE_DIR} TASK_SUITE=${TASK_SUITE}"
+echo "      MODEL_DIR=${SAVE_DIR}/final TASK_SUITE=${TASK_SUITE}"

@@ -59,6 +59,18 @@ cd "$(dirname "$0")"
 # WM 学習 run name（checkpoints/libero/TemporalQueryResidualWM/${WM_RUN_NAME}/ を参照）
 export WM_RUN_NAME="${WM_RUN_NAME:-v4_improved_spatial}"
 
+# 実験テーブルの選択。
+#   v4_improved_spatial: 既存の improved spatial 実験群
+#   v4_next_exps       : results/phase1/v4_next_exps で学習した WM 実験群
+RFT_EXPERIMENT_SET="${RFT_EXPERIMENT_SET:-}"
+if [ -z "${RFT_EXPERIMENT_SET}" ]; then
+    if [ "${WM_RUN_NAME}" = "v4_next_exps" ]; then
+        RFT_EXPERIMENT_SET="v4_next_exps"
+    else
+        RFT_EXPERIMENT_SET="v4_improved_spatial"
+    fi
+fi
+
 # WM チェックポイントのシード（s${CKPT_SEED}/final を使用）
 export CKPT_SEED="${CKPT_SEED:-42}"
 
@@ -94,7 +106,8 @@ export CLIP_RANK_REWARD="${CLIP_RANK_REWARD:-1}"
 export RANK_REWARD_CLIP_VALUE="${RANK_REWARD_CLIP_VALUE:-5.0}"
 
 # phase0 baseline token WM のパス
-TOKEN_WM_PATH="${TOKEN_WM_PATH:-checkpoints/libero/WorldModel/${TASK_SUITE}}"
+# WM 評価 protocol と同じ checkpoint-150000 を使用する。
+TOKEN_WM_PATH="${TOKEN_WM_PATH:-checkpoints/libero/WorldModel/${TASK_SUITE}/20260429_worldmodel_scratch/checkpoint-150000}"
 
 # RFT 結果の保存先ルート（空のときはスクリプトデフォルトを使用）
 #   設定時: ${OUTPUT_ROOT}/<role>/ に各グループの結果を保存
@@ -113,25 +126,53 @@ fi
 #   EXP_NAME = "__baseline__" のときは phase0 AR-Pixel token WM を使用
 #   それ以外は WM_RUN_NAME/${TASK_SUITE}/${EXP_NAME}/s${CKPT_SEED}/final を参照
 # ==============================================================
-_EXP_TABLE=(
-    # ── baseline ──────────────────────────────────────────────────────────
-    "baseline|__baseline__|lpips_mae|Phase0 AR-Pixel token WM ベースライン"
+case "${RFT_EXPERIMENT_SET}" in
+    v4_improved_spatial)
+        _EXP_TABLE=(
+            # ── baseline ──────────────────────────────────────────────────
+            "baseline|__baseline__|lpips_mae|Phase0 AR-Pixel token WM ベースライン"
 
-    # ── v4a: scorer なし → lpips_mae のみ ─────────────────────────────────
-    "v4a_recon|v4a_q8_k2_motion|lpips_mae|v4a K=2 Q=8 motion bias, 報酬 -(LPIPS+MAE)"
+            # ── v4a: scorer なし → lpips_mae のみ ─────────────────────────
+            "v4a_recon|v4a_q8_k2_motion|lpips_mae|v4a K=2 Q=8 motion bias, 報酬 -(LPIPS+MAE)"
 
-    # ── v4b λ_rank=1.0 × motion bias ──────────────────────────────────────
-    "v4b_r1_hybrid|v4b_q8_k2_rank1_motion|hybrid|v4b λ_rank=1.0: 0.2×-(LPIPS+MAE)+0.8×rank_score"
-    "v4b_r1_rank|v4b_q8_k2_rank1_motion|rank_score|v4b λ_rank=1.0: rank_score のみ"
+            # ── v4b λ_rank=1.0 × motion bias ──────────────────────────────
+            "v4b_r1_hybrid|v4b_q8_k2_rank1_motion|hybrid|v4b λ_rank=1.0: 0.2×-(LPIPS+MAE)+0.8×rank_score"
+            "v4b_r1_rank|v4b_q8_k2_rank1_motion|rank_score|v4b λ_rank=1.0: rank_score のみ"
 
-    # ── v4b λ_rank=2.0 × motion bias ──────────────────────────────────────
-    "v4b_r2_hybrid|v4b_q8_k2_rank2_motion|hybrid|v4b λ_rank=2.0: 0.2×-(LPIPS+MAE)+0.8×rank_score"
-    "v4b_r2_rank|v4b_q8_k2_rank2_motion|rank_score|v4b λ_rank=2.0: rank_score のみ"
+            # ── v4b λ_rank=2.0 × motion bias ──────────────────────────────
+            "v4b_r2_hybrid|v4b_q8_k2_rank2_motion|hybrid|v4b λ_rank=2.0: 0.2×-(LPIPS+MAE)+0.8×rank_score"
+            "v4b_r2_rank|v4b_q8_k2_rank2_motion|rank_score|v4b λ_rank=2.0: rank_score のみ"
 
-    # ── v4b λ_rank=1.0 × mixed negatives ──────────────────────────────────
-    "v4b_mixneg_hybrid|v4b_q8_k2_rank1_mixedneg|hybrid|v4b mixed-neg: 0.2×-(LPIPS+MAE)+0.8×rank_score"
-    "v4b_mixneg_rank|v4b_q8_k2_rank1_mixedneg|rank_score|v4b mixed-neg: rank_score のみ"
-)
+            # ── v4b λ_rank=1.0 × mixed negatives ──────────────────────────
+            "v4b_mixneg_hybrid|v4b_q8_k2_rank1_mixedneg|hybrid|v4b mixed-neg: 0.2×-(LPIPS+MAE)+0.8×rank_score"
+            "v4b_mixneg_rank|v4b_q8_k2_rank1_mixedneg|rank_score|v4b mixed-neg: rank_score のみ"
+        )
+        ;;
+    v4_next_exps)
+        _EXP_TABLE=(
+            # ── q16 mixed negatives: scorer あり → 3 報酬 ─────────────────
+            "next_q16_lpips|v4b_q16_k2_rank1_mixedneg|lpips_mae|v4_next q16 mixed-neg: 報酬 -(LPIPS+MAE)"
+            "next_q16_rank|v4b_q16_k2_rank1_mixedneg|rank_score|v4_next q16 mixed-neg: rank_score のみ"
+            "next_q16_hybrid|v4b_q16_k2_rank1_mixedneg|hybrid|v4_next q16 mixed-neg: 0.2×-(LPIPS+MAE)+0.8×rank_score"
+
+            # ── 2-stage: scorer あり → 3 報酬 ─────────────────────────────
+            "next_2stage_lpips|v4b_q8_k2_rank1_2stage|lpips_mae|v4_next 2-stage: 報酬 -(LPIPS+MAE)"
+            "next_2stage_rank|v4b_q8_k2_rank1_2stage|rank_score|v4_next 2-stage: rank_score のみ"
+            "next_2stage_hybrid|v4b_q8_k2_rank1_2stage|hybrid|v4_next 2-stage: 0.2×-(LPIPS+MAE)+0.8×rank_score"
+
+            # ── action-noise negatives: scorer あり → 3 報酬 ──────────────
+            "next_actnoise_lpips|v4b_q8_k2_rank1_actnoiseneg|lpips_mae|v4_next action-noise negatives: 報酬 -(LPIPS+MAE)"
+            "next_actnoise_rank|v4b_q8_k2_rank1_actnoiseneg|rank_score|v4_next action-noise negatives: rank_score のみ"
+            "next_actnoise_hybrid|v4b_q8_k2_rank1_actnoiseneg|hybrid|v4_next action-noise negatives: 0.2×-(LPIPS+MAE)+0.8×rank_score"
+
+        )
+        ;;
+    *)
+        echo "Unknown RFT_EXPERIMENT_SET=${RFT_EXPERIMENT_SET}" >&2
+        echo "Expected: v4_improved_spatial or v4_next_exps" >&2
+        exit 2
+        ;;
+esac
 
 # ROLE_FILTER: カンマ区切りで実行するロールを指定（空 = 全ロール）
 ROLE_FILTER="${ROLE_FILTER:-}"
@@ -184,6 +225,7 @@ echo "============================================================"
 echo "Phase1 v4 WM → RFT 第2段階学習"
 echo ""
 echo "  WM_RUN_NAME       = ${WM_RUN_NAME}"
+echo "  RFT_EXPERIMENT_SET= ${RFT_EXPERIMENT_SET}"
 echo "  CKPT_SEED         = ${CKPT_SEED}  (s${CKPT_SEED}/final)"
 echo "  TASK_SUITE        = ${TASK_SUITE}"
 echo "  ROLE_FILTER       = ${ROLE_FILTER:-（全グループ）}"

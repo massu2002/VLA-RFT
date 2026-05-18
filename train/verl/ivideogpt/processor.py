@@ -190,17 +190,25 @@ class ContextMultiStepPredictionProcessor:
             # recon = self.visual_tokenizer.detokenize(ctx_tokens, dyn_tokens).clip(0, 1)
         ctx_tokens += self.config.visual_token_num # offset context tokens
         hist_dyn_tokens = dyn_tokens  # [B, T, h*w]
-        # breakpoint()
-        action_tokens = self._discretize_actions(actions[:, 1:], self.config.action_bins)  # [B, T, num_actions]
+        # actions has shape [B, T+1, A] (first_action prepended + raw_actions + end_action).
+        # Drop the last (repeated) entry so we get T actions aligned with T dyn steps:
+        #   pair t: [act_{t} | dyn_{t}] — matches offline training [ACT|DYN] per-step layout.
+        action_tokens = self._discretize_actions(actions[:, :-1], self.config.action_bins)  # [B, T, num_actions]
         action_tokens += self.config.visual_token_num * 2  # offset action tokens
-        
-        
-        hist_tokens = torch.cat([hist_dyn_tokens, action_tokens], dim=-1).reshape(b, -1)  # [B, T*(h*w+num_actions)]
-        input_ids = torch.cat([ctx_tokens.reshape(b, -1), hist_tokens], dim=-1)  # [B, H*W + T*(h*w+num_actions)]
-        
-        labels = hist_tokens
-        labels[:, :hist_dyn_tokens.shape[-1]] = -100
-        labels = torch.cat([torch.ones_like(ctx_tokens.reshape(b, -1)) * -100, labels], dim=-1)
+
+        # [ACT|DYN] per step — matches worldmodel/core/processor.py offline training format.
+        n_act = action_tokens.shape[-1]
+        step_tokens = torch.cat([action_tokens, hist_dyn_tokens], dim=-1)  # [B, T, n_act + N_dyn]
+        hist_tokens = step_tokens.reshape(b, -1)
+        input_ids = torch.cat([ctx_tokens.reshape(b, -1), hist_tokens], dim=-1)
+
+        # Supervise only DYN positions; mask ctx and ACT (matches offline training).
+        step_labels = torch.full_like(step_tokens, -100)
+        step_labels[..., n_act:] = hist_dyn_tokens
+        labels = torch.cat([
+            torch.ones_like(ctx_tokens.reshape(b, -1)) * -100,
+            step_labels.reshape(b, -1),
+        ], dim=-1)
         
         attention_mask = torch.ones_like(input_ids).to(torch.float32)
         position_ids = compute_position_id_with_mask(attention_mask)

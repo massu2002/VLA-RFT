@@ -24,6 +24,7 @@ BATCH_SIZE_PER_DEVICE="${BATCH_SIZE_PER_DEVICE:-1}"
 TOKENIZER_MICRO_BATCH_SIZE="${TOKENIZER_MICRO_BATCH_SIZE:-4}"
 MAX_STEPS="${MAX_STEPS:-150000}"
 PRECISION="${PRECISION:-bf16}"
+SEGMENT_LENGTH="${SEGMENT_LENGTH:-9}"  # 9 frames -> 8 action steps, matching LIBERO policy chunks
 
 if [ -n "${LIBERO_TASKS:-}" ]; then
   read -r -a TASKS <<< "${LIBERO_TASKS}"
@@ -83,7 +84,7 @@ for task_name in "${TASKS[@]}"; do
     --visual-tokenizer "${visual_tokenizer_dir}"
     --output-dir "${output_dir}"
     --max-steps "${MAX_STEPS}"
-    --segment-length 8
+    --segment-length "${SEGMENT_LENGTH}"
     --context-length 1
     --tokenizer-micro-batch-size "${TOKENIZER_MICRO_BATCH_SIZE}"
     --batch-size-per-device "${BATCH_SIZE_PER_DEVICE}"
@@ -108,8 +109,13 @@ for task_name in "${TASKS[@]}"; do
     if (( NPROC_PER_NODE == 1 )); then
       ./.venv/bin/python "${train_cmd[@]}"
     else
+      # Pick a free port each run to avoid EADDRINUSE when tasks run back-to-back.
+      # torchrun --standalone internally calls get_free_port() but the port can still
+      # be in TIME_WAIT from the previous task (default TIME_WAIT is 60-120 s).
+      _MASTER_PORT="${MASTER_PORT:-$(python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()')}"
       torchrun --standalone --nnodes=1 \
         --nproc_per_node="${NPROC_PER_NODE}" \
+        --master_port="${_MASTER_PORT}" \
         "${train_cmd[@]}"
     fi
   ) 2>&1 | tee "${task_log}"

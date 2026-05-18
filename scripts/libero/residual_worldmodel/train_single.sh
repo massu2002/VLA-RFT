@@ -64,7 +64,7 @@ LR="1e-4"                       # 学習率
 BATCH_SIZE=4                    # per-device batch size
 GRAD_ACCUM=1                    # gradient accumulation steps
 #   effective batch = BATCH_SIZE * N_GPUS * GRAD_ACCUM
-ACTION_HORIZON=7                # = segment_length - 1
+ACTION_HORIZON=8                # = segment_length - 1
 OVERRIDE_MAX_STEPS=""           # 空=task別デフォルト; 例: 12000
 PRECISION="bf16"                # bf16 | fp16 | fp32
 WARMUP_RATIO=0.02

@@ -217,28 +217,30 @@ class vLLMRollout(BaseRollout):
                     gt_actions = prompts.batch["gt_action_ids"]
                     gt_idx_list = copy.deepcopy(idx_list)
                     for t in range(gt_actions.shape[1]-1):
+                        # [ACT|DYN] layout: prepend next action BEFORE generating dyn tokens.
+                        for j in range(len(gt_idx_list)):
+                            gt_idx_list[j] += gt_actions[j, t+1].detach().cpu().numpy().tolist()
                         output = self.inference_engine.generate(
-                            prompt_token_ids=idx_list,
+                            prompt_token_ids=gt_idx_list,
                             prompts=None,
                             sampling_params=self.sampling_params,
                             use_tqdm=False
                         )
-                        # breakpoint()
                         for j in range(len(output[0])):
                             gt_idx_list[j] += output[0][j].cpu().numpy().tolist()
-                            gt_idx_list[j] += gt_actions[j, t+1].detach().cpu().numpy().tolist()
                         gt_response = torch.tensor(gt_idx_list)[:, self.config.prompt_length:].to(idx.device)
                 for t in range(actions.shape[1]-1):  # T-1
+                    # [ACT|DYN] layout: prepend next action BEFORE generating dyn tokens.
+                    for j in range(len(idx_list)):
+                        idx_list[j] += actions[j, t+1].detach().cpu().numpy().tolist()
                     output = self.inference_engine.generate(
                         prompt_token_ids=idx_list,
                         prompts=None,
                         sampling_params=self.sampling_params,
                         use_tqdm=False
                     )
-                    # breakpoint()
                     for j in range(len(output[0])):
                         idx_list[j] += output[0][j].cpu().numpy().tolist()
-                        idx_list[j] += actions[j, t+1].detach().cpu().numpy().tolist()
                 response = torch.tensor(idx_list)[:, self.config.prompt_length:].to(idx.device)
 
             else:

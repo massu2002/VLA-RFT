@@ -33,7 +33,7 @@ from worldmodel.libero.visualize import (
     compute_sequence_metrics_all,
     rollout_episode_single_pass,
 )
-from worldmodel.residual_worldmodel.pixel_residual_utils import aggregate_phase1_metrics, get_lpips_fn
+from worldmodel.dynquery.utils import aggregate_phase1_metrics, get_lpips_fn
 
 
 def sha256_file(path: Path) -> str:

@@ -1307,15 +1307,16 @@ class RayVLARFTGRPOTrainer(RayPPOTrainer):
         action_dim = self.config.processor.action_dim
         # breakpoint()
         output_tokens = batch.batch["responses"].reshape(batch_size, segment_length - 1, tokens_per_frame + action_dim)
-        output_tokens = output_tokens[:, :, :tokens_per_frame]
+        # [ACT|DYN] per-step layout: DYN tokens occupy the last tokens_per_frame positions.
+        output_tokens = output_tokens[:, :, action_dim:]
         output_tokens = output_tokens.clamp(0, self.config.processor.visual_token_num - 1).long()
-        
+
         ctx_tokens = batch.batch["ctx_tokens"]
         output_tokens = output_tokens.reshape(batch_size, segment_length - 1, tokens_per_frame)
 
         if self.config.world_model_rollout.rollout.w_gt_ac:
             gt_output_tokens = batch.batch["gt_responses"].reshape(batch_size, segment_length - 1, tokens_per_frame + action_dim)
-            gt_output_tokens = gt_output_tokens[:, :, :tokens_per_frame]
+            gt_output_tokens = gt_output_tokens[:, :, action_dim:]
             gt_output_tokens = gt_output_tokens.clamp(0, self.config.processor.visual_token_num - 1).long()
             detokenize_output = self.tokenizer_wg.detokenize(
                 DataProto.from_single_dict({"tokens": output_tokens, "ctx_tokens": ctx_tokens}),
@@ -1330,8 +1331,8 @@ class RayVLARFTGRPOTrainer(RayPPOTrainer):
         if 'recon_loss' in detokenize_output.batch.keys():
             recon_loss = detokenize_output.batch['recon_loss']
         else:
-            pred = detokenize_output.batch['pixels'].clamp(0.0, 1.0)[:, 1:]
-            real = pixels[:, 2:]
+            pred = detokenize_output.batch['pixels'].clamp(0.0, 1.0)
+            real = pixels[:, 1:]
             if self.config.trainer.reward_fn == 'mse':
                 recon_loss = torch.mean((real - pred)**2, dim=(2, 3, 4))
             elif self.config.trainer.reward_fn == 'mae':
@@ -1364,8 +1365,8 @@ class RayVLARFTGRPOTrainer(RayPPOTrainer):
 
         if save_pred:
 
-            pred = detokenize_output.batch['pixels'].clamp(0.0, 1.0)[:, 1:]
-            real = pixels.batch['pixels'][:, 2:]
+            pred = detokenize_output.batch['pixels'].clamp(0.0, 1.0)
+            real = pixels[:, 1:]
             if self.config.world_model_rollout.rollout.w_gt_ac:
                 gt_ac_gen = detokenize_output.batch['real']
                 for i in range(5):
@@ -1582,7 +1583,12 @@ class RayVLARFTGRPOTrainer(RayPPOTrainer):
                     "gt_actions": gt_actions
                 })
 
-                _wm_pixels = wm_raw_pixel_values if wm_raw_pixel_values is not None else raw_pixel_values
+                phase1_residual_enabled = self.config.processor.get("phase1_residual", {}).get("enabled", False)
+                _wm_pixels = (
+                    wm_raw_pixel_values
+                    if phase1_residual_enabled and wm_raw_pixel_values is not None
+                    else raw_pixel_values
+                )
                 wm_batch = DataProto.from_single_dict({
                     "pixels": _wm_pixels
                 })

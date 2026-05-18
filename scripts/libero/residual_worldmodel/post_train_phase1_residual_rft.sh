@@ -26,7 +26,7 @@ if [[ -z "${WORLD_MODEL_CKPT}" ]]; then
   echo "WORLD_MODEL_CKPT is required" >&2
   exit 2
 fi
-if [[ -z "${WORLD_MODEL_CONFIG}" ]]; then
+if [[ "${MODEL_GENERATION}" != "baseline" && -z "${WORLD_MODEL_CONFIG}" ]]; then
   WORLD_MODEL_CONFIG="${WORLD_MODEL_CKPT}/pixel_residual_config.json"
 fi
 if [[ ! -d "${WORLD_MODEL_CKPT}" ]]; then
@@ -58,7 +58,7 @@ if "${MODEL_GENERATION}" != "baseline":
 info = {
     "task_suite": "${TASK_SUITE}",
     "world_model_ckpt": "${WORLD_MODEL_CKPT}",
-    "world_model_config": "${WORLD_MODEL_CONFIG}",
+    "world_model_config": "" if "${MODEL_GENERATION}" == "baseline" else "${WORLD_MODEL_CONFIG}",
     "target_mode": "${TARGET_MODE}",
     "model_generation": "${MODEL_GENERATION}",
     "rft_steps": int("${RFT_STEPS}"),
@@ -83,7 +83,7 @@ git status --short > "${OUTPUT_DIR}/git_status.txt" || true
 
 if [[ "${DRY_RUN}" != "1" ]]; then
   if [[ "${MODEL_GENERATION}" != "baseline" ]]; then
-    "${VENV_PATH}/bin/python" -m worldmodel.residual_worldmodel.rft_inference \
+    "${VENV_PATH}/bin/python" -m worldmodel.dynquery.rft \
       --checkpoint "${WORLD_MODEL_CKPT}" \
       --target-mode "${TARGET_MODE}" \
       --model-generation "${MODEL_GENERATION}" \

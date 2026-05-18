@@ -153,7 +153,7 @@ if [ "${RUN_BASELINE_EVAL}" = "1" ]; then
     PHASE0_TOKENIZER_CKPT="${BASELINE_TOKENIZER_CKPT}" \
     WINDOW_MANIFEST="${_BL_MANIFEST}" \
     OUTPUT_DIR="${_BL_OUT}" \
-    EVAL_HORIZON="${EVAL_HORIZON:-7}" \
+    EVAL_HORIZON="${EVAL_HORIZON:-8}" \
     LIBERO_DATA_ROOT="${LIBERO_DATA_ROOT}" \
       bash scripts/libero/residual_worldmodel/eval_phase0_ar_pixel_on_phase1_manifest.sh
     echo "    完了 → ${_BL_OUT}/aggregate_metrics.json"

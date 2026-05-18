@@ -42,9 +42,9 @@ MATCH_PHASE0_HPARAMS="${MATCH_PHASE0_HPARAMS:-1}"
 
 # Phase0 AR-Pixel WM defaults:
 #   max_steps=150000, global_batch=16, per-device batch=1, lr=5e-5,
-#   warmup=0, scheduler=constant, precision=bf16, future horizon=7.
+#   warmup=0, scheduler=constant, precision=bf16, future horizon=8.
 # PixelResidualWorldModel internally uses pixels[:,1] as current and
-# pixels[:,2:] as target future, so horizon=7 requires SEGMENT_LENGTH=9.
+# pixels[:,2:] as target future, so horizon=8 requires SEGMENT_LENGTH=10.
 case "${MATCH_PHASE0_HPARAMS}" in
   0|false|FALSE|False|no|NO)
     _DEFAULT_LR="1e-4"
@@ -61,7 +61,7 @@ case "${MATCH_PHASE0_HPARAMS}" in
     _DEFAULT_LR="5e-5"
     _DEFAULT_WORLD_BATCH="16"
     _DEFAULT_BATCH_SIZE="1"
-    _DEFAULT_TRAIN_HORIZON="7"
+    _DEFAULT_TRAIN_HORIZON="8"
     _DEFAULT_PRECISION="bf16"
     _DEFAULT_WARMUP_RATIO="0.0"
     _DEFAULT_LR_SCHEDULER="constant"

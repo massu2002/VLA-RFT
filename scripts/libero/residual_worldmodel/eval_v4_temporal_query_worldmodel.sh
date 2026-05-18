@@ -17,7 +17,7 @@
 #   OUTPUT_DIR              — output dir
 #   NUM_EVAL_WINDOWS        — total windows (default: 200)
 #   NUM_RANKING_WINDOWS     — windows for ranking eval (default: 100)
-#   EVAL_HORIZON            — rollout horizon H (default: 7)
+#   EVAL_HORIZON            — rollout horizon H (default: 8)
 #   SEED, DEVICE
 #   DRY_RUN_WINDOWS         — >0 limits windows per task for quick sanity check
 #   SAVE_DEBUG_VISUALS      — 1 to save v4 debug PNGs (masks, queries, overlays)
@@ -74,7 +74,7 @@ DATA_ROOT="${DATA_ROOT:-$(default_libero_data_root)}"
 NUM_EVAL_WINDOWS="${NUM_EVAL_WINDOWS:-200}"
 NUM_RANKING_WINDOWS="${NUM_RANKING_WINDOWS:-100}"
 NUM_SHUFFLE_REPS="${NUM_SHUFFLE_REPS:-3}"
-EVAL_HORIZON="${EVAL_HORIZON:-7}"
+EVAL_HORIZON="${EVAL_HORIZON:-8}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-4}"
 
 
@@ -105,9 +105,9 @@ if [ ! -d "${MODEL_DIR}" ]; then
   echo "[eval_v4] ERROR: MODEL_DIR not found: ${MODEL_DIR}" >&2
   exit 1
 fi
-if [ ! -f "${MODEL_DIR}/v4_config.json" ]; then
-  echo "[eval_v4] ERROR: v4_config.json not found in ${MODEL_DIR}" >&2
-  echo "[eval_v4] Ensure v4 training has completed and save_pretrained() was called." >&2
+if [ ! -f "${MODEL_DIR}/dynquery_config.json" ] && [ ! -f "${MODEL_DIR}/v4_config.json" ]; then
+  echo "[eval_v4] ERROR: neither dynquery_config.json nor v4_config.json found in ${MODEL_DIR}" >&2
+  echo "[eval_v4] Ensure training has completed and save_pretrained() was called." >&2
   exit 1
 fi
 
@@ -151,7 +151,7 @@ print_run_summary \
 # Build eval command
 # ---------------------------------------------------------------------------
 EVAL_ARGS=(
-  -m worldmodel.residual_worldmodel.eval_v4_temporal_query_libero
+  -m worldmodel.dynquery.eval
   --task-suite           "${TASK_SUITE}"
   --model-dir            "${MODEL_DIR}"
   --data-root            "${DATA_ROOT}"

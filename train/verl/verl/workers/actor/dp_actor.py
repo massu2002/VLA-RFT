@@ -115,7 +115,9 @@ class DataParallelPPOActor(BasePPOActor):
         const_term = 0.5 * (torch.log(torch.tensor(2.0 * torch.pi, device=device, dtype=torch.float32)) + 1.0)  # 0.5*log(2πe)
 
         # ---- Encode context once ----
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+        # LLM/vision backbone is frozen: no_grad avoids building the autograd graph
+        # for parameters that are not in the optimizer, saving memory and compute.
+        with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             output = self.actor_module(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -124,7 +126,7 @@ class DataParallelPPOActor(BasePPOActor):
                 output_hidden_states=True,
                 proprio=None,
                 proprio_projector=None,
-                noisy_actions=None,                
+                noisy_actions=None,
                 noisy_action_projector=None,
                 use_film=False,
             )
@@ -180,11 +182,10 @@ class DataParallelPPOActor(BasePPOActor):
             if return_entropy:
                 # per-dim entropy accumulation: log σ + 0.5*log(2πe)
                 entropy_per_dim += log_std.to(torch.float32) + const_term              # (B, chunk_len, action_dim)
-        # breakpoint()
-        # Flatten to (B, chunk_len*action_dim)
-        logp_vec = logp_per_dim.reshape(B, chunk_len * action_dim).to(torch.bfloat16)
+        # Average over K integration steps to match paper Eq.: ℓ̄ = (1/K)∑ log p^(k)
+        logp_vec = (logp_per_dim / K).reshape(B, chunk_len * action_dim).to(torch.bfloat16)
         if return_entropy:
-            entropy_per_dim = entropy_per_dim / (K + 1)  
+            entropy_per_dim = entropy_per_dim / K
             entropy_vec = entropy_per_dim.reshape(B, chunk_len * action_dim).to(torch.bfloat16)
             if return_hidden_states:
                 # breakpoint()

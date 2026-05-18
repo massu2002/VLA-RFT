@@ -17,7 +17,7 @@
 #   OUTPUT_DIR              — output dir (default: results/phase1/residual_worldmodel/<condition_name>)
 #   NUM_EVAL_WINDOWS        — total windows (default: 200)
 #   NUM_RANKING_WINDOWS     — windows for ranking eval (default: 100)
-#   EVAL_HORIZON            — rollout horizon H (default: 7)
+#   EVAL_HORIZON            — rollout horizon H (default: 8)
 #   SEED, DEVICE
 #   DRY_RUN_WINDOWS         — >0 limits windows per task for quick sanity check
 #   SAVE_DEBUG_IMAGES       — 1 to save debug PNGs
@@ -77,7 +77,7 @@ DATA_ROOT="${DATA_ROOT:-$(default_libero_data_root)}"
 NUM_EVAL_WINDOWS="${NUM_EVAL_WINDOWS:-200}"
 NUM_RANKING_WINDOWS="${NUM_RANKING_WINDOWS:-100}"
 NUM_SHUFFLE_REPS="${NUM_SHUFFLE_REPS:-3}"
-EVAL_HORIZON="${EVAL_HORIZON:-7}"
+EVAL_HORIZON="${EVAL_HORIZON:-8}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-4}"
 HELDOUT_RATIO="${HELDOUT_RATIO:-0.2}"
 LPIPS_BATCH_SIZE="${LPIPS_BATCH_SIZE:-4}"
