@@ -53,7 +53,7 @@ def build_parser():
 
     # --- Training ---
     parser.add_argument("--max-steps", type=int, default=150000)
-    parser.add_argument("--segment-length", type=int, default=8)
+    parser.add_argument("--segment-length", type=int, default=9)  # 9 total = 1 context + 8 predicted (paper: segment_length=8 predicted)
     parser.add_argument("--context-length", type=int, default=1)
     parser.add_argument("--tokenizer-micro-batch-size", type=int, default=4)
     parser.add_argument("--batch-size-per-device", type=int, default=1)

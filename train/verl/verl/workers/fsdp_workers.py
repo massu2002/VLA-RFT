@@ -2482,17 +2482,23 @@ class TokenizerWorker(Worker):
                 real = real.repeat_interleave(pixels.shape[0] // real.shape[0], dim=0)
             if self.config.interact:
                 pred = pixels.clamp(0.0, 1.0)
+                # Align frame counts: interact mode generates ceil(max_response_length/tokens_per_frame)
+                # frames which may exceed the GT horizon by 1 when max_response_length is not a
+                # multiple of tokens_per_frame (e.g. 568 tokens / 64 per frame = 8.875 → 9 frames,
+                # but GT has only 8). Truncate to the shorter of the two.
+                n_frames = min(real.shape[1], pred.shape[1])
+                real_cmp = real[:, :n_frames]
+                pred_cmp = pred[:, :n_frames]
                 perceptual_loss = self._perceptual_loss(
-                    real.reshape(-1, *real.shape[-3:]), 
-                    pred.reshape(-1, *pred.shape[-3:]),
+                    real_cmp.reshape(-1, *real_cmp.shape[-3:]),
+                    pred_cmp.reshape(-1, *pred_cmp.shape[-3:]),
                 )
-                # breakpoint()
-                perceptual_loss = perceptual_loss.reshape(*pred.shape[:-3])
+                perceptual_loss = perceptual_loss.reshape(*pred_cmp.shape[:-3])
                 if 'recon' in lpips_data.meta_info.keys():
                     if lpips_data.meta_info['recon'] == 'mse':
-                        output['recon_loss'] = torch.mean((real - pred)**2, dim=(2, 3, 4))
+                        output['recon_loss'] = torch.mean((real_cmp - pred_cmp)**2, dim=(2, 3, 4))
                     elif lpips_data.meta_info['recon'] == 'mae':
-                        output['recon_loss'] = torch.mean(torch.abs(real - pred), dim=(2, 3, 4))
+                        output['recon_loss'] = torch.mean(torch.abs(real_cmp - pred_cmp), dim=(2, 3, 4))
                 output['perceptual_loss'] = perceptual_loss
             else:
                 if self.config.tokenizer.name == 'ctx_cnn':

@@ -84,14 +84,41 @@ def aggregate_phase1_metrics(
     )
 
     scalar_keys = [
+        # Primary: reconstruction
         "horizon_avg_lpips",
         "horizon_avg_mae",
         "horizon_avg_mse",
         "rft_reward_proxy",
         "copy_current_horizon_avg_mse",
         "horizon_mse_over_copy",
+        # Primary: per-step LPIPS / MAE
+        "lpips_step1",
+        "lpips_step4",
+        "lpips_step8",
+        "mae_step1",
+        "mae_step4",
+        "mae_step8",
+        # Primary: GT-masked dynamic / static
+        "dynamic_region_mse_gt",
+        "dynamic_region_mae_gt",
+        "dynamic_region_lpips_gt",
+        "static_consistency_mse",
+        "static_consistency_mae",
+        # Primary: ROI
+        "roi/gripper_mse",
+        "roi/gripper_mae",
+        "roi/gripper_lpips",
+        "roi/goal_mse",
+        "roi/goal_mae",
+        "roi/goal_lpips",
+        # Secondary: ranking
         "score_gap",
         "rft_reward_gap",
+        # Secondary: dynamic mask localisation
+        "dynamic_mask_iou_gt",
+        "dynamic_mask_precision_gt",
+        "dynamic_mask_recall_gt",
+        # Debug: model internals
         "fuser_mask_entropy",
         "fuser_mask_overlap",
         "dynamic_mask_entropy",
@@ -167,7 +194,6 @@ def aggregate_phase1_metrics(
 
     def _bucket_to_metrics(bucket: Dict[str, List[float]]) -> Dict[str, float]:
         metrics = {k: _mean(bucket[k]) for k in scalar_keys}
-        metrics["pairwise_acc_rft"] = _mean(bucket["pairwise_win_rft"])
         metrics["pairwise_acc_score"] = _mean(bucket["pairwise_win_score"])
         metrics["num_windows"] = len(bucket["pairwise_win_rft"])
         for neg in negative_types:
@@ -175,6 +201,12 @@ def aggregate_phase1_metrics(
             metrics[f"score_gap_mean_{neg}"] = _mean(bucket[f"score_gap_{neg}"])
             metrics[f"pairwise_acc_rft_{neg}"] = _mean(bucket[f"pairwise_win_rft_{neg}"])
             metrics[f"pairwise_acc_score_{neg}"] = _mean(bucket[f"pairwise_win_score_{neg}"])
+        _per_type_accs = [
+            metrics[f"pairwise_acc_rft_{neg}"]
+            for neg in negative_types
+            if _is_valid(metrics.get(f"pairwise_acc_rft_{neg}"))
+        ]
+        metrics["pairwise_acc_rft"] = _mean(_per_type_accs) if _per_type_accs else _mean(bucket["pairwise_win_rft"])
         return metrics
 
     def _phase_sort_key(phase: str) -> int:
@@ -204,6 +236,13 @@ def aggregate_phase1_metrics(
 
     rft_gaps = agg.get("rft_reward_gap", [])
     agg_metrics["rft_reward_gap_min"] = float(np.min(rft_gaps)) if rft_gaps else float("nan")
+
+    # Reward signal stability
+    rft_proxies = agg.get("rft_reward_proxy", [])
+    agg_metrics["rft_reward_proxy_std"]   = float(np.std(rft_proxies))  if rft_proxies else float("nan")
+    agg_metrics["rft_reward_proxy_range"] = float(np.ptp(rft_proxies))  if rft_proxies else float("nan")
+    agg_metrics["rft_reward_gap_std"]     = float(np.std(rft_gaps))     if rft_gaps    else float("nan")
+
     for neg in negative_types:
         rft_gap_key = f"rft_reward_gap_{neg}"
         score_gap_key = f"score_gap_{neg}"
@@ -219,6 +258,16 @@ def aggregate_phase1_metrics(
         agg_metrics[f"pairwise_acc_score_{neg}"] = _mean(
             _collect_bool_metric(f"pairwise_win_score_{neg}", f"score_shuffle_{neg}")
         )
+
+    # Override pairwise_acc_rft with the mean of per-type accuracies so the overall
+    # metric reflects all negative types equally rather than the pooled-equal strategy.
+    _per_type_accs = [
+        agg_metrics[f"pairwise_acc_rft_{neg}"]
+        for neg in negative_types
+        if _is_valid(agg_metrics.get(f"pairwise_acc_rft_{neg}"))
+    ]
+    if _per_type_accs:
+        agg_metrics["pairwise_acc_rft"] = _mean(_per_type_accs)
 
     by_phase: Dict[str, Dict[str, List[float]]] = {}
     for row in per_window_rows:
@@ -325,11 +374,16 @@ def aggregate_phase1_metrics(
     with open(os.path.join(output_dir, "config_used.json"), "w") as f:
         json.dump({"condition": condition_name}, f, indent=2)
 
-    logger.info("[phase1_metrics] %s: pairwise_acc_rft=%.4f  horizon_avg_lpips=%.4f  horizon_avg_mse=%.6f  n=%d",
-                condition_name,
-                agg_metrics.get("pairwise_acc_rft", float("nan")),
-                agg_metrics.get("horizon_avg_lpips", float("nan")),
-                agg_metrics.get("horizon_avg_mse", float("nan")),
-                num_windows)
+    logger.info(
+        "[phase1_metrics] %s: pairwise_acc_rft=%.4f  lpips=%.4f  dyn_lpips_gt=%.4f  "
+        "rft_proxy_std=%.4f  gap_std=%.4f  n=%d",
+        condition_name,
+        agg_metrics.get("pairwise_acc_rft", float("nan")),
+        agg_metrics.get("horizon_avg_lpips", float("nan")),
+        agg_metrics.get("dynamic_region_lpips_gt", float("nan")),
+        agg_metrics.get("rft_reward_proxy_std", float("nan")),
+        agg_metrics.get("rft_reward_gap_std", float("nan")),
+        num_windows,
+    )
 
     return agg_metrics

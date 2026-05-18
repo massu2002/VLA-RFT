@@ -77,7 +77,7 @@ export SEGMENT_LENGTH
 
 CKPT_ROOT="${CKPT_ROOT:-${REPO_ROOT}/checkpoints/libero/DynQueryWorldModel/core_sweep}"
 OUT_ROOT="${OUT_ROOT:-${REPO_ROOT}/results/phase1/DynQueryWorldModel_core_sweep}"
-SWEEP_CONFIG="${SWEEP_CONFIG:-${REPO_ROOT}/configs/libero/phase1/dynquery_core_sweep.json}"
+SWEEP_CONFIG="${SWEEP_CONFIG:-${REPO_ROOT}/configs/libero/dynquery_core_sweep.json}"
 MODE="${MODE:-train_eval}"
 DRY_RUN="${DRY_RUN:-0}"
 SMOKE="${SMOKE:-0}"

@@ -6,6 +6,7 @@ __pycache__
 .venv5090_eval
 .libero_phase1_eval
 .libero_base_eval
+.venv_pro6000
 reports
 logs
 tensorboard_log

@@ -199,10 +199,12 @@ def compute_roi_metrics_np(
         return {}
 
     gripper_mse_list:   List[float] = []
+    gripper_mae_list:   List[float] = []
     gripper_psnr_list:  List[float] = []
     gripper_ssim_list:  List[float] = []
     gripper_lpips_list: List[float] = []
     goal_mse_list:      List[float] = []
+    goal_mae_list:      List[float] = []
     goal_psnr_list:     List[float] = []
     goal_ssim_list:     List[float] = []
     goal_lpips_list:    List[float] = []
@@ -218,6 +220,7 @@ def compute_roi_metrics_np(
         gg_f   = g_gt.astype(np.float32)   / 255.0
 
         gripper_mse_list.append(float(np.mean((gp_f - gg_f) ** 2)))
+        gripper_mae_list.append(float(np.mean(np.abs(gp_f - gg_f))))
         gripper_psnr_list.append(_psnr_np(g_gt, g_pred))
         gripper_ssim_list.append(_ssim_np(g_gt, g_pred))
         try:
@@ -232,6 +235,7 @@ def compute_roi_metrics_np(
         lg_f   = l_gt.astype(np.float32)   / 255.0
 
         goal_mse_list.append(float(np.mean((lp_f - lg_f) ** 2)))
+        goal_mae_list.append(float(np.mean(np.abs(lp_f - lg_f))))
         goal_psnr_list.append(_psnr_np(l_gt, l_pred))
         goal_ssim_list.append(_ssim_np(l_gt, l_pred))
         try:
@@ -246,17 +250,21 @@ def compute_roi_metrics_np(
     return {
         # scalars (averages over horizon)
         "roi/gripper_mse":   _mean(gripper_mse_list),
+        "roi/gripper_mae":   _mean(gripper_mae_list),
         "roi/gripper_lpips": _mean(gripper_lpips_list),
         "roi/gripper_psnr":  _mean(gripper_psnr_list),
         "roi/gripper_ssim":  _mean(gripper_ssim_list),
         "roi/goal_mse":      _mean(goal_mse_list),
+        "roi/goal_mae":      _mean(goal_mae_list),
         "roi/goal_lpips":    _mean(goal_lpips_list),
         "roi/goal_psnr":     _mean(goal_psnr_list),
         "roi/goal_ssim":     _mean(goal_ssim_list),
         # multi-step per-frame lists
         "roi/multi_step_gripper_mse":    gripper_mse_list,
+        "roi/multi_step_gripper_mae":    gripper_mae_list,
         "roi/multi_step_gripper_lpips":  gripper_lpips_list,
         "roi/multi_step_goal_mse":       goal_mse_list,
+        "roi/multi_step_goal_mae":       goal_mae_list,
         "roi/multi_step_goal_lpips":     goal_lpips_list,
     }
 

@@ -17,6 +17,7 @@ from typing import Any
 import numpy as np
 import tensorflow_datasets as tfds
 import torch
+from tqdm import tqdm
 import torch.nn.functional as F
 
 from worldmodel.datasets.libero.data import resolve_dataset_name
@@ -71,6 +72,39 @@ def build_episode_lookup(ds) -> dict[str, dict]:
     return out
 
 
+def build_episode_lookup_selective(ds, needed_indices: set[int]) -> dict[str, dict]:
+    """Load only episodes referenced by the manifest.
+
+    Iterates the dataset lazily (no tfds.as_numpy on the full dataset), converts
+    only the needed episodes to numpy, and stops as soon as all are found.
+    This avoids loading image tensors for episodes that are never used.
+    """
+    out: dict[str, dict] = {}
+    remaining = set(needed_indices)
+    for idx, ep in enumerate(ds):
+        if idx not in needed_indices:
+            continue
+        path = ep["episode_metadata"]["file_path"].numpy().decode("utf-8", errors="ignore")
+        steps_np = []
+        for step in ep["steps"]:
+            step_np: dict = {}
+            for k, v in step.items():
+                if k == "observation":
+                    step_np["observation"] = {k2: v2.numpy() for k2, v2 in v.items()}
+                else:
+                    step_np[k] = v.numpy() if hasattr(v, "numpy") else v
+            steps_np.append(step_np)
+        ep_np = {"episode_metadata": {"file_path": path.encode()}, "steps": steps_np}
+        out[path] = ep_np
+        out[os.path.basename(path)] = ep_np
+        out[episode_id(path)] = ep_np
+        out[str(idx)] = ep_np
+        remaining.discard(idx)
+        if not remaining:
+            break
+    return out
+
+
 def episode_arrays(ep: dict) -> tuple[np.ndarray, np.ndarray]:
     steps = list(ep["steps"])
     imgs = np.stack([s["observation"]["image"] for s in steps], axis=0).astype(np.uint8)
@@ -105,6 +139,14 @@ def masked_mse_np(a: np.ndarray, b: np.ndarray, mask: np.ndarray) -> float:
     if m.sum() <= 0:
         return float("nan")
     diff = (a.astype(np.float32) / 255.0 - b.astype(np.float32) / 255.0) ** 2
+    return float((diff * m[:, :, None]).sum() / (m.sum() * a.shape[-1]))
+
+
+def masked_mae_np(a: np.ndarray, b: np.ndarray, mask: np.ndarray) -> float:
+    m = mask.astype(np.float32)
+    if m.sum() <= 0:
+        return float("nan")
+    diff = np.abs(a.astype(np.float32) / 255.0 - b.astype(np.float32) / 255.0)
     return float((diff * m[:, :, None]).sum() / (m.sum() * a.shape[-1]))
 
 
@@ -291,15 +333,24 @@ def main() -> None:
     ap.add_argument("--dynamic-dilate-kernel", type=int, default=7)
     ap.add_argument("--num-shuffle-reps", type=int, default=3,
                     help="Number of negative action samples per window (same default as v4 eval)")
-    ap.add_argument("--negative-eval-types", default=os.environ.get("NEGATIVE_EVAL_TYPES", "same_phase,temporal_shift,action_noise,mixed"))
+    ap.add_argument("--negative-eval-types", default=os.environ.get("NEGATIVE_EVAL_TYPES", "same_phase,temporal_shift,action_noise"))
     ap.add_argument("--temporal-shift-max", type=int, default=int(os.environ.get("TEMPORAL_SHIFT_MAX", "3")))
     ap.add_argument("--action-noise-std", type=float, default=float(os.environ.get("ACTION_NOISE_STD", "0.15")))
     ap.add_argument("--seed", type=int, default=42,
                     help="Base seed for negative sampling RNG")
     ap.add_argument("--smoke", action="store_true")
+    ap.add_argument("--shard-index", type=int, default=0,
+                    help="0-based shard index for multi-GPU evaluation")
+    ap.add_argument("--num-shards", type=int, default=1,
+                    help="Total number of shards (= number of GPUs) for multi-GPU evaluation")
     args = ap.parse_args()
 
-    out = Path(args.output_dir)
+    # When sharded, write to a shard-specific subdirectory
+    out_base = Path(args.output_dir)
+    if args.num_shards > 1:
+        out = out_base / f"shard_{args.shard_index}_of_{args.num_shards}"
+    else:
+        out = out_base
     out.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if args.device == "auto" and torch.cuda.is_available() else ("cpu" if args.device == "auto" else args.device))
 
@@ -315,9 +366,26 @@ def main() -> None:
     if int(proto.get("eval_horizon", args.eval_horizon)) != int(args.eval_horizon):
         raise ValueError(f"eval_horizon mismatch: manifest={proto.get('eval_horizon')} current={args.eval_horizon}")
 
+    # all_windows: full manifest (used for negative sampling pool and episode loading)
+    all_windows = manifest.get("windows", [])
+
+    # Smoke / shard filtering applies only to evaluation windows
+    windows = all_windows
+    if args.smoke:
+        windows = windows[: max(1, min(2, len(windows)))]
+
+    # Round-robin shard assignment: shard i handles windows[i::num_shards]
+    if args.num_shards > 1:
+        windows = windows[args.shard_index :: args.num_shards]
+        print(f"[Shard {args.shard_index}/{args.num_shards}] Assigned {len(windows)} windows (round-robin)")
+
     dataset_name = resolve_dataset_name(args.task_suite)
     ds = tfds.load(dataset_name, data_dir=args.data_root, split="train", shuffle_files=False)
-    lookup = build_episode_lookup(ds)
+    # Load ALL manifest episodes so same_phase negative sampling works correctly across shards.
+    # Without this, each shard only has its subset of episodes and the same_phase pool collapses.
+    needed_indices = {int(w["episode_index"]) for w in all_windows if "episode_index" in w}
+    print(f"Loading {len(needed_indices)} episodes selectively (out of full dataset) ...")
+    lookup = build_episode_lookup_selective(ds, needed_indices)
 
     model = load_phase0_model(args, device).eval()
     lpips_model = __import__("lpips").LPIPS(net="alex").to(device).eval()
@@ -325,19 +393,20 @@ def main() -> None:
     roi_config = load_roi_config()
 
     rows = []
-    windows = manifest.get("windows", [])
-    if args.smoke:
-        windows = windows[: max(1, min(2, len(windows)))]
     negative_eval_types = parse_negative_eval_types(args.negative_eval_types)
-    default_negative_type = "mixed" if "mixed" in negative_eval_types else negative_eval_types[0]
+    # Primary pairwise uses pooled-equal negatives: same_phase, temporal_shift, action_noise
+    # each contribute equally. "mixed" (random pick) is excluded from the primary metric.
+    _POOLED_NEG_TYPES = ["same_phase", "temporal_shift", "action_noise"]
+    default_negative_type = "pooled_equal"  # metadata label for the primary metric
 
-    # Build per-task window list for negative sampling (same strategy as v4 eval:
-    # sample actions from another window of the same task, args.num_shuffle_reps times).
+    # Build negative sampling pool from ALL manifest windows (not just current shard's subset).
+    # With sharding, each shard had only ~4 windows/task, making same_phase pool near-empty.
     task_wins_by_id: dict[int, list[dict]] = defaultdict(list)
-    for w in windows:
+    for w in all_windows:
         task_wins_by_id[int(w["task_id"])].append(w)
 
-    for rec in windows:
+    pbar = tqdm(windows, desc="Evaluating windows", unit="win", dynamic_ncols=True)
+    for rec in pbar:
         task_id = int(rec["task_id"])
         task_name = rec.get("task_name", f"task{task_id}")
         current = int(rec["current_frame_index"])
@@ -371,6 +440,34 @@ def main() -> None:
         _h_avg_mse = float(seq["avg_mse"])
         _h_avg_mae = horizon_avg_mae(pred, gt)
         _rft_proxy = -(_h_avg_lpips + _h_avg_mae)
+        pbar.set_postfix({
+            "task": task_name[:30],
+            "lpips": f"{_h_avg_lpips:.4f}",
+            "mae": f"{_h_avg_mae:.4f}",
+            "rft": f"{_rft_proxy:.4f}",
+        })
+
+        # per-step LPIPS / MAE scalars
+        _lpips_per_frame = seq.get("lpips_per_frame", np.array([]))
+        lpips_step1 = float(_lpips_per_frame[0]) if len(_lpips_per_frame) > 0 else float("nan")
+        lpips_step4 = float(_lpips_per_frame[3]) if len(_lpips_per_frame) > 3 else float("nan")
+        lpips_step8 = float(_lpips_per_frame[7]) if len(_lpips_per_frame) > 7 else float("nan")
+        _mae_per_step = [
+            float(np.mean(np.abs(p.astype(np.float32) / 255.0 - g.astype(np.float32) / 255.0)))
+            for p, g in zip(pred, gt)
+        ]
+        mae_step1 = _mae_per_step[0] if len(_mae_per_step) > 0 else float("nan")
+        mae_step4 = _mae_per_step[3] if len(_mae_per_step) > 3 else float("nan")
+        mae_step8 = _mae_per_step[7] if len(_mae_per_step) > 7 else float("nan")
+
+        # masked MAE for dynamic/static regions
+        _dyn_mae_vals, _static_mae_vals = [], []
+        for _p, _g in zip(pred, gt):
+            _dm = dynamic_mask_np(current_img, _g, args.dynamic_threshold, args.dynamic_dilate_kernel)
+            _dyn_mae_vals.append(masked_mae_np(_p, _g, _dm))
+            _static_mae_vals.append(masked_mae_np(_p, current_img, 1.0 - _dm))
+        dynamic_region_mae_gt  = float(np.nanmean(_dyn_mae_vals))    if _dyn_mae_vals    else float("nan")
+        static_consistency_mae = float(np.nanmean(_static_mae_vals)) if _static_mae_vals else float("nan")
 
         neg_stats: dict[str, dict[str, float]] = {}
         for neg_type in negative_eval_types:
@@ -409,9 +506,18 @@ def main() -> None:
                 "rft_gap": _rft_proxy - _neg_proxy,
             }
 
-        default_stats = neg_stats[default_negative_type]
-        _shuffled_lpips = default_stats["lpips"]
-        _rft_reward_gap = default_stats["rft_gap"]
+        # Pool negatives equally from same_phase / temporal_shift / action_noise.
+        # Each type contributes the same weight regardless of num_shuffle_reps.
+        _pool_types = [t for t in _POOLED_NEG_TYPES if t in neg_stats]
+        if _pool_types:
+            _pooled_neg_lpips = float(np.nanmean([neg_stats[t]["lpips"] for t in _pool_types]))
+            _pooled_neg_mae   = float(np.nanmean([neg_stats[t]["mae"]   for t in _pool_types]))
+            _rft_reward_gap   = _rft_proxy - (-(_pooled_neg_lpips + _pooled_neg_mae))
+            _shuffled_lpips   = _pooled_neg_lpips
+        else:
+            _pooled_neg_lpips = float("nan")
+            _rft_reward_gap   = float("nan")
+            _shuffled_lpips   = float("nan")
         _copy_mse = cmet["copy_current_full_mse"]
         row = {
             "model_name": "phase0_ar_pixel_direct_eval",
@@ -439,14 +545,37 @@ def main() -> None:
             "horizon_mse_over_copy": _h_avg_mse / _copy_mse if _copy_mse > 0 else float("nan"),
             "rft_reward_gap": _rft_reward_gap,
             "pairwise_win_rft": _rft_reward_gap > 0,
-            # v4-specific fields are not applicable for Phase0
+            # per-step LPIPS / MAE (shared with DynQuery eval)
+            "lpips_step1": lpips_step1,
+            "lpips_step4": lpips_step4,
+            "lpips_step8": lpips_step8,
+            "mae_step1": mae_step1,
+            "mae_step4": mae_step4,
+            "mae_step8": mae_step8,
+            # GT-masked dynamic/static (shared naming with DynQuery eval)
+            "dynamic_region_mse_gt": dyn_mse,
+            "dynamic_region_mae_gt": dynamic_region_mae_gt,
+            "dynamic_region_lpips_gt": dyn_lpips,
+            "static_consistency_mse": static_mse,
+            "static_consistency_mae": static_consistency_mae,
+            # ROI metrics (shared naming with DynQuery eval)
+            "roi/gripper_mse":   roi.get("roi/gripper_mse",   float("nan")),
+            "roi/gripper_mae":   roi.get("roi/gripper_mae",   float("nan")),
+            "roi/gripper_lpips": roi.get("roi/gripper_lpips", float("nan")),
+            "roi/goal_mse":      roi.get("roi/goal_mse",      float("nan")),
+            "roi/goal_mae":      roi.get("roi/goal_mae",      float("nan")),
+            "roi/goal_lpips":    roi.get("roi/goal_lpips",    float("nan")),
+            # v4-specific fields not applicable for Phase0
             "score_gap": float("nan"),
             "fuser_mask_entropy": float("nan"),
             "fuser_mask_overlap": float("nan"),
             "dynamic_mask_entropy": float("nan"),
             "dynamic_mask_overlap": float("nan"),
             "future_dynamic_query_norm": float("nan"),
-            # Legacy / auxiliary fields kept for ranking_by_task and diagnostics
+            "dynamic_mask_iou_gt": float("nan"),
+            "dynamic_mask_precision_gt": float("nan"),
+            "dynamic_mask_recall_gt": float("nan"),
+            # Legacy aliases (kept for ranking_by_task backward compat)
             "correct_lpips": _h_avg_lpips,
             "shuffled_lpips": _shuffled_lpips,
             "lpips_gap": _shuffled_lpips - _h_avg_lpips,
@@ -459,10 +588,9 @@ def main() -> None:
             "goal_lpips": roi.get("roi/goal_lpips", float("nan")),
             "dynamic_mse": dyn_mse,
             "dynamic_lpips": dyn_lpips,
-            "static_consistency_mse": static_mse,
             **cmet,
         }
-        row["negative_metric_type"] = default_negative_type
+        row["negative_metric_type"] = f"pooled({','.join(_pool_types)})" if _pool_types else "none"
         for neg_type, stats in neg_stats.items():
             suffix = negative_metric_suffix(neg_type)
             row[f"rft_reward_gap_{suffix}"] = stats["rft_gap"]
@@ -472,8 +600,25 @@ def main() -> None:
             row[f"pairwise_win_score_{suffix}"] = False
         rows.append(row)
 
+    # Always write rows.jsonl so merge_eval_shards.py can re-aggregate across shards
+    (out / "rows.jsonl").write_text(
+        "\n".join(json.dumps(r, allow_nan=True) for r in rows) + "\n",
+        encoding="utf-8",
+    )
+
     metrics = aggregate_phase1_metrics(rows, str(out), "phase0_ar_pixel_direct_eval")
     save_ranking_by_task(rows, out)
+
+    # Reward signal stability (computed over all windows after collection)
+    def _row_vals(key):
+        return [r[key] for r in rows if isinstance(r.get(key), float) and not np.isnan(r[key])]
+
+    _rft_proxies = _row_vals("rft_reward_proxy")
+    _rft_gaps    = _row_vals("rft_reward_gap")
+    rft_proxy_std   = float(np.std(_rft_proxies))  if _rft_proxies else float("nan")
+    rft_proxy_range = float(np.ptp(_rft_proxies))  if _rft_proxies else float("nan")
+    rft_gap_std     = float(np.std(_rft_gaps))     if _rft_gaps    else float("nan")
+
     metrics.update({
         "model_name": "phase0_ar_pixel_direct_eval",
         "model_family": "phase0_ar_pixel",
@@ -486,13 +631,22 @@ def main() -> None:
         "default_negative_type": default_negative_type,
         "temporal_shift_max": args.temporal_shift_max,
         "action_noise_std": args.action_noise_std,
-        # Alias: summary scripts read rft_reward_gap_mean; aggregate_phase1_metrics
-        # stores the mean under plain "rft_reward_gap" (in scalar_keys).
+        # Alias: summary scripts read rft_reward_gap_mean
         "rft_reward_gap_mean": metrics.get("rft_reward_gap", float("nan")),
+        # Reward stability
+        "rft_reward_proxy_std":   rft_proxy_std,
+        "rft_reward_proxy_range": rft_proxy_range,
+        "rft_reward_gap_std":     rft_gap_std,
         # Phase0 has no ActionFutureScorer — set explicitly to NaN for consistency.
-        "pairwise_acc_score": float("nan"),
-        "score_gap_mean":     float("nan"),
-        "score_gap_min":      float("nan"),
+        "pairwise_acc_score":        float("nan"),
+        "score_gap_mean":            float("nan"),
+        "score_gap_min":             float("nan"),
+        "pearson_rft_score_corr":    float("nan"),
+        "spearman_rft_score_corr":   float("nan"),
+        # Dynamic mask localisation — not applicable for Phase0
+        "dynamic_mask_iou_gt_mean":       float("nan"),
+        "dynamic_mask_precision_gt_mean": float("nan"),
+        "dynamic_mask_recall_gt_mean":    float("nan"),
     })
     (out / "aggregate_metrics.json").write_text(
         json.dumps({"condition": "phase0_ar_pixel_direct_eval", "metrics": metrics}, indent=2, allow_nan=True),

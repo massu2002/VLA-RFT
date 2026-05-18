@@ -31,7 +31,7 @@ export PYTHONPATH="${REPO_ROOT}/worldmodel/_compat:${REPO_ROOT}/train/verl:${REP
 
 CMD=(
   "${REPO_ROOT}/${VENV_NAME}/bin/python"
-  analysis/evaluate_phase0_ar_pixel_on_manifest.py
+  analysis/worldmodel/evaluate_ar_pixel_on_manifest.py
   --phase0-ar-pixel-ckpt "${PHASE0_AR_PIXEL_CKPT}"
   --tokenizer-ckpt "${PHASE0_TOKENIZER_CKPT}"
   --window-manifest "${WINDOW_MANIFEST}"

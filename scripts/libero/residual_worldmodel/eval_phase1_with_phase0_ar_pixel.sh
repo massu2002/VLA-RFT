@@ -78,7 +78,7 @@ if [[ ! -d "${PHASE0_RESULTS}" ]]; then
   exit 2
 fi
 
-"${REPO_ROOT}/.venv/bin/python" analysis/convert_phase0_ar_pixel_to_phase1_eval.py \
+"${REPO_ROOT}/.venv/bin/python" analysis/worldmodel/convert_to_phase1_eval.py \
   --phase0-results "${PHASE0_RESULTS}" \
   --out-dir "${OUTPUT_DIR}" \
   --task-suite "${TASK_SUITE}" \

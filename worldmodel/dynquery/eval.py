@@ -59,6 +59,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import tensorflow_datasets as tfds
 import torch
+import torch.nn.functional as F
 
 from ..datasets.libero.data import resolve_dataset_name
 from .model import DynQueryWorldModel, compute_dynamic_mask
@@ -68,6 +69,8 @@ from ..eval_roi_utils import (
     get_goal_roi_center,
     get_roi_half,
     roi_crop_np,
+    compute_roi_metrics_np,
+    motion_com_np,
 )
 
 logger = logging.getLogger(__name__)
@@ -130,6 +133,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--debug-windows-per-task", type=int,
                         default=int(os.environ.get("DEBUG_WINDOWS_PER_TASK", "3")))
 
+    parser.add_argument("--dynamic-threshold",     type=float,
+                        default=float(os.environ.get("DYNAMIC_THRESHOLD", "0.05")),
+                        help="Pixel diff threshold for GT dynamic mask.")
+    parser.add_argument("--dynamic-dilate-kernel", type=int,
+                        default=int(os.environ.get("DYNAMIC_DILATE_KERNEL", "7")),
+                        help="Dilation kernel size for GT dynamic mask.")
     parser.add_argument("--action-ablation",      action="store_true",
                         default=os.environ.get("ACTION_ABLATION", "0") == "1")
     parser.add_argument("--window-position-mode", type=str,
@@ -185,6 +194,44 @@ def _mask_overlap_np(mask: torch.Tensor) -> float:
     eye  = torch.eye(Q, device=mask.device, dtype=sim.dtype).unsqueeze(0)
     n_off = flat.shape[0] * Q * (Q - 1)
     return float((sim * (1.0 - eye)).sum().item() / max(n_off, 1))
+
+
+def _gt_dynamic_mask_np(
+    current_np: np.ndarray,
+    future_np: np.ndarray,
+    threshold: float,
+    dilate_kernel: int,
+) -> np.ndarray:
+    """Compute GT dynamic mask: pixels where |future - current| > threshold."""
+    diff = np.abs(future_np.astype(np.float32) / 255.0 - current_np.astype(np.float32) / 255.0).mean(axis=2)
+    mask = (diff > threshold).astype(np.float32)
+    if dilate_kernel > 1:
+        t = torch.from_numpy(mask)[None, None]
+        t = F.max_pool2d(t, kernel_size=dilate_kernel, stride=1, padding=dilate_kernel // 2)
+        mask = t[0, 0].numpy()
+    return mask
+
+
+def _masked_mse_np(a: np.ndarray, b: np.ndarray, mask: np.ndarray) -> float:
+    m = mask.astype(np.float32)
+    if m.sum() <= 0:
+        return float("nan")
+    diff = (a.astype(np.float32) / 255.0 - b.astype(np.float32) / 255.0) ** 2
+    return float((diff * m[:, :, None]).sum() / (m.sum() * a.shape[-1]))
+
+
+def _masked_mae_np(a: np.ndarray, b: np.ndarray, mask: np.ndarray) -> float:
+    m = mask.astype(np.float32)
+    if m.sum() <= 0:
+        return float("nan")
+    diff = np.abs(a.astype(np.float32) / 255.0 - b.astype(np.float32) / 255.0)
+    return float((diff * m[:, :, None]).sum() / (m.sum() * a.shape[-1]))
+
+
+def _spearman_corr(x: np.ndarray, y: np.ndarray) -> float:
+    rank_x = np.argsort(np.argsort(x)).astype(float) + 1.0
+    rank_y = np.argsort(np.argsort(y)).astype(float) + 1.0
+    return float(np.corrcoef(rank_x, rank_y)[0, 1])
 
 
 def _lpips_safe(fn, a, b) -> float:
@@ -323,6 +370,8 @@ def _eval_window(
     roi_half: int,
     window_id: int,
     task_name: str,
+    dynamic_threshold: float = 0.05,
+    dynamic_dilate_kernel: int = 7,
 ) -> Optional[Dict]:
     try:
         pixels_t  = torch.from_numpy(pixels_np).unsqueeze(0).to(device)
@@ -358,6 +407,72 @@ def _eval_window(
         copy_current_horizon_avg_mse = float(np.nanmean(_copy_mse)) if _copy_mse else float("nan")
         horizon_mse_over_copy        = horizon_avg_mse / max(copy_current_horizon_avg_mse, 1e-12)
 
+        # ---- per-step LPIPS / MAE scalars ----
+        lpips_step1 = float(_h_lpips[0]) if len(_h_lpips) > 0 else float("nan")
+        lpips_step4 = float(_h_lpips[3]) if len(_h_lpips) > 3 else float("nan")
+        lpips_step8 = float(_h_lpips[7]) if len(_h_lpips) > 7 else float("nan")
+        mae_step1   = float(_h_mae[0])   if len(_h_mae)   > 0 else float("nan")
+        mae_step4   = float(_h_mae[3])   if len(_h_mae)   > 3 else float("nan")
+        mae_step8   = float(_h_mae[7])   if len(_h_mae)   > 7 else float("nan")
+
+        # ---- GT dynamic mask + masked metrics ----
+        _gt_dyn_masks: list = []
+        for _t in range(horizon):
+            _gt_np = _to_uint8_np(future_gt_t[_t])
+            _gt_dyn_masks.append(_gt_dynamic_mask_np(curr_np, _gt_np, dynamic_threshold, dynamic_dilate_kernel))
+
+        _dyn_mse_list, _dyn_mae_list, _dyn_lpips_list = [], [], []
+        _static_mse_list, _static_mae_list = [], []
+        for _t in range(horizon):
+            _pt = _to_uint8_np(pred_future[_t])
+            _gt = _to_uint8_np(future_gt_t[_t])
+            _dm = _gt_dyn_masks[_t]
+            _inv_dm = 1.0 - _dm
+            _dyn_mse_list.append(_masked_mse_np(_pt, _gt, _dm))
+            _dyn_mae_list.append(_masked_mae_np(_pt, _gt, _dm))
+            _static_mse_list.append(_masked_mse_np(_pt, curr_np, _inv_dm))
+            _static_mae_list.append(_masked_mae_np(_pt, curr_np, _inv_dm))
+            _pt_m = (_pt.astype(np.float32) * _dm[:, :, None] + curr_np.astype(np.float32) * _inv_dm[:, :, None]).astype(np.uint8)
+            _gt_m = (_gt.astype(np.float32) * _dm[:, :, None] + curr_np.astype(np.float32) * _inv_dm[:, :, None]).astype(np.uint8)
+            _dyn_lpips_list.append(_lpips_safe(lpips_fn, _pt_m, _gt_m))
+
+        dynamic_region_mse_gt   = float(np.nanmean(_dyn_mse_list))    if _dyn_mse_list    else float("nan")
+        dynamic_region_mae_gt   = float(np.nanmean(_dyn_mae_list))    if _dyn_mae_list    else float("nan")
+        dynamic_region_lpips_gt = float(np.nanmean(_dyn_lpips_list))  if _dyn_lpips_list  else float("nan")
+        static_consistency_mse  = float(np.nanmean(_static_mse_list)) if _static_mse_list else float("nan")
+        static_consistency_mae  = float(np.nanmean(_static_mae_list)) if _static_mae_list else float("nan")
+
+        # ---- ROI metrics (gripper = motion center-of-mass, goal = per-task ROI) ----
+        _gripper_center = motion_com_np(curr_np, _to_uint8_np(future_gt_t[-1]))
+        _roi = compute_roi_metrics_np(
+            pred_frames=[_to_uint8_np(pred_future[_t]) for _t in range(horizon)],
+            gt_frames=[_to_uint8_np(future_gt_t[_t]) for _t in range(horizon)],
+            lpips_fn=lpips_fn,
+            gripper_center=_gripper_center,
+            goal_center=goal_center,
+            roi_half=roi_half,
+        )
+
+        # ---- Dynamic mask IoU: fuser_masks union vs GT dynamic mask union ----
+        # fuser_masks shape: [H, Q, N] — Q queries, N spatial tokens (8×8=64)
+        _gt_union = np.stack(_gt_dyn_masks, axis=0).max(axis=0)  # [H_img, W_img]
+        _fuser_union = fuser_masks.float().max(dim=1)[0].max(dim=0)[0]  # [N]
+        _N_sp = _fuser_union.shape[0]
+        _sp = int(_N_sp ** 0.5)
+        _H_img, _W_img = curr_np.shape[:2]
+        _fuser_up = F.interpolate(
+            _fuser_union.reshape(_sp, _sp).unsqueeze(0).unsqueeze(0).float(),
+            size=(_H_img, _W_img), mode="bilinear", align_corners=False,
+        ).squeeze().numpy()
+        _fuser_bin = (_fuser_up > 0.5).astype(np.float32)
+        _inter      = (_fuser_bin * _gt_union).sum()
+        _union_area = ((_fuser_bin + _gt_union) > 0).astype(np.float32).sum()
+        _pred_area  = _fuser_bin.sum()
+        _gt_area    = _gt_union.sum()
+        dynamic_mask_iou_gt       = float(_inter / max(_union_area, 1e-6))
+        dynamic_mask_precision_gt = float(_inter / max(_pred_area,  1e-6))
+        dynamic_mask_recall_gt    = float(_inter / max(_gt_area,    1e-6))
+
         fuser_mask_entropy   = _mask_entropy_np(fuser_masks)
         fuser_mask_overlap   = _mask_overlap_np(fuser_masks)
         dynamic_mask_entropy = _mask_entropy_np(dynamic_masks_t)
@@ -369,17 +484,44 @@ def _eval_window(
         row: Dict = {
             "task_name":                     task_name,
             "window_id":                     window_id,
+            # --- Primary: reconstruction ---
             "horizon_avg_lpips":             horizon_avg_lpips,
             "horizon_avg_mae":               horizon_avg_mae,
             "horizon_avg_mse":               horizon_avg_mse,
             "rft_reward_proxy":              rft_reward_proxy,
             "copy_current_horizon_avg_mse":  copy_current_horizon_avg_mse,
             "horizon_mse_over_copy":         horizon_mse_over_copy,
+            # --- Primary: per-step LPIPS / MAE ---
+            "lpips_step1":                   lpips_step1,
+            "lpips_step4":                   lpips_step4,
+            "lpips_step8":                   lpips_step8,
+            "mae_step1":                     mae_step1,
+            "mae_step4":                     mae_step4,
+            "mae_step8":                     mae_step8,
+            # --- Primary: GT-masked dynamic / static ---
+            "dynamic_region_mse_gt":         dynamic_region_mse_gt,
+            "dynamic_region_mae_gt":         dynamic_region_mae_gt,
+            "dynamic_region_lpips_gt":       dynamic_region_lpips_gt,
+            "static_consistency_mse":        static_consistency_mse,
+            "static_consistency_mae":        static_consistency_mae,
+            # --- Primary: ROI ---
+            "roi/gripper_mse":               _roi.get("roi/gripper_mse",   float("nan")),
+            "roi/gripper_mae":               _roi.get("roi/gripper_mae",   float("nan")),
+            "roi/gripper_lpips":             _roi.get("roi/gripper_lpips", float("nan")),
+            "roi/goal_mse":                  _roi.get("roi/goal_mse",      float("nan")),
+            "roi/goal_mae":                  _roi.get("roi/goal_mae",      float("nan")),
+            "roi/goal_lpips":                _roi.get("roi/goal_lpips",    float("nan")),
+            # --- Secondary: dynamic mask IoU ---
+            "dynamic_mask_iou_gt":           dynamic_mask_iou_gt,
+            "dynamic_mask_precision_gt":     dynamic_mask_precision_gt,
+            "dynamic_mask_recall_gt":        dynamic_mask_recall_gt,
+            # --- Debug: model internals ---
             "fuser_mask_entropy":            fuser_mask_entropy,
             "fuser_mask_overlap":            fuser_mask_overlap,
             "dynamic_mask_entropy":          dynamic_mask_entropy,
             "dynamic_mask_overlap":          dynamic_mask_overlap,
             "future_dynamic_query_norm":     future_dq_norm,
+            # --- Ranking ---
             "score_correct":                 score_correct_init,
             "score_shuffle":                 float("nan"),
             "score_gap":                     float("nan"),
@@ -792,6 +934,8 @@ def run_evaluation(args: argparse.Namespace) -> None:
                 roi_half=roi_half,
                 window_id=window_count,
                 task_name=task_name,
+                dynamic_threshold=args.dynamic_threshold,
+                dynamic_dilate_kernel=args.dynamic_dilate_kernel,
             )
             if row is None:
                 skipped_history += 1
@@ -977,17 +1121,44 @@ def run_evaluation(args: argparse.Namespace) -> None:
 
     agg = aggregate_phase1_metrics(all_rows, str(output_dir), condition_name)
 
+    def _valid_vals(key):
+        return [r[key] for r in all_rows if not np.isnan(r.get(key, float("nan")))]
+
     def _valid_mean(key):
-        vals = [r[key] for r in all_rows if not np.isnan(r.get(key, float("nan")))]
+        vals = _valid_vals(key)
         return float(np.mean(vals)) if vals else float("nan")
 
     def _valid_min(key):
-        vals = [r[key] for r in all_rows if not np.isnan(r.get(key, float("nan")))]
+        vals = _valid_vals(key)
         return float(np.min(vals)) if vals else float("nan")
+
+    def _valid_std(key):
+        vals = _valid_vals(key)
+        return float(np.std(vals)) if vals else float("nan")
 
     _score_rows = [r for r in all_rows if not np.isnan(r.get("score_shuffle", float("nan")))]
     _pairwise_acc_score = (float(np.mean([r["pairwise_win_score"] for r in _score_rows]))
                            if _score_rows else float("nan"))
+
+    # ---- reward signal stability ----
+    _rft_proxies = _valid_vals("rft_reward_proxy")
+    rft_reward_proxy_std   = float(np.std(_rft_proxies))  if _rft_proxies else float("nan")
+    rft_reward_proxy_range = float(np.ptp(_rft_proxies))  if _rft_proxies else float("nan")
+    _rft_gaps = _valid_vals("rft_reward_gap")
+    rft_reward_gap_std = float(np.std(_rft_gaps)) if _rft_gaps else float("nan")
+
+    # ---- Pearson / Spearman between rft_reward_proxy and ranking_score ----
+    _score_vals = np.array([r.get("score_correct", float("nan")) for r in all_rows], dtype=float)
+    _rft_vals   = np.array([r.get("rft_reward_proxy", float("nan")) for r in all_rows], dtype=float)
+    _valid_pair = np.isfinite(_score_vals) & np.isfinite(_rft_vals)
+    if _valid_pair.sum() >= 3:
+        _sv = _score_vals[_valid_pair]
+        _rv = _rft_vals[_valid_pair]
+        pearson_rft_score_corr  = float(np.corrcoef(_sv, _rv)[0, 1])
+        spearman_rft_score_corr = _spearman_corr(_sv, _rv)
+    else:
+        pearson_rft_score_corr  = float("nan")
+        spearman_rft_score_corr = float("nan")
 
     agg.update({
         "model_generation":          "dynquery",
@@ -1001,12 +1172,27 @@ def run_evaluation(args: argparse.Namespace) -> None:
         "default_negative_type":      default_negative_type,
         "temporal_shift_max":         args.temporal_shift_max,
         "action_noise_std":           args.action_noise_std,
+        "dynamic_threshold":          args.dynamic_threshold,
+        "dynamic_dilate_kernel":      args.dynamic_dilate_kernel,
+        # --- Primary ranking ---
         "pairwise_acc_score":        _pairwise_acc_score,
         "pairwise_acc_rft":          agg.get("pairwise_acc_rft", float("nan")),
         "score_gap_mean":            _valid_mean("score_gap"),
         "score_gap_min":             _valid_min("score_gap"),
         "rft_reward_gap_mean":       _valid_mean("rft_reward_gap"),
         "rft_reward_gap_min":        _valid_min("rft_reward_gap"),
+        # --- Primary: reward stability ---
+        "rft_reward_proxy_std":      rft_reward_proxy_std,
+        "rft_reward_proxy_range":    rft_reward_proxy_range,
+        "rft_reward_gap_std":        rft_reward_gap_std,
+        # --- Secondary: Scorer ↔ RFT reward alignment ---
+        "pearson_rft_score_corr":    pearson_rft_score_corr,
+        "spearman_rft_score_corr":   spearman_rft_score_corr,
+        # --- Secondary: dynamic mask IoU ---
+        "dynamic_mask_iou_gt_mean":       _valid_mean("dynamic_mask_iou_gt"),
+        "dynamic_mask_precision_gt_mean": _valid_mean("dynamic_mask_precision_gt"),
+        "dynamic_mask_recall_gt_mean":    _valid_mean("dynamic_mask_recall_gt"),
+        # --- Debug: model internals ---
         "fuser_mask_entropy":        _valid_mean("fuser_mask_entropy"),
         "fuser_mask_overlap":        _valid_mean("fuser_mask_overlap"),
         "dynamic_mask_entropy":      _valid_mean("dynamic_mask_entropy"),
@@ -1080,11 +1266,26 @@ def run_evaluation(args: argparse.Namespace) -> None:
                 agg.get("pairwise_acc_score", float("nan")),
                 agg.get("rft_reward_gap_mean", float("nan")),
                 agg.get("score_gap_mean", float("nan")))
-    logger.info("  fuser_entropy=%.4f  fuser_overlap=%.4f  dyn_entropy=%.4f  dyn_overlap=%.4f  skipped=%d",
+    logger.info("  dynamic_region_lpips_gt=%.4f  dynamic_region_mse_gt=%.6f  static_mse=%.6f",
+                agg.get("dynamic_region_lpips_gt", float("nan")),
+                agg.get("dynamic_region_mse_gt", float("nan")),
+                agg.get("static_consistency_mse", float("nan")))
+    logger.info("  roi_gripper_lpips=%.4f  roi_goal_lpips=%.4f",
+                agg.get("roi/gripper_lpips", float("nan")),
+                agg.get("roi/goal_lpips", float("nan")))
+    logger.info("  dyn_mask_iou=%.4f  precision=%.4f  recall=%.4f",
+                agg.get("dynamic_mask_iou_gt_mean", float("nan")),
+                agg.get("dynamic_mask_precision_gt_mean", float("nan")),
+                agg.get("dynamic_mask_recall_gt_mean", float("nan")))
+    logger.info("  rft_proxy_std=%.4f  rft_gap_std=%.4f  pearson_score_corr=%.4f  spearman_score_corr=%.4f",
+                agg.get("rft_reward_proxy_std", float("nan")),
+                agg.get("rft_reward_gap_std", float("nan")),
+                agg.get("pearson_rft_score_corr", float("nan")),
+                agg.get("spearman_rft_score_corr", float("nan")))
+    logger.info("  fuser_entropy=%.4f  fuser_overlap=%.4f  dyn_entropy=%.4f  skipped=%d",
                 agg.get("fuser_mask_entropy", float("nan")),
                 agg.get("fuser_mask_overlap", float("nan")),
                 agg.get("dynamic_mask_entropy", float("nan")),
-                agg.get("dynamic_mask_overlap", float("nan")),
                 skipped_history)
     logger.info("  → %s", output_dir)
 

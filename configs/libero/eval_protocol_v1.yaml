@@ -15,9 +15,6 @@ task_suites:
   - goal
   - long
 
-# Subset config reference (used by analyze_worldmodel_eval.py --use-subset)
-task_subset_file: configs/libero/task_subset_v1.json
-
 # ---------------------------------------------------------------------------
 # Metric groups
 # ---------------------------------------------------------------------------

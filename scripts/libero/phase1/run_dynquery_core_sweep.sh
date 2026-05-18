@@ -26,7 +26,7 @@
 #     bash scripts/libero/phase1/run_dynquery_core_sweep.sh
 #
 # Key env-var overrides:
-#   SWEEP_CONFIG   path to JSON   (default: configs/libero/phase1/dynquery_core_sweep.json)
+#   SWEEP_CONFIG   path to JSON   (default: configs/libero/dynquery_core_sweep.json)
 #   TASK_SUITE     spatial | object | goal | 10
 #   RUN_NAME       unique name for this sweep run
 #   MODE           train_only | eval_only | train_eval
@@ -51,7 +51,7 @@ die()     { echo "[dynquery-core-sweep] ERROR: $*" >&2; exit 1; }
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-SWEEP_CONFIG="${SWEEP_CONFIG:-${REPO_ROOT}/configs/libero/phase1/dynquery_core_sweep.json}"
+SWEEP_CONFIG="${SWEEP_CONFIG:-${REPO_ROOT}/configs/libero/dynquery_core_sweep.json}"
 TASK_SUITE="${TASK_SUITE:-spatial}"
 RUN_NAME="${RUN_NAME:-DynQueryWorldModel_core_sweep}"
 MODE="${MODE:-train_only}"
@@ -72,6 +72,8 @@ LOG_ROOT="${LOG_ROOT:-${OUT_ROOT}/logs/node${NODE_INDEX}_of_${NUM_NODES}}"
 MANIFEST="${OUT_ROOT}/sweep_manifest_node${NODE_INDEX}_of_${NUM_NODES}.tsv"
 
 SHARED_WINDOW_MANIFEST="${SHARED_WINDOW_MANIFEST:-}"
+REUSE_EVAL_ROOT="${REUSE_EVAL_ROOT:-}"   # _reuse_from 元スイープの評価結果ルート（空=sweep名から自動解決）
+REUSE_CKPT_ROOT="${REUSE_CKPT_ROOT:-}"  # _reuse_from 元スイープのチェックポイントルート（空=自動解決）
 
 [ -f "${SWEEP_CONFIG}" ] || die "SWEEP_CONFIG not found: ${SWEEP_CONFIG}"
 python3 -c "import json; json.load(open('${SWEEP_CONFIG}'))" \
@@ -166,6 +168,86 @@ fi
 
 TOTAL_JOBS=$(echo "${JOBS_TSV}" | wc -l)
 
+# ---------------------------------------------------------------------------
+# _reuse_from リスト抽出（disabled 実験で _reuse_from が指定されているもの）
+# 形式: dst_exp|src_sweep|src_exp
+# ---------------------------------------------------------------------------
+REUSE_LIST="$(python3 - <<PYEOF
+import json
+cfg = json.load(open("${SWEEP_CONFIG}"))
+for exp in cfg.get("experiments", []):
+    if exp.get("enabled", True):
+        continue
+    r = exp.get("_reuse_from")
+    if not r:
+        continue
+    print("|".join([exp["exp_name"], r.get("sweep", ""), r.get("exp_name", "")]))
+PYEOF
+)"
+
+# sweep名からデフォルトのルートを解決する
+_resolve_reuse_src() {
+  local sweep="${1}" type="${2}"
+  if [ "${type}" = "eval" ]; then
+    [ -n "${REUSE_EVAL_ROOT}" ] && { echo "${REUSE_EVAL_ROOT}"; return; }
+    case "${sweep}" in
+      dynquery_core_sweep) echo "${REPO_ROOT}/results/phase1/DynQueryWorldModel_core_sweep" ;;
+      *) echo "${REPO_ROOT}/results/phase1/${sweep}" ;;
+    esac
+  else
+    [ -n "${REUSE_CKPT_ROOT}" ] && { echo "${REUSE_CKPT_ROOT}"; return; }
+    case "${sweep}" in
+      dynquery_core_sweep) echo "${REPO_ROOT}/checkpoints/libero/DynQueryWorldModel/core_sweep" ;;
+      *) echo "${REPO_ROOT}/checkpoints/libero/DynQueryWorldModel/${sweep}" ;;
+    esac
+  fi
+}
+
+# _reuse_from の実行：評価結果コピー + チェックポイントのシンボリックリンク
+_do_reuse() {
+  [ -z "${REUSE_LIST}" ] && return 0
+  log "=== _reuse_from 自動コピー ==="
+  while IFS='|' read -r dst_exp src_sweep src_exp; do
+    [ -z "${dst_exp}" ] && continue
+    local src_eval dst_eval src_ckpt dst_ckpt
+    src_eval="$(_resolve_reuse_src "${src_sweep}" eval)/${src_exp}"
+    dst_eval="${OUT_ROOT}/${dst_exp}"
+    src_ckpt="$(_resolve_reuse_src "${src_sweep}" ckpt)/${TASK_SUITE}/${src_exp}/s${SEED}"
+    dst_ckpt="${CKPT_ROOT}/${TASK_SUITE}/${dst_exp}/s${SEED}"
+
+    log "  ${dst_exp} ← ${src_sweep}::${src_exp}"
+
+    # 評価結果のコピー
+    if [ -d "${src_eval}" ]; then
+      mkdir -p "${dst_eval}"
+      local n=0
+      for f in aggregate_metrics.json rows.jsonl dynquery_config.json dynquery_sweep_config_used.json; do
+        if [ -f "${src_eval}/${f}" ]; then
+          cp "${src_eval}/${f}" "${dst_eval}/${f}"
+          n=$((n + 1))
+        fi
+      done
+      log "    eval: ${n} ファイルをコピー → ${dst_eval}"
+    else
+      log "    [WARN] 評価結果が見つかりません: ${src_eval}"
+    fi
+
+    # チェックポイントのシンボリックリンク
+    if [ -d "${src_ckpt}" ]; then
+      mkdir -p "$(dirname "${dst_ckpt}")"
+      if [ -e "${dst_ckpt}" ]; then
+        log "    ckpt: 既に存在します — スキップ: ${dst_ckpt}"
+      else
+        ln -s "${src_ckpt}" "${dst_ckpt}"
+        log "    ckpt: symlink 作成 → ${dst_ckpt}"
+        log "          (参照先: ${src_ckpt})"
+      fi
+    else
+      log "    [WARN] チェックポイントが見つかりません: ${src_ckpt}"
+    fi
+  done <<< "${REUSE_LIST}"
+}
+
 log "=== DynQuery core sweep ==="
 log "config     : ${SWEEP_CONFIG}"
 log "task_suite : ${TASK_SUITE}"
@@ -177,6 +259,7 @@ log "total jobs : ${TOTAL_JOBS}  (this node: ~$((TOTAL_JOBS / NUM_NODES + 1)))"
 log "skip_exist : ${SKIP_EXISTING}  overwrite: ${OVERWRITE}  dry_run: ${DRY_RUN}  smoke: ${SMOKE}"
 log "ckpt_root  : ${CKPT_ROOT}"
 log "out_root   : ${OUT_ROOT}"
+[ -n "${REUSE_LIST}" ] && log "reuse_jobs : $(echo "${REUSE_LIST}" | wc -l) 件の _reuse_from 参照あり"
 
 {
   printf 'job_id\tnode_index\texp_name\tstage\tK\tQ\tact_cond\tpred_mode\tgate\tscorer\tlambda_rank\tneg_type\tstatus\tlog\n'
@@ -198,10 +281,25 @@ if is_true "${DRY_RUN}"; then
     fi
     job_id=$((job_id + 1))
   done <<< "${JOBS_TSV}"
+  if [ -n "${REUSE_LIST}" ]; then
+    log ""
+    log "  _reuse_from 自動コピー対象:"
+    while IFS='|' read -r dst_exp src_sweep src_exp; do
+      [ -z "${dst_exp}" ] && continue
+      log "    ${dst_exp} ← ${src_sweep}::${src_exp}"
+      log "      eval: $(_resolve_reuse_src "${src_sweep}" eval)/${src_exp} → ${OUT_ROOT}/${dst_exp}"
+      log "      ckpt: $(_resolve_reuse_src "${src_sweep}" ckpt)/${TASK_SUITE}/${src_exp}/s${SEED} → ${CKPT_ROOT}/${TASK_SUITE}/${dst_exp}/s${SEED} (symlink)"
+    done <<< "${REUSE_LIST}"
+  fi
   log ""
   log "  Set DRY_RUN=0 to execute."
   exit 0
 fi
+
+# ---------------------------------------------------------------------------
+# _reuse_from の自動コピー（学習ループの前に実行）
+# ---------------------------------------------------------------------------
+_do_reuse
 
 # ---------------------------------------------------------------------------
 # Execute jobs

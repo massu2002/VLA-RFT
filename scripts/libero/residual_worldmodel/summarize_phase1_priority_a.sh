@@ -8,6 +8,6 @@ cd "${REPO_ROOT}"
 EVAL_ROOT="${EVAL_ROOT:-${REPO_ROOT}/results/phase1/residual_worldmodel}"
 OUT_DIR="${OUT_DIR:-${EVAL_ROOT}/priority_a_summary}"
 
-"${REPO_ROOT}/.venv/bin/python" analysis/summarize_phase1_priority_a.py "${EVAL_ROOT}" --out-dir "${OUT_DIR}"
+"${REPO_ROOT}/.venv/bin/python" analysis/rft/summarize_priority_a.py "${EVAL_ROOT}" --out-dir "${OUT_DIR}"
 
 echo "summary: ${OUT_DIR}/summary.md"
